@@ -1,0 +1,231 @@
+{
+  "ir_version": "1.0.0",
+  "source": {
+    "workflow_id": "fastp_demo",
+    "workflow_schema_version": "1.0.0",
+    "workflow_semantic_digest": "sha256:6b2e90ea0b889e5d4148b0353e4ded68ba565dd88724f82add0371f4e745c163",
+    "tool_digests": [
+      "sha256:f65755c1e908864e19c2eefd7781a7dc035de02a90538b2ec527823bdab41bcc"
+    ]
+  },
+  "target": {
+    "language": "wdl",
+    "version": "1.0",
+    "profile": "cromwell-compatible"
+  },
+  "tasks": [
+    {
+      "name": "fastp",
+      "source_tool": {
+        "id": "fastp",
+        "tool_version": "0.23.4",
+        "spec_version": "1.0.0",
+        "digest": "sha256:f65755c1e908864e19c2eefd7781a7dc035de02a90538b2ec527823bdab41bcc"
+      },
+      "inputs": [
+        {
+          "name": "reads_1",
+          "type": {
+            "wdl_type": "File",
+            "optional": false,
+            "semantic_type": "bio.fastq.gz.r1"
+          }
+        },
+        {
+          "name": "reads_2",
+          "type": {
+            "wdl_type": "File",
+            "optional": false,
+            "semantic_type": "bio.fastq.gz.r2"
+          }
+        },
+        {
+          "name": "threads",
+          "type": {
+            "wdl_type": "Int",
+            "optional": true,
+            "semantic_type": "core.integer"
+          },
+          "default": {
+            "kind": "literal",
+            "wdl_type": "Int",
+            "value": 4
+          }
+        }
+      ],
+      "command": {
+        "shell": "bash",
+        "strict_mode": true,
+        "segments": [
+          {
+            "kind": "literal",
+            "value": "mkdir -p outputs\nfastp \\\n  --in1 "
+          },
+          {
+            "kind": "input_ref",
+            "name": "reads_1"
+          },
+          {
+            "kind": "literal",
+            "value": " \\\n  --in2 "
+          },
+          {
+            "kind": "input_ref",
+            "name": "reads_2"
+          },
+          {
+            "kind": "literal",
+            "value": " \\\n  --out1 outputs/clean_R1.fastq.gz \\\n  --out2 outputs/clean_R2.fastq.gz \\\n  --html outputs/fastp.html \\\n  --json outputs/fastp.json \\\n  --thread "
+          },
+          {
+            "kind": "input_ref",
+            "name": "threads"
+          },
+          {
+            "kind": "literal",
+            "value": "\n"
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "name": "clean_reads_1",
+          "type": {
+            "wdl_type": "File",
+            "optional": false,
+            "semantic_type": "bio.fastq.gz.r1"
+          },
+          "expression": {
+            "kind": "path",
+            "value": "outputs/clean_R1.fastq.gz"
+          }
+        },
+        {
+          "name": "clean_reads_2",
+          "type": {
+            "wdl_type": "File",
+            "optional": false,
+            "semantic_type": "bio.fastq.gz.r2"
+          },
+          "expression": {
+            "kind": "path",
+            "value": "outputs/clean_R2.fastq.gz"
+          }
+        },
+        {
+          "name": "html_report",
+          "type": {
+            "wdl_type": "File",
+            "optional": false,
+            "semantic_type": "bio.report.html"
+          },
+          "expression": {
+            "kind": "path",
+            "value": "outputs/fastp.html"
+          }
+        },
+        {
+          "name": "json_report",
+          "type": {
+            "wdl_type": "File",
+            "optional": false,
+            "semantic_type": "bio.report.json"
+          },
+          "expression": {
+            "kind": "path",
+            "value": "outputs/fastp.json"
+          }
+        }
+      ],
+      "runtime": {
+        "docker": "quay.io/biocontainers/fastp:0.23.4--h5f740d0_0",
+        "cpu": 4,
+        "memory_gb": 8,
+        "disk_gb": 20
+      }
+    }
+  ],
+  "workflow": {
+    "name": "fastp_demo",
+    "inputs": [
+      {
+        "name": "input_reads_1",
+        "type": {
+          "wdl_type": "File",
+          "optional": false,
+          "semantic_type": "bio.fastq.gz.r1"
+        }
+      },
+      {
+        "name": "input_reads_2",
+        "type": {
+          "wdl_type": "File",
+          "optional": false,
+          "semantic_type": "bio.fastq.gz.r2"
+        }
+      }
+    ],
+    "calls": [
+      {
+        "alias": "fastp_1",
+        "task": "fastp",
+        "bindings": {
+          "reads_1": {
+            "kind": "workflow_input_ref",
+            "name": "input_reads_1"
+          },
+          "reads_2": {
+            "kind": "workflow_input_ref",
+            "name": "input_reads_2"
+          },
+          "threads": {
+            "kind": "literal",
+            "wdl_type": "Int",
+            "value": 4
+          }
+        }
+      }
+    ],
+    "outputs": [
+      {
+        "name": "output_clean_reads_1",
+        "type": {
+          "wdl_type": "File",
+          "optional": false,
+          "semantic_type": "bio.fastq.gz.r1"
+        },
+        "expression": {
+          "kind": "call_output_ref",
+          "call": "fastp_1",
+          "output": "clean_reads_1"
+        }
+      },
+      {
+        "name": "output_clean_reads_2",
+        "type": {
+          "wdl_type": "File",
+          "optional": false,
+          "semantic_type": "bio.fastq.gz.r2"
+        },
+        "expression": {
+          "kind": "call_output_ref",
+          "call": "fastp_1",
+          "output": "clean_reads_2"
+        }
+      },
+      {
+        "name": "output_html_report",
+        "type": {
+          "wdl_type": "File",
+          "optional": false,
+          "semantic_type": "bio.report.html"
+        },
+        "expression": {
+          "kind": "call_output_ref",
+          "call": "fastp_1",
+          "output": "html_report"
+        }
+      }
+    ]
+  }
+}
