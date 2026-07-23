@@ -1,0 +1,160 @@
+{
+  "schema_version": "1.0.0",
+  "id": "fastp_demo",
+  "name": "fastp demo",
+  "description": "Phase 1 single-tool workflow demonstrating Graph-to-WDL generation.",
+  "target": {
+    "language": "wdl",
+    "version": "1.0",
+    "profile": "cromwell-compatible"
+  },
+  "nodes": [
+    {
+      "id": "input_reads_1",
+      "type": "workflow_input",
+      "label": "Read 1 FASTQ",
+      "port": {
+        "name": "value",
+        "wdl_type": "File",
+        "semantic_type": "bio.fastq.gz.r1",
+        "required": true,
+        "description": "Paired-end read 1 input"
+      }
+    },
+    {
+      "id": "input_reads_2",
+      "type": "workflow_input",
+      "label": "Read 2 FASTQ",
+      "port": {
+        "name": "value",
+        "wdl_type": "File",
+        "semantic_type": "bio.fastq.gz.r2",
+        "required": true,
+        "description": "Paired-end read 2 input"
+      }
+    },
+    {
+      "id": "fastp_1",
+      "type": "tool",
+      "label": "fastp",
+      "tool_ref": {
+        "id": "fastp",
+        "tool_version": "0.23.4",
+        "spec_version": "1.0.0",
+        "digest": "sha256:f65755c1e908864e19c2eefd7781a7dc035de02a90538b2ec527823bdab41bcc"
+      },
+      "parameter_values": {
+        "threads": 4
+      }
+    },
+    {
+      "id": "output_clean_reads_1",
+      "type": "workflow_output",
+      "label": "Clean read 1 FASTQ",
+      "port": {
+        "name": "value",
+        "wdl_type": "File",
+        "semantic_type": "bio.fastq.gz.r1",
+        "description": "Filtered read 1 output"
+      }
+    },
+    {
+      "id": "output_clean_reads_2",
+      "type": "workflow_output",
+      "label": "Clean read 2 FASTQ",
+      "port": {
+        "name": "value",
+        "wdl_type": "File",
+        "semantic_type": "bio.fastq.gz.r2",
+        "description": "Filtered read 2 output"
+      }
+    },
+    {
+      "id": "output_html_report",
+      "type": "workflow_output",
+      "label": "fastp HTML report",
+      "port": {
+        "name": "value",
+        "wdl_type": "File",
+        "semantic_type": "bio.report.html",
+        "description": "fastp quality-control report"
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "edge_reads_1_fastp",
+      "source": {
+        "node_id": "input_reads_1",
+        "port": "value"
+      },
+      "target": {
+        "node_id": "fastp_1",
+        "port": "reads_1"
+      }
+    },
+    {
+      "id": "edge_reads_2_fastp",
+      "source": {
+        "node_id": "input_reads_2",
+        "port": "value"
+      },
+      "target": {
+        "node_id": "fastp_1",
+        "port": "reads_2"
+      }
+    },
+    {
+      "id": "edge_fastp_clean_1",
+      "source": {
+        "node_id": "fastp_1",
+        "port": "clean_reads_1"
+      },
+      "target": {
+        "node_id": "output_clean_reads_1",
+        "port": "value"
+      }
+    },
+    {
+      "id": "edge_fastp_clean_2",
+      "source": {
+        "node_id": "fastp_1",
+        "port": "clean_reads_2"
+      },
+      "target": {
+        "node_id": "output_clean_reads_2",
+        "port": "value"
+      }
+    },
+    {
+      "id": "edge_fastp_html",
+      "source": {
+        "node_id": "fastp_1",
+        "port": "html_report"
+      },
+      "target": {
+        "node_id": "output_html_report",
+        "port": "value"
+      }
+    }
+  ],
+  "layout": {
+    "nodes": {
+      "input_reads_1": {"x": 0, "y": 40},
+      "input_reads_2": {"x": 0, "y": 200},
+      "fastp_1": {"x": 320, "y": 120},
+      "output_clean_reads_1": {"x": 680, "y": 20},
+      "output_clean_reads_2": {"x": 680, "y": 140},
+      "output_html_report": {"x": 680, "y": 260}
+    },
+    "viewport": {
+      "x": 0,
+      "y": 0,
+      "zoom": 1
+    }
+  },
+  "metadata": {
+    "tags": ["phase1", "fastp", "acceptance"],
+    "notes": "The ToolSpec digest is calculated from canonical JSON with sorted object keys and compact separators."
+  }
+}
