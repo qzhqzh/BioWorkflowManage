@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Validate Phase 1 schemas, diagnostics, and golden fixtures.
 
-This script intentionally depends only on jsonschema plus the Python standard
+The script intentionally depends only on jsonschema plus the Python standard
 library. WDL syntax validation is executed separately by miniwdl in CI.
 """
 
@@ -20,23 +20,19 @@ SCHEMAS = ROOT / "schemas"
 FIXTURE = ROOT / "examples" / "phase1-fastp"
 VALIDATION_FIXTURE = ROOT / "examples" / "validation"
 
-STAGE_ORDER = {
-    stage: index
-    for index, stage in enumerate(
-        (
-            "parse",
-            "schema",
-            "tool_spec",
-            "resolution",
-            "graph",
-            "type",
-            "lowering",
-            "render",
-            "wdl_validation",
-            "system",
-        )
-    )
-}
+STAGES = (
+    "parse",
+    "schema",
+    "tool_spec",
+    "resolution",
+    "graph",
+    "type",
+    "lowering",
+    "render",
+    "wdl_validation",
+    "system",
+)
+STAGE_ORDER = {stage: index for index, stage in enumerate(STAGES)}
 
 
 def load_json(path: Path) -> Any:
@@ -54,6 +50,18 @@ def canonical_digest(document: Any) -> str:
     return "sha256:" + hashlib.sha256(canonical).hexdigest()
 
 
+def graph_semantic_document(graph: dict[str, Any]) -> dict[str, Any]:
+    """Return the Phase 1 semantic canonical form of a Workflow Graph."""
+    semantic = {
+        key: value
+        for key, value in graph.items()
+        if key not in {"layout", "metadata"}
+    }
+    semantic["nodes"] = sorted(semantic["nodes"], key=lambda item: item["id"])
+    semantic["edges"] = sorted(semantic["edges"], key=lambda item: item["id"])
+    return semantic
+
+
 def validate_document(schema: dict[str, Any], document: Any, name: str) -> None:
     validator = Draft202012Validator(schema)
     errors = sorted(validator.iter_errors(document), key=lambda error: list(error.path))
@@ -68,15 +76,15 @@ def validate_document(schema: dict[str, Any], document: Any, name: str) -> None:
 
 
 def assert_unique(values: Iterable[str], label: str) -> None:
-    materialized = list(values)
-    if len(materialized) != len(set(materialized)):
-        raise AssertionError(f"Duplicate {label}: {materialized}")
+    items = list(values)
+    if len(items) != len(set(items)):
+        raise AssertionError(f"Duplicate {label}: {items}")
 
 
 def assert_sorted(values: Iterable[str], label: str) -> None:
-    materialized = list(values)
-    if materialized != sorted(materialized):
-        raise AssertionError(f"{label} must be sorted: {materialized}")
+    items = list(values)
+    if items != sorted(items):
+        raise AssertionError(f"{label} must be sorted: {items}")
 
 
 def contains_key(value: Any, key: str) -> bool:
@@ -85,6 +93,30 @@ def contains_key(value: Any, key: str) -> bool:
     if isinstance(value, list):
         return any(contains_key(item, key) for item in value)
     return False
+
+
+def validate_error_catalog(catalog: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    if catalog.get("catalog_version") != "1.0.0":
+        raise AssertionError("Unsupported error catalog version")
+    entries = catalog.get("entries")
+    if not isinstance(entries, list) or not entries:
+        raise AssertionError("Error catalog must contain entries")
+
+    index: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        if set(entry) != {"code", "stage", "severity", "title"}:
+            raise AssertionError(f"Invalid catalog entry shape: {entry}")
+        code = entry["code"]
+        if code in index:
+            raise AssertionError(f"Duplicate diagnostic code: {code}")
+        if entry["stage"] not in STAGE_ORDER:
+            raise AssertionError(f"Unknown diagnostic stage for {code}")
+        if entry["severity"] not in {"error", "warning"}:
+            raise AssertionError(f"Unknown diagnostic severity for {code}")
+        if not entry["title"]:
+            raise AssertionError(f"Missing catalog title for {code}")
+        index[code] = entry
+    return index
 
 
 def diagnostic_sort_key(diagnostic: dict[str, Any]) -> tuple[Any, ...]:
@@ -101,69 +133,31 @@ def diagnostic_sort_key(diagnostic: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def validate_error_catalog(catalog: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    if catalog.get("catalog_version") != "1.0.0":
-        raise AssertionError("Unsupported error catalog version")
-
-    entries = catalog.get("entries")
-    if not isinstance(entries, list) or not entries:
-        raise AssertionError("Error catalog must contain entries")
-
-    codes: list[str] = []
-    index: dict[str, dict[str, Any]] = {}
-    for entry in entries:
-        expected_keys = {"code", "stage", "severity", "title"}
-        if set(entry) != expected_keys:
-            raise AssertionError(f"Invalid catalog entry shape: {entry}")
-        code = entry["code"]
-        if entry["stage"] not in STAGE_ORDER:
-            raise AssertionError(f"Unknown diagnostic stage for {code}")
-        if entry["severity"] not in {"error", "warning"}:
-            raise AssertionError(f"Unknown diagnostic severity for {code}")
-        if not isinstance(entry["title"], str) or not entry["title"]:
-            raise AssertionError(f"Missing catalog title for {code}")
-        codes.append(code)
-        index[code] = entry
-
-    assert_unique(codes, "diagnostic code")
-    return index
-
-
-def validate_report_invariants(
+def validate_report(
     report: dict[str, Any], catalog: dict[str, dict[str, Any]]
 ) -> None:
     diagnostics = report["diagnostics"]
-    error_count = sum(item["severity"] == "error" for item in diagnostics)
-    warning_count = sum(item["severity"] == "warning" for item in diagnostics)
-
-    if report["summary"] != {
-        "error_count": error_count,
-        "warning_count": warning_count,
-    }:
+    errors = sum(item["severity"] == "error" for item in diagnostics)
+    warnings = sum(item["severity"] == "warning" for item in diagnostics)
+    if report["summary"] != {"error_count": errors, "warning_count": warnings}:
         raise AssertionError("Validation summary does not match diagnostics")
-
-    expected_status = "invalid" if error_count else "valid"
+    expected_status = "invalid" if errors else "valid"
     if report["status"] != expected_status:
-        raise AssertionError(
-            f"Validation status mismatch: expected={expected_status}, "
-            f"actual={report['status']}"
-        )
-
+        raise AssertionError("Validation status does not match diagnostics")
     if diagnostics != sorted(diagnostics, key=diagnostic_sort_key):
-        raise AssertionError("Diagnostics are not in deterministic order")
+        raise AssertionError("Diagnostics are not deterministically sorted")
 
     for diagnostic in diagnostics:
-        code = diagnostic["code"]
-        if code not in catalog:
-            raise AssertionError(f"Diagnostic code is absent from catalog: {code}")
-        catalog_entry = catalog[code]
-        if diagnostic["stage"] != catalog_entry["stage"]:
-            raise AssertionError(f"Diagnostic stage differs from catalog for {code}")
-        if diagnostic["severity"] != catalog_entry["severity"]:
-            raise AssertionError(f"Diagnostic severity differs from catalog for {code}")
+        entry = catalog.get(diagnostic["code"])
+        if entry is None:
+            raise AssertionError(f"Unknown diagnostic code: {diagnostic['code']}")
+        if diagnostic["stage"] != entry["stage"]:
+            raise AssertionError(f"Stage differs from catalog: {diagnostic['code']}")
+        if diagnostic["severity"] != entry["severity"]:
+            raise AssertionError(f"Severity differs from catalog: {diagnostic['code']}")
 
 
-def validate_ir_invariants(
+def validate_ir(
     ir: dict[str, Any], tool_digest: str, graph_digest: str
 ) -> None:
     source = ir["source"]
@@ -172,48 +166,38 @@ def validate_ir_invariants(
     if source["tool_digests"] != [tool_digest]:
         raise AssertionError("IR ToolSpec digest set is inconsistent")
     assert_sorted(source["tool_digests"], "IR tool digests")
-
     if contains_key(ir, "layout"):
         raise AssertionError("Compiler IR must not contain UI layout")
 
     tasks = ir["tasks"]
     assert_unique((task["name"] for task in tasks), "IR task name")
     assert_sorted((task["name"] for task in tasks), "IR task names")
+    task_outputs: dict[str, set[str]] = {}
     for task in tasks:
         if task["source_tool"]["digest"] not in source["tool_digests"]:
-            raise AssertionError(f"Task {task['name']} references an unknown ToolSpec digest")
-        assert_unique((item["name"] for item in task["inputs"]), "task input")
+            raise AssertionError(f"Task {task['name']} references unknown ToolSpec")
         assert_sorted((item["name"] for item in task["inputs"]), "task inputs")
-        assert_unique((item["name"] for item in task["outputs"]), "task output")
         assert_sorted((item["name"] for item in task["outputs"]), "task outputs")
-
         declared_inputs = {item["name"] for item in task["inputs"]}
+        task_outputs[task["name"]] = {item["name"] for item in task["outputs"]}
         for segment in task["command"]["segments"]:
             if segment["kind"] == "input_ref" and segment["name"] not in declared_inputs:
-                raise AssertionError(
-                    f"Command in task {task['name']} references unknown input "
-                    f"{segment['name']}"
-                )
+                raise AssertionError("Command segment references unknown task input")
 
     workflow = ir["workflow"]
-    assert_unique((item["name"] for item in workflow["inputs"]), "workflow input")
     assert_sorted((item["name"] for item in workflow["inputs"]), "workflow inputs")
-    assert_unique((item["alias"] for item in workflow["calls"]), "call alias")
-    assert_unique((item["name"] for item in workflow["outputs"]), "workflow output")
     assert_sorted((item["name"] for item in workflow["outputs"]), "workflow outputs")
+    assert_unique((item["alias"] for item in workflow["calls"]), "call alias")
 
-    task_names = {task["name"] for task in tasks}
     workflow_inputs = {item["name"] for item in workflow["inputs"]}
+    task_names = {task["name"] for task in tasks}
     calls_seen: set[str] = set()
-    call_outputs = {
-        task["name"]: {item["name"] for item in task["outputs"]} for task in tasks
-    }
-
+    call_to_task: dict[str, str] = {}
     for call in workflow["calls"]:
         if call["task"] not in task_names:
-            raise AssertionError(f"Call {call['alias']} references unknown task")
+            raise AssertionError("Call references unknown task")
         if list(call["bindings"]) != sorted(call["bindings"]):
-            raise AssertionError(f"Bindings for {call['alias']} must be sorted")
+            raise AssertionError("Call bindings must be sorted")
         for expression in call["bindings"].values():
             if expression["kind"] == "workflow_input_ref":
                 if expression["name"] not in workflow_inputs:
@@ -222,29 +206,32 @@ def validate_ir_invariants(
                 if expression["call"] not in calls_seen:
                     raise AssertionError("Call output reference violates topology")
         calls_seen.add(call["alias"])
+        call_to_task[call["alias"]] = call["task"]
 
-    call_to_task = {call["alias"]: call["task"] for call in workflow["calls"]}
     for output in workflow["outputs"]:
         expression = output["expression"]
         if expression["kind"] == "workflow_input_ref":
             if expression["name"] not in workflow_inputs:
-                raise AssertionError("Workflow output references unknown workflow input")
+                raise AssertionError("Workflow output references unknown input")
         else:
-            call_alias = expression["call"]
-            if call_alias not in call_to_task:
+            call = expression["call"]
+            if call not in call_to_task:
                 raise AssertionError("Workflow output references unknown call")
-            task_name = call_to_task[call_alias]
-            if expression["output"] not in call_outputs[task_name]:
+            if expression["output"] not in task_outputs[call_to_task[call]]:
                 raise AssertionError("Workflow output references unknown task output")
 
 
 def main() -> None:
-    tool_schema = load_json(SCHEMAS / "tool-spec.schema.json")
-    graph_schema = load_json(SCHEMAS / "workflow-graph.schema.json")
-    ir_schema = load_json(SCHEMAS / "compiler-ir.schema.json")
-    report_schema = load_json(SCHEMAS / "validation-report.schema.json")
-
-    for schema in (tool_schema, graph_schema, ir_schema, report_schema):
+    schemas = {
+        name: load_json(SCHEMAS / name)
+        for name in (
+            "tool-spec.schema.json",
+            "workflow-graph.schema.json",
+            "compiler-ir.schema.json",
+            "validation-report.schema.json",
+        )
+    }
+    for schema in schemas.values():
         Draft202012Validator.check_schema(schema)
 
     tool = load_json(FIXTURE / "tool-fastp.json")
@@ -252,84 +239,60 @@ def main() -> None:
     ir = load_json(FIXTURE / "expected" / "compiler-ir.json")
     manifest = load_json(FIXTURE / "expected" / "compile-manifest.json")
     load_json(FIXTURE / "expected" / "inputs.template.json")
+    report = load_json(VALIDATION_FIXTURE / "semantic-mismatch-report.json")
+    catalog = validate_error_catalog(load_json(SCHEMAS / "error-catalog.json"))
 
-    validation_report = load_json(
-        VALIDATION_FIXTURE / "semantic-mismatch-report.json"
-    )
-    error_catalog = validate_error_catalog(load_json(SCHEMAS / "error-catalog.json"))
-
-    validate_document(tool_schema, tool, "tool-fastp.json")
-    validate_document(graph_schema, graph, "workflow-graph.json")
-    validate_document(ir_schema, ir, "compiler-ir.json")
+    validate_document(schemas["tool-spec.schema.json"], tool, "tool-fastp.json")
+    validate_document(schemas["workflow-graph.schema.json"], graph, "workflow-graph.json")
+    validate_document(schemas["compiler-ir.schema.json"], ir, "compiler-ir.json")
     validate_document(
-        report_schema, validation_report, "semantic-mismatch-report.json"
+        schemas["validation-report.schema.json"],
+        report,
+        "semantic-mismatch-report.json",
     )
 
     tool_digest = canonical_digest(tool)
     tool_nodes = [node for node in graph["nodes"] if node["type"] == "tool"]
     if len(tool_nodes) != 1:
         raise AssertionError("The first fixture must contain exactly one tool node")
+    if tool_nodes[0]["tool_ref"]["digest"] != tool_digest:
+        raise AssertionError("Workflow Graph ToolRef digest mismatch")
+    if manifest["tools"][0]["digest"] != tool_digest:
+        raise AssertionError("Manifest ToolSpec digest mismatch")
 
-    graph_tool_digest = tool_nodes[0]["tool_ref"]["digest"]
-    if graph_tool_digest != tool_digest:
-        raise AssertionError(
-            f"ToolRef digest mismatch: graph={graph_tool_digest}, actual={tool_digest}"
-        )
+    semantic_digest = canonical_digest(graph_semantic_document(graph))
+    if manifest["workflow"]["semantic_digest"] != semantic_digest:
+        raise AssertionError("Manifest Workflow semantic digest mismatch")
 
-    manifest_tool_digest = manifest["tools"][0]["digest"]
-    if manifest_tool_digest != tool_digest:
-        raise AssertionError(
-            f"Manifest ToolSpec digest mismatch: manifest={manifest_tool_digest}, "
-            f"actual={tool_digest}"
-        )
-
-    semantic_graph = {
-        key: value
-        for key, value in graph.items()
-        if key not in {"layout", "metadata"}
-    }
-    semantic_digest = canonical_digest(semantic_graph)
-    manifest_graph_digest = manifest["workflow"]["semantic_digest"]
-    if manifest_graph_digest != semantic_digest:
-        raise AssertionError(
-            f"Workflow semantic digest mismatch: manifest={manifest_graph_digest}, "
-            f"actual={semantic_digest}"
-        )
-
-    validate_ir_invariants(ir, tool_digest, semantic_digest)
+    validate_ir(ir, tool_digest, semantic_digest)
     ir_digest = canonical_digest(ir)
     if manifest["ir"]["digest"] != ir_digest:
-        raise AssertionError(
-            f"Compiler IR digest mismatch: manifest={manifest['ir']['digest']}, "
-            f"actual={ir_digest}"
-        )
+        raise AssertionError("Manifest Compiler IR digest mismatch")
     if manifest["ir"]["version"] != ir["ir_version"]:
-        raise AssertionError("Compiler IR version mismatch in manifest")
+        raise AssertionError("Manifest Compiler IR version mismatch")
 
-    artifact_paths = {artifact["path"] for artifact in manifest["artifacts"]}
-    required_artifacts = {"compiler-ir.json", "workflow.wdl", "inputs.template.json"}
-    if not required_artifacts.issubset(artifact_paths):
-        raise AssertionError("Compile manifest is missing required Phase 1 artifacts")
+    artifacts = {artifact["path"] for artifact in manifest["artifacts"]}
+    required = {"compiler-ir.json", "workflow.wdl", "inputs.template.json"}
+    if not required.issubset(artifacts):
+        raise AssertionError("Compile manifest is missing required artifacts")
 
-    validate_report_invariants(validation_report, error_catalog)
+    validate_report(report, catalog)
 
-    wdl_path = FIXTURE / "expected" / "workflow.wdl"
-    wdl = wdl_path.read_text(encoding="utf-8")
-    required_fragments = (
+    wdl = (FIXTURE / "expected" / "workflow.wdl").read_text(encoding="utf-8")
+    for fragment in (
         "version 1.0",
         "task fastp",
         "workflow fastp_demo",
         "call fastp as fastp_1",
-    )
-    for fragment in required_fragments:
+    ):
         if fragment not in wdl:
             raise AssertionError(f"Missing WDL fragment: {fragment}")
 
-    print("Phase 1 ToolSpec, Graph, IR, diagnostics, and golden fixtures are consistent.")
+    print("Phase 1 contracts and golden fixtures are consistent.")
     print(f"ToolSpec digest: {tool_digest}")
     print(f"Workflow semantic digest: {semantic_digest}")
     print(f"Compiler IR digest: {ir_digest}")
-    print(f"Diagnostic catalog entries: {len(error_catalog)}")
+    print(f"Diagnostic catalog entries: {len(catalog)}")
 
 
 if __name__ == "__main__":
