@@ -1,0 +1,166 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bioworkflowmanage.local/schemas/validation-report.schema.json",
+  "title": "BioWorkflowManage Validation Report",
+  "description": "Stable Phase 1 diagnostics contract returned by validators and compiler stages.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "report_version",
+    "status",
+    "validation_id",
+    "summary",
+    "diagnostics"
+  ],
+  "properties": {
+    "report_version": {"const": "1.0.0"},
+    "status": {
+      "type": "string",
+      "enum": ["valid", "invalid", "failed"]
+    },
+    "validation_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "source": {"$ref": "#/$defs/source"},
+    "summary": {"$ref": "#/$defs/summary"},
+    "diagnostics": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/diagnostic"},
+      "maxItems": 10000
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[a-fA-F0-9]{64}$"
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "tool_spec",
+            "workflow_graph",
+            "compiler_ir",
+            "rendered_wdl",
+            "compile_request"
+          ]
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "digest": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["error_count", "warning_count"],
+      "properties": {
+        "error_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000
+        },
+        "warning_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000
+        }
+      }
+    },
+    "location": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "node_id": {"$ref": "#/$defs/identifier"},
+        "edge_id": {"$ref": "#/$defs/identifier"},
+        "port": {"$ref": "#/$defs/identifier"},
+        "tool_id": {"$ref": "#/$defs/identifier"},
+        "line": {"type": "integer", "minimum": 1},
+        "column": {"type": "integer", "minimum": 1}
+      }
+    },
+    "contextValue": {
+      "oneOf": [
+        {"type": ["string", "number", "integer", "boolean", "null"]},
+        {
+          "type": "array",
+          "items": {"type": ["string", "number", "integer", "boolean", "null"]},
+          "maxItems": 256
+        }
+      ]
+    },
+    "diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "stage", "severity", "message"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "pattern": "^[A-Z]+[0-9]{3}$",
+          "minLength": 5,
+          "maxLength": 16
+        },
+        "stage": {
+          "type": "string",
+          "enum": [
+            "parse",
+            "schema",
+            "tool_spec",
+            "resolution",
+            "graph",
+            "type",
+            "lowering",
+            "render",
+            "wdl_validation",
+            "system"
+          ]
+        },
+        "severity": {
+          "type": "string",
+          "enum": ["error", "warning"]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^(|/.*)$",
+          "maxLength": 4096
+        },
+        "location": {"$ref": "#/$defs/location"},
+        "context": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+            "maxLength": 128
+          },
+          "additionalProperties": {"$ref": "#/$defs/contextValue"},
+          "maxProperties": 128
+        },
+        "suggestion": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        }
+      }
+    }
+  }
+}
