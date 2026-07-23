@@ -1,0 +1,344 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bioworkflowmanage.local/schemas/compiler-ir.schema.json",
+  "title": "BioWorkflowManage Compiler IR",
+  "description": "Phase 1 validated intermediate representation used by deterministic renderers.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["ir_version", "source", "target", "tasks", "workflow"],
+  "properties": {
+    "ir_version": {"const": "1.0.0"},
+    "source": {"$ref": "#/$defs/source"},
+    "target": {"$ref": "#/$defs/target"},
+    "tasks": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/task"},
+      "maxItems": 4096
+    },
+    "workflow": {"$ref": "#/$defs/workflow"}
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[a-fA-F0-9]{64}$"
+    },
+    "wdlType": {
+      "type": "string",
+      "enum": [
+        "File",
+        "String",
+        "Int",
+        "Float",
+        "Boolean",
+        "Array[File]",
+        "Array[String]",
+        "Array[Int]",
+        "Array[Float]",
+        "Array[Boolean]"
+      ]
+    },
+    "semanticType": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z0-9_]+)+$",
+      "minLength": 3,
+      "maxLength": 128
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workflow_id",
+        "workflow_schema_version",
+        "workflow_semantic_digest",
+        "tool_digests"
+      ],
+      "properties": {
+        "workflow_id": {"$ref": "#/$defs/identifier"},
+        "workflow_schema_version": {"const": "1.0.0"},
+        "workflow_semantic_digest": {"$ref": "#/$defs/digest"},
+        "tool_digests": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/digest"},
+          "uniqueItems": true,
+          "maxItems": 4096
+        }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["language", "version", "profile"],
+      "properties": {
+        "language": {"const": "wdl"},
+        "version": {"const": "1.0"},
+        "profile": {
+          "type": "string",
+          "enum": ["cromwell-compatible", "miniwdl-compatible"]
+        }
+      }
+    },
+    "typeRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["wdl_type", "optional", "semantic_type"],
+      "properties": {
+        "wdl_type": {"$ref": "#/$defs/wdlType"},
+        "optional": {"type": "boolean"},
+        "semantic_type": {"$ref": "#/$defs/semanticType"}
+      }
+    },
+    "literalExpression": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "wdl_type", "value"],
+      "properties": {
+        "kind": {"const": "literal"},
+        "wdl_type": {"$ref": "#/$defs/wdlType"},
+        "value": {
+          "type": ["string", "number", "integer", "boolean", "array", "null"],
+          "items": {"type": ["string", "number", "integer", "boolean"]}
+        }
+      }
+    },
+    "workflowInputRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "name"],
+      "properties": {
+        "kind": {"const": "workflow_input_ref"},
+        "name": {"$ref": "#/$defs/identifier"}
+      }
+    },
+    "callOutputRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "call", "output"],
+      "properties": {
+        "kind": {"const": "call_output_ref"},
+        "call": {"$ref": "#/$defs/identifier"},
+        "output": {"$ref": "#/$defs/identifier"}
+      }
+    },
+    "bindingExpression": {
+      "oneOf": [
+        {"$ref": "#/$defs/literalExpression"},
+        {"$ref": "#/$defs/workflowInputRef"},
+        {"$ref": "#/$defs/callOutputRef"}
+      ]
+    },
+    "taskInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "type"],
+      "properties": {
+        "name": {"$ref": "#/$defs/identifier"},
+        "type": {"$ref": "#/$defs/typeRef"},
+        "default": {"$ref": "#/$defs/literalExpression"}
+      }
+    },
+    "literalSegment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "value"],
+      "properties": {
+        "kind": {"const": "literal"},
+        "value": {"type": "string", "maxLength": 65536}
+      }
+    },
+    "inputRefSegment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "name"],
+      "properties": {
+        "kind": {"const": "input_ref"},
+        "name": {"$ref": "#/$defs/identifier"}
+      }
+    },
+    "command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["shell", "strict_mode", "segments"],
+      "properties": {
+        "shell": {"const": "bash"},
+        "strict_mode": {"type": "boolean"},
+        "segments": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              {"$ref": "#/$defs/literalSegment"},
+              {"$ref": "#/$defs/inputRefSegment"}
+            ]
+          },
+          "minItems": 1,
+          "maxItems": 8192
+        }
+      }
+    },
+    "pathExpression": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "value"],
+      "properties": {
+        "kind": {"const": "path"},
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048,
+          "not": {
+            "anyOf": [
+              {"pattern": "^(?:/|[A-Za-z]:[\\\\/])"},
+              {"pattern": "(^|/)\\.\\.(/|$)"}
+            ]
+          }
+        }
+      }
+    },
+    "globExpression": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "value"],
+      "properties": {
+        "kind": {"const": "glob"},
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048,
+          "not": {
+            "anyOf": [
+              {"pattern": "^(?:/|[A-Za-z]:[\\\\/])"},
+              {"pattern": "(^|/)\\.\\.(/|$)"}
+            ]
+          }
+        }
+      }
+    },
+    "taskOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "type", "expression"],
+      "properties": {
+        "name": {"$ref": "#/$defs/identifier"},
+        "type": {"$ref": "#/$defs/typeRef"},
+        "expression": {
+          "oneOf": [
+            {"$ref": "#/$defs/pathExpression"},
+            {"$ref": "#/$defs/globExpression"}
+          ]
+        }
+      }
+    },
+    "sourceTool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "tool_version", "spec_version", "digest"],
+      "properties": {
+        "id": {"$ref": "#/$defs/identifier"},
+        "tool_version": {"type": "string", "minLength": 1, "maxLength": 128},
+        "spec_version": {"const": "1.0.0"},
+        "digest": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["docker"],
+      "properties": {
+        "docker": {"type": "string", "minLength": 3, "maxLength": 512},
+        "cpu": {"type": "integer", "minimum": 1, "maximum": 1024},
+        "memory_gb": {"type": "number", "exclusiveMinimum": 0, "maximum": 65536},
+        "disk_gb": {"type": "integer", "minimum": 1, "maximum": 1048576},
+        "max_retries": {"type": "integer", "minimum": 0, "maximum": 20}
+      }
+    },
+    "task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "source_tool", "inputs", "command", "outputs", "runtime"],
+      "properties": {
+        "name": {"$ref": "#/$defs/identifier"},
+        "source_tool": {"$ref": "#/$defs/sourceTool"},
+        "inputs": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/taskInput"},
+          "maxItems": 256
+        },
+        "command": {"$ref": "#/$defs/command"},
+        "outputs": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/taskOutput"},
+          "minItems": 1,
+          "maxItems": 256
+        },
+        "runtime": {"$ref": "#/$defs/runtime"}
+      }
+    },
+    "workflowInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "type"],
+      "properties": {
+        "name": {"$ref": "#/$defs/identifier"},
+        "type": {"$ref": "#/$defs/typeRef"}
+      }
+    },
+    "call": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["alias", "task", "bindings"],
+      "properties": {
+        "alias": {"$ref": "#/$defs/identifier"},
+        "task": {"$ref": "#/$defs/identifier"},
+        "bindings": {
+          "type": "object",
+          "propertyNames": {"$ref": "#/$defs/identifier"},
+          "additionalProperties": {"$ref": "#/$defs/bindingExpression"},
+          "maxProperties": 256
+        }
+      }
+    },
+    "workflowOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "type", "expression"],
+      "properties": {
+        "name": {"$ref": "#/$defs/identifier"},
+        "type": {"$ref": "#/$defs/typeRef"},
+        "expression": {
+          "oneOf": [
+            {"$ref": "#/$defs/workflowInputRef"},
+            {"$ref": "#/$defs/callOutputRef"}
+          ]
+        }
+      }
+    },
+    "workflow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "inputs", "calls", "outputs"],
+      "properties": {
+        "name": {"$ref": "#/$defs/identifier"},
+        "inputs": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/workflowInput"},
+          "maxItems": 4096
+        },
+        "calls": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/call"},
+          "maxItems": 4096
+        },
+        "outputs": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/workflowOutput"},
+          "maxItems": 4096
+        }
+      }
+    }
+  }
+}
