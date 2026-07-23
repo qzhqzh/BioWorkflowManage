@@ -9,11 +9,11 @@
   "workflow": {
     "id": "fastp_demo",
     "graph_schema_version": "1.0.0",
-    "semantic_digest": "sha256:6b2e90ea0b889e5d4148b0353e4ded68ba565dd88724f82add0371f4e745c163"
+    "semantic_digest": "sha256:18535416ae1a082716f0b2a43f35eab3ce821fa4738b71f5299ad62ec2339bc6"
   },
   "ir": {
     "version": "1.0.0",
-    "digest": "sha256:9aade6b3922e3145a9502fe344b3f230bbc441f528c47b699b50c9b897f6e66b"
+    "digest": "sha256:2f77d1d42d7cb8a14dbf4093ad5ae59359144f7572068e8db02c5963accd9462"
   },
   "tools": [
     {
