@@ -1,0 +1,341 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bioworkflowmanage.local/schemas/tool-spec.schema.json",
+  "title": "BioWorkflowManage ToolSpec",
+  "description": "Phase 1 schema for a reusable bioinformatics tool definition.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "id",
+    "name",
+    "tool_version",
+    "container",
+    "inputs",
+    "outputs",
+    "command"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0.0"
+    },
+    "id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "display_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "tool_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 4096
+    },
+    "category": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$",
+      "maxLength": 64
+    },
+    "container": {
+      "$ref": "#/$defs/container"
+    },
+    "inputs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/inputPort"
+      },
+      "maxItems": 256
+    },
+    "outputs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/outputPort"
+      },
+      "minItems": 1,
+      "maxItems": 256
+    },
+    "command": {
+      "$ref": "#/$defs/command"
+    },
+    "runtime": {
+      "$ref": "#/$defs/runtime"
+    },
+    "metadata": {
+      "$ref": "#/$defs/metadata"
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "wdlType": {
+      "type": "string",
+      "enum": [
+        "File",
+        "String",
+        "Int",
+        "Float",
+        "Boolean",
+        "Array[File]",
+        "Array[String]",
+        "Array[Int]",
+        "Array[Float]",
+        "Array[Boolean]"
+      ]
+    },
+    "semanticType": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z0-9_]+)+$",
+      "minLength": 3,
+      "maxLength": 128
+    },
+    "container": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["engine", "image"],
+      "properties": {
+        "engine": {
+          "const": "docker"
+        },
+        "image": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 512,
+          "pattern": "^[^\\s]+(:[^\\s]+|@sha256:[a-fA-F0-9]{64})$"
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^sha256:[a-fA-F0-9]{64}$"
+        }
+      }
+    },
+    "constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "extensions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^\\.[A-Za-z0-9._-]+$"
+          },
+          "uniqueItems": true,
+          "maxItems": 32
+        },
+        "minimum": {
+          "type": "number"
+        },
+        "maximum": {
+          "type": "number"
+        },
+        "min_length": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_length": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "pattern": {
+          "type": "string",
+          "maxLength": 1024
+        },
+        "enum": {
+          "type": "array",
+          "items": {
+            "type": ["string", "number", "integer", "boolean"]
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        }
+      }
+    },
+    "inputPort": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "wdl_type", "semantic_type", "required"],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/identifier"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "wdl_type": {
+          "$ref": "#/$defs/wdlType"
+        },
+        "semantic_type": {
+          "$ref": "#/$defs/semanticType"
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 2048
+        },
+        "default": {
+          "type": ["string", "number", "integer", "boolean", "array", "null"]
+        },
+        "constraints": {
+          "$ref": "#/$defs/constraints"
+        }
+      }
+    },
+    "capture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "value"],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["path", "glob"]
+        },
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048,
+          "not": {
+            "anyOf": [
+              {
+                "pattern": "^(?:/|[A-Za-z]:[\\\\/])"
+              },
+              {
+                "pattern": "(^|/)\\.\\.(/|$)"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "outputPort": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "wdl_type", "semantic_type", "capture"],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/identifier"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "wdl_type": {
+          "$ref": "#/$defs/wdlType"
+        },
+        "semantic_type": {
+          "$ref": "#/$defs/semanticType"
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 2048
+        },
+        "capture": {
+          "$ref": "#/$defs/capture"
+        }
+      }
+    },
+    "command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["shell", "strict_mode", "template"],
+      "properties": {
+        "shell": {
+          "const": "bash"
+        },
+        "strict_mode": {
+          "type": "boolean"
+        },
+        "template": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 65536
+        }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cpu": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024
+        },
+        "memory_gb": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 65536
+        },
+        "disk_gb": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1048576
+        },
+        "max_retries": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 20
+        }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "homepage": {
+          "type": "string",
+          "format": "uri",
+          "maxLength": 2048
+        },
+        "source_repository": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "license": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "authors": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "maxItems": 128
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9_-]*$",
+            "maxLength": 64
+          },
+          "uniqueItems": true,
+          "maxItems": 64
+        },
+        "created_by": {
+          "type": "string",
+          "maxLength": 256
+        }
+      }
+    }
+  }
+}
