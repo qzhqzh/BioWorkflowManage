@@ -1,0 +1,4 @@
+{
+  "fastp_demo.input_reads_1": "/path/to/sample_R1.fastq.gz",
+  "fastp_demo.input_reads_2": "/path/to/sample_R2.fastq.gz"
+}
