@@ -1,0 +1,33 @@
+{
+  "manifest_version": "1.0.0",
+  "compiler_contract": "phase1",
+  "target": {
+    "language": "wdl",
+    "version": "1.0",
+    "profile": "cromwell-compatible"
+  },
+  "workflow": {
+    "id": "fastp_demo",
+    "graph_schema_version": "1.0.0",
+    "semantic_digest": "sha256:6b2e90ea0b889e5d4148b0353e4ded68ba565dd88724f82add0371f4e745c163"
+  },
+  "tools": [
+    {
+      "id": "fastp",
+      "tool_version": "0.23.4",
+      "tool_spec_schema_version": "1.0.0",
+      "digest": "sha256:f65755c1e908864e19c2eefd7781a7dc035de02a90538b2ec527823bdab41bcc",
+      "container": "quay.io/biocontainers/fastp:0.23.4--h5f740d0_0"
+    }
+  ],
+  "artifacts": [
+    {
+      "path": "workflow.wdl",
+      "media_type": "application/wdl"
+    },
+    {
+      "path": "inputs.template.json",
+      "media_type": "application/json"
+    }
+  ]
+}
