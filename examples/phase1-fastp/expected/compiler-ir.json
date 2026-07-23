@@ -3,7 +3,7 @@
   "source": {
     "workflow_id": "fastp_demo",
     "workflow_schema_version": "1.0.0",
-    "workflow_semantic_digest": "sha256:6b2e90ea0b889e5d4148b0353e4ded68ba565dd88724f82add0371f4e745c163",
+    "workflow_semantic_digest": "sha256:18535416ae1a082716f0b2a43f35eab3ce821fa4738b71f5299ad62ec2339bc6",
     "tool_digests": [
       "sha256:f65755c1e908864e19c2eefd7781a7dc035de02a90538b2ec527823bdab41bcc"
     ]
