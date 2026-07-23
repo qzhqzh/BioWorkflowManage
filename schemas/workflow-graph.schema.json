@@ -1,0 +1,362 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bioworkflowmanage.local/schemas/workflow-graph.schema.json",
+  "title": "BioWorkflowManage Workflow Graph",
+  "description": "Phase 1 schema for a visual bioinformatics workflow DAG.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "id",
+    "name",
+    "target",
+    "nodes",
+    "edges"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0.0"
+    },
+    "id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 4096
+    },
+    "target": {
+      "$ref": "#/$defs/target"
+    },
+    "nodes": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {
+            "$ref": "#/$defs/workflowInputNode"
+          },
+          {
+            "$ref": "#/$defs/toolNode"
+          },
+          {
+            "$ref": "#/$defs/workflowOutputNode"
+          }
+        ]
+      },
+      "minItems": 1,
+      "maxItems": 4096
+    },
+    "edges": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/edge"
+      },
+      "maxItems": 16384
+    },
+    "layout": {
+      "$ref": "#/$defs/layout"
+    },
+    "metadata": {
+      "$ref": "#/$defs/metadata"
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "wdlType": {
+      "type": "string",
+      "enum": [
+        "File",
+        "String",
+        "Int",
+        "Float",
+        "Boolean",
+        "Array[File]",
+        "Array[String]",
+        "Array[Int]",
+        "Array[Float]",
+        "Array[Boolean]"
+      ]
+    },
+    "semanticType": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z0-9_]+)+$",
+      "minLength": 3,
+      "maxLength": 128
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["language", "version", "profile"],
+      "properties": {
+        "language": {
+          "const": "wdl"
+        },
+        "version": {
+          "const": "1.0"
+        },
+        "profile": {
+          "type": "string",
+          "enum": [
+            "cromwell-compatible",
+            "miniwdl-compatible"
+          ]
+        }
+      }
+    },
+    "portContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "wdl_type", "semantic_type"],
+      "properties": {
+        "name": {
+          "const": "value"
+        },
+        "wdl_type": {
+          "$ref": "#/$defs/wdlType"
+        },
+        "semantic_type": {
+          "$ref": "#/$defs/semanticType"
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 2048
+        }
+      }
+    },
+    "workflowInputNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "port"],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "type": {
+          "const": "workflow_input"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "port": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/portContract"
+            },
+            {
+              "type": "object",
+              "required": ["required"]
+            }
+          ]
+        }
+      }
+    },
+    "toolRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "tool_version",
+        "spec_version",
+        "digest"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "tool_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "spec_version": {
+          "const": "1.0.0"
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^sha256:[a-fA-F0-9]{64}$"
+        }
+      }
+    },
+    "parameterValue": {
+      "type": [
+        "string",
+        "number",
+        "integer",
+        "boolean",
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": ["string", "number", "integer", "boolean"]
+      }
+    },
+    "toolNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "tool_ref"],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "type": {
+          "const": "tool"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "tool_ref": {
+          "$ref": "#/$defs/toolRef"
+        },
+        "parameter_values": {
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/identifier"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/parameterValue"
+          },
+          "maxProperties": 256
+        }
+      }
+    },
+    "workflowOutputNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "port"],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "type": {
+          "const": "workflow_output"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "port": {
+          "$ref": "#/$defs/portContract"
+        }
+      }
+    },
+    "endpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["node_id", "port"],
+      "properties": {
+        "node_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "port": {
+          "$ref": "#/$defs/identifier"
+        }
+      }
+    },
+    "edge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "source", "target"],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "source": {
+          "$ref": "#/$defs/endpoint"
+        },
+        "target": {
+          "$ref": "#/$defs/endpoint"
+        }
+      }
+    },
+    "position": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y"],
+      "properties": {
+        "x": {
+          "type": "number"
+        },
+        "y": {
+          "type": "number"
+        }
+      }
+    },
+    "viewport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "zoom"],
+      "properties": {
+        "x": {
+          "type": "number"
+        },
+        "y": {
+          "type": "number"
+        },
+        "zoom": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 16
+        }
+      }
+    },
+    "layout": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "nodes": {
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/identifier"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/position"
+          }
+        },
+        "viewport": {
+          "$ref": "#/$defs/viewport"
+        }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "created_by": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9_-]*$",
+            "maxLength": 64
+          },
+          "uniqueItems": true,
+          "maxItems": 64
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 4096
+        }
+      }
+    }
+  }
+}
