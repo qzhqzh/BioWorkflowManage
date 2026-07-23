@@ -1,0 +1,102 @@
+{
+  "schema_version": "1.0.0",
+  "id": "fastp",
+  "name": "fastp",
+  "display_name": "fastp paired-end preprocessing",
+  "tool_version": "0.23.4",
+  "description": "Quality filtering and adapter trimming for paired-end FASTQ reads.",
+  "category": "quality_control",
+  "container": {
+    "engine": "docker",
+    "image": "quay.io/biocontainers/fastp:0.23.4--h5f740d0_0"
+  },
+  "inputs": [
+    {
+      "name": "reads_1",
+      "label": "Read 1 FASTQ",
+      "wdl_type": "File",
+      "semantic_type": "bio.fastq.gz.r1",
+      "required": true,
+      "constraints": {
+        "extensions": [".fastq.gz", ".fq.gz"]
+      }
+    },
+    {
+      "name": "reads_2",
+      "label": "Read 2 FASTQ",
+      "wdl_type": "File",
+      "semantic_type": "bio.fastq.gz.r2",
+      "required": true,
+      "constraints": {
+        "extensions": [".fastq.gz", ".fq.gz"]
+      }
+    },
+    {
+      "name": "threads",
+      "wdl_type": "Int",
+      "semantic_type": "core.integer",
+      "required": false,
+      "default": 4,
+      "constraints": {
+        "minimum": 1,
+        "maximum": 64
+      }
+    }
+  ],
+  "outputs": [
+    {
+      "name": "clean_reads_1",
+      "label": "Clean read 1 FASTQ",
+      "wdl_type": "File",
+      "semantic_type": "bio.fastq.gz.r1",
+      "capture": {
+        "mode": "path",
+        "value": "outputs/clean_R1.fastq.gz"
+      }
+    },
+    {
+      "name": "clean_reads_2",
+      "label": "Clean read 2 FASTQ",
+      "wdl_type": "File",
+      "semantic_type": "bio.fastq.gz.r2",
+      "capture": {
+        "mode": "path",
+        "value": "outputs/clean_R2.fastq.gz"
+      }
+    },
+    {
+      "name": "html_report",
+      "label": "fastp HTML report",
+      "wdl_type": "File",
+      "semantic_type": "bio.report.html",
+      "capture": {
+        "mode": "path",
+        "value": "outputs/fastp.html"
+      }
+    },
+    {
+      "name": "json_report",
+      "label": "fastp JSON report",
+      "wdl_type": "File",
+      "semantic_type": "bio.report.json",
+      "capture": {
+        "mode": "path",
+        "value": "outputs/fastp.json"
+      }
+    }
+  ],
+  "command": {
+    "shell": "bash",
+    "strict_mode": true,
+    "template": "mkdir -p outputs\nfastp \\\n  --in1 {{ inputs.reads_1 }} \\\n  --in2 {{ inputs.reads_2 }} \\\n  --out1 outputs/clean_R1.fastq.gz \\\n  --out2 outputs/clean_R2.fastq.gz \\\n  --html outputs/fastp.html \\\n  --json outputs/fastp.json \\\n  --thread {{ inputs.threads }}\n"
+  },
+  "runtime": {
+    "cpu": 4,
+    "memory_gb": 8,
+    "disk_gb": 20
+  },
+  "metadata": {
+    "license": "MIT",
+    "tags": ["qc", "fastq"]
+  }
+}
