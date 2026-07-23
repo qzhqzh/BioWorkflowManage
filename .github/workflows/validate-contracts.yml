@@ -1,0 +1,32 @@
+name: Validate Phase 1 Contracts
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install validators
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "jsonschema>=4.20,<5" "miniwdl>=1.10,<2"
+
+      - name: Validate JSON contracts and fixture digests
+        run: python scripts/validate_contracts.py
+
+      - name: Validate generated WDL syntax
+        run: miniwdl check examples/phase1-fastp/expected/workflow.wdl
