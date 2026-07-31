@@ -1,4 +1,4 @@
-name: Validate Phase 1 Contracts
+name: Validate BioWorkflowManage
 
 on:
   push:
@@ -7,26 +7,159 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: validate-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  validate-contracts:
+  contracts-and-golden:
+    name: Contracts and golden fixtures
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.12"
-          cache: pip
+          enable-cache: true
+          cache-dependency-glob: uv.lock
 
-      - name: Install validators
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install "jsonschema>=4.20,<5" "miniwdl>=1.10,<2"
+      - name: Install Python dependencies
+        run: uv sync --frozen
 
       - name: Validate JSON contracts and fixture digests
-        run: python scripts/validate_contracts.py
+        run: uv run python scripts/validate_contracts.py
 
       - name: Validate generated WDL syntax
-        run: miniwdl check examples/phase1-fastp/expected/workflow.wdl
+        run: uv run python scripts/miniwdl_runtime.py check
+
+  miniwdl-runtime-smoke:
+    name: miniwdl isolated runtime smoke
+    runs-on: ubuntu-latest
+    needs: [contracts-and-golden]
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run a real miniwdl container task
+        run: ./scripts/miniwdl.sh smoke
+
+      - name: Show runtime logs on failure
+        if: failure()
+        run: ./scripts/miniwdl.sh logs
+
+      - name: Upload miniwdl runtime diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: miniwdl-runtime-${{ github.run_id }}
+          path: data/miniwdl/work/runs
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Stop the isolated runtime
+        if: always()
+        run: ./scripts/miniwdl.sh stop
+
+  backend:
+    name: Backend quality gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install Python dependencies
+        run: uv sync --frozen
+
+      - name: Lint backend
+        run: uvx --from ruff==0.15.14 ruff check backend scripts/miniwdl_runtime.py
+
+      - name: Run backend tests
+        run: uv run pytest backend/tests
+
+      - name: Run Django system checks
+        run: uv run python backend/manage.py check
+
+      - name: Check for missing migrations
+        run: uv run python backend/manage.py makemigrations --check --dry-run
+
+  frontend:
+    name: Frontend quality gates
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+
+      - name: Cache Bun packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('frontend/bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Type-check frontend
+        run: bun run typecheck
+
+      - name: Build frontend
+        run: bun run build
+
+  end-to-end:
+    name: Docker Compose browser smoke tests
+    runs-on: ubuntu-latest
+    needs: [contracts-and-golden, backend, frontend]
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: bun install --frozen-lockfile
+
+      - name: Install Playwright Chromium
+        working-directory: frontend
+        run: bunx playwright install --with-deps chromium
+
+      - name: Build and start the application
+        run: docker compose up -d --build --wait
+
+      - name: Run browser smoke tests
+        working-directory: frontend
+        env:
+          PLAYWRIGHT_BASE_URL: http://127.0.0.1:8082
+        run: bun run test:e2e
+
+      - name: Show container logs on failure
+        if: failure()
+        run: docker compose logs --no-color
+
+      - name: Stop the application
+        if: always()
+        run: docker compose down
