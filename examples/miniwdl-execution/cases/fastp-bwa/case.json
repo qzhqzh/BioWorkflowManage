@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "id": "fastp-bwa",
+  "title": "fastp → BWA → samtools 真实运行",
+  "description": "运行时验收版先生成 BWA 索引，再由独立 samtools task 生成并检查 BAM；用于验证完整执行链路。",
+  "wdl": "examples/miniwdl-execution/cases/fastp-bwa/run-ready.wdl",
+  "runnable": true,
+  "inputs": {
+    "fastp_bwa_runtime.input_reads_1": {
+      "path": "sample_R1.fastq.gz",
+      "description": "双端测序 R1，gzip FASTQ",
+      "format": "fastq_gz",
+      "pair": "sample",
+      "mate": 1
+    },
+    "fastp_bwa_runtime.input_reads_2": {
+      "path": "sample_R2.fastq.gz",
+      "description": "双端测序 R2，gzip FASTQ",
+      "format": "fastq_gz",
+      "pair": "sample",
+      "mate": 2
+    },
+    "fastp_bwa_runtime.input_reference": {
+      "path": "reference.fa",
+      "description": "未预建索引的 FASTA 参考序列",
+      "format": "fasta"
+    }
+  },
+  "expected_outputs": [
+    {
+      "name": "fastp_bwa_runtime.output_aligned_bam",
+      "type": "File"
+    },
+    {
+      "name": "fastp_bwa_runtime.output_fastp_html",
+      "type": "File"
+    },
+    {
+      "name": "fastp_bwa_runtime.output_fastp_json",
+      "type": "File"
+    }
+  ],
+  "compiled_source": {
+    "wdl": "examples/phase1-fastp-bwa/expected/workflow.wdl",
+    "execution_status": "blocked",
+    "runtime_blockers": [
+      "BWA task 只声明 reference.fa，miniwdl 不会自动挂载同目录的 .amb/.ann/.bwt/.pac/.sa 索引文件。",
+      "当前 BWA 镜像包含 bwa 但不包含命令中调用的 samtools，执行到管道时会返回 exit 127。"
+    ]
+  }
+}

@@ -10,6 +10,12 @@
     "ir_version": {"const": "1.0.0"},
     "source": {"$ref": "#/$defs/source"},
     "target": {"$ref": "#/$defs/target"},
+    "imports": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/workflowImport"},
+      "uniqueItems": true,
+      "maxItems": 4096
+    },
     "tasks": {
       "type": "array",
       "items": {"$ref": "#/$defs/task"},
@@ -27,6 +33,30 @@
     "digest": {
       "type": "string",
       "pattern": "^sha256:[a-fA-F0-9]{64}$"
+    },
+    "artifactPath": {
+      "type": "string",
+      "minLength": 5,
+      "maxLength": 2048,
+      "pattern": "\\.wdl$",
+      "not": {
+        "anyOf": [
+          {"pattern": "^(?:/|[A-Za-z]:[\\\\/])"},
+          {"pattern": "(^|/)\\.\\.(/|$)"}
+        ]
+      }
+    },
+    "workflowImport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "namespace", "slug", "version", "semantic_digest"],
+      "properties": {
+        "path": {"$ref": "#/$defs/artifactPath"},
+        "namespace": {"$ref": "#/$defs/identifier"},
+        "slug": {"$ref": "#/$defs/identifier"},
+        "version": {"type": "integer", "minimum": 1},
+        "semantic_digest": {"$ref": "#/$defs/digest"}
+      }
     },
     "wdlType": {
       "type": "string",
@@ -294,6 +324,7 @@
       "properties": {
         "alias": {"$ref": "#/$defs/identifier"},
         "task": {"$ref": "#/$defs/identifier"},
+        "namespace": {"$ref": "#/$defs/identifier"},
         "bindings": {
           "type": "object",
           "propertyNames": {"$ref": "#/$defs/identifier"},

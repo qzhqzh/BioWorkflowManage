@@ -1,0 +1,18 @@
+{
+  "fixture_version": "1.0.0",
+  "scenario": "linear",
+  "workflow_graph": "workflow-graph.json",
+  "tool_specs": [
+    "../phase1-fastp/tool-fastp.json",
+    "tool-bwa-mem.json"
+  ],
+  "invalid_workflow_graphs": [
+    "invalid/workflow-graph-semantic-mismatch.json"
+  ],
+  "expected_artifacts": [
+    "expected/compiler-ir.json",
+    "expected/workflow.wdl",
+    "expected/inputs.template.json",
+    "expected/compile-manifest.json"
+  ]
+}

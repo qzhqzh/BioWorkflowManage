@@ -1,0 +1,49 @@
+{
+  "manifest_version": "1.0.0",
+  "compiler_contract": "phase1",
+  "target": {
+    "language": "wdl",
+    "version": "1.0",
+    "profile": "miniwdl-compatible"
+  },
+  "workflow": {
+    "id": "fastp_bwa_demo",
+    "graph_schema_version": "1.0.0",
+    "semantic_digest": "sha256:d31efa4020ab45a5964b1f906503eda97a8fb9ece0accf0526bbbad771c6b87e"
+  },
+  "ir": {
+    "version": "1.0.0",
+    "digest": "sha256:602fa829b7c79116e33ca343912e41942acf6a3cf38a23fa945f9b636404850d"
+  },
+  "tools": [
+    {
+      "id": "bwa_mem",
+      "tool_version": "0.7.17",
+      "tool_spec_schema_version": "1.0.0",
+      "digest": "sha256:55e326f6622aa2fbf9c5fa209e77f2ad08514dbfe8ff169b863941f2b1379bd2",
+      "container": "quay.io/biocontainers/bwa:0.7.17--he4a0461_11"
+    },
+    {
+      "id": "fastp",
+      "tool_version": "0.23.4",
+      "tool_spec_schema_version": "1.0.0",
+      "digest": "sha256:f65755c1e908864e19c2eefd7781a7dc035de02a90538b2ec527823bdab41bcc",
+      "container": "quay.io/biocontainers/fastp:0.23.4--h5f740d0_0"
+    }
+  ],
+  "subworkflows": [],
+  "artifacts": [
+    {
+      "path": "compiler-ir.json",
+      "media_type": "application/json"
+    },
+    {
+      "path": "workflow.wdl",
+      "media_type": "application/wdl"
+    },
+    {
+      "path": "inputs.template.json",
+      "media_type": "application/json"
+    }
+  ]
+}

@@ -1,0 +1,194 @@
+{
+  "schema_version": "1.0.0",
+  "id": "fastp_bwa_demo",
+  "name": "fastp → BWA-MEM demo",
+  "description": "Paired-end quality control followed by reference alignment.",
+  "target": {
+    "language": "wdl",
+    "version": "1.0",
+    "profile": "miniwdl-compatible"
+  },
+  "nodes": [
+    {
+      "id": "input_reads_1",
+      "type": "workflow_input",
+      "label": "Read 1 FASTQ",
+      "port": {
+        "name": "value",
+        "wdl_type": "File",
+        "semantic_type": "bio.fastq.gz.r1",
+        "required": true
+      }
+    },
+    {
+      "id": "input_reads_2",
+      "type": "workflow_input",
+      "label": "Read 2 FASTQ",
+      "port": {
+        "name": "value",
+        "wdl_type": "File",
+        "semantic_type": "bio.fastq.gz.r2",
+        "required": true
+      }
+    },
+    {
+      "id": "input_reference",
+      "type": "workflow_input",
+      "label": "Reference FASTA",
+      "port": {
+        "name": "value",
+        "wdl_type": "File",
+        "semantic_type": "bio.reference.fasta",
+        "required": true
+      }
+    },
+    {
+      "id": "fastp_1",
+      "type": "tool",
+      "label": "fastp",
+      "tool_ref": {
+        "id": "fastp",
+        "tool_version": "0.23.4",
+        "spec_version": "1.0.0",
+        "digest": "sha256:f65755c1e908864e19c2eefd7781a7dc035de02a90538b2ec527823bdab41bcc"
+      },
+      "parameter_values": {
+        "threads": 4
+      }
+    },
+    {
+      "id": "bwa_mem_1",
+      "type": "tool",
+      "label": "BWA-MEM",
+      "tool_ref": {
+        "id": "bwa_mem",
+        "tool_version": "0.7.17",
+        "spec_version": "1.0.0",
+        "digest": "sha256:55e326f6622aa2fbf9c5fa209e77f2ad08514dbfe8ff169b863941f2b1379bd2"
+      },
+      "parameter_values": {
+        "threads": 8
+      }
+    },
+    {
+      "id": "output_aligned_bam",
+      "type": "workflow_output",
+      "label": "Aligned BAM",
+      "port": {
+        "name": "value",
+        "wdl_type": "File",
+        "semantic_type": "bio.alignment.bam"
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "edge_reads_1_fastp",
+      "source": {
+        "node_id": "input_reference",
+        "port": "value"
+      },
+      "target": {
+        "node_id": "fastp_1",
+        "port": "reads_1"
+      }
+    },
+    {
+      "id": "edge_reads_2_fastp",
+      "source": {
+        "node_id": "input_reads_2",
+        "port": "value"
+      },
+      "target": {
+        "node_id": "fastp_1",
+        "port": "reads_2"
+      }
+    },
+    {
+      "id": "edge_reference_bwa",
+      "source": {
+        "node_id": "input_reference",
+        "port": "value"
+      },
+      "target": {
+        "node_id": "bwa_mem_1",
+        "port": "reference"
+      }
+    },
+    {
+      "id": "edge_fastp_clean_1_bwa",
+      "source": {
+        "node_id": "fastp_1",
+        "port": "clean_reads_1"
+      },
+      "target": {
+        "node_id": "bwa_mem_1",
+        "port": "reads_1"
+      }
+    },
+    {
+      "id": "edge_fastp_clean_2_bwa",
+      "source": {
+        "node_id": "fastp_1",
+        "port": "clean_reads_2"
+      },
+      "target": {
+        "node_id": "bwa_mem_1",
+        "port": "reads_2"
+      }
+    },
+    {
+      "id": "edge_bwa_bam",
+      "source": {
+        "node_id": "bwa_mem_1",
+        "port": "aligned_bam"
+      },
+      "target": {
+        "node_id": "output_aligned_bam",
+        "port": "value"
+      }
+    }
+  ],
+  "layout": {
+    "nodes": {
+      "input_reads_1": {
+        "x": 0,
+        "y": 20
+      },
+      "input_reads_2": {
+        "x": 0,
+        "y": 180
+      },
+      "input_reference": {
+        "x": 320,
+        "y": 340
+      },
+      "fastp_1": {
+        "x": 320,
+        "y": 100
+      },
+      "bwa_mem_1": {
+        "x": 680,
+        "y": 160
+      },
+      "output_aligned_bam": {
+        "x": 1040,
+        "y": 160
+      }
+    },
+    "viewport": {
+      "x": 0,
+      "y": 0,
+      "zoom": 1
+    }
+  },
+  "metadata": {
+    "tags": [
+      "phase1",
+      "fastp",
+      "bwa",
+      "alignment"
+    ],
+    "notes": "Default two-tool DAG used to demonstrate tool chaining."
+  }
+}

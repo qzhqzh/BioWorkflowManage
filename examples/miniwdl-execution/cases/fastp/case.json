@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "id": "fastp",
+  "title": "编译产物 fastp 真实运行",
+  "description": "直接运行编译器生成的 fastp golden WDL，验证双端 FASTQ 清洗和报告输出。",
+  "wdl": "examples/phase1-fastp/expected/workflow.wdl",
+  "runnable": true,
+  "inputs": {
+    "fastp_demo.input_reads_1": {
+      "path": "sample_R1.fastq.gz",
+      "description": "双端测序 R1，gzip FASTQ",
+      "format": "fastq_gz",
+      "pair": "sample",
+      "mate": 1
+    },
+    "fastp_demo.input_reads_2": {
+      "path": "sample_R2.fastq.gz",
+      "description": "双端测序 R2，gzip FASTQ",
+      "format": "fastq_gz",
+      "pair": "sample",
+      "mate": 2
+    }
+  },
+  "expected_outputs": [
+    {
+      "name": "fastp_demo.output_clean_reads_1",
+      "type": "File"
+    },
+    {
+      "name": "fastp_demo.output_clean_reads_2",
+      "type": "File"
+    },
+    {
+      "name": "fastp_demo.output_html_report",
+      "type": "File"
+    }
+  ],
+  "compiled_source": {
+    "wdl": "examples/phase1-fastp/expected/workflow.wdl",
+    "execution_status": "awaiting_data",
+    "runtime_blockers": []
+  }
+}

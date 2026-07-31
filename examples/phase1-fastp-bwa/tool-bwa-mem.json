@@ -1,0 +1,77 @@
+{
+  "schema_version": "1.0.0",
+  "id": "bwa_mem",
+  "name": "bwa mem",
+  "display_name": "BWA-MEM paired-end alignment",
+  "tool_version": "0.7.17",
+  "description": "Align paired-end FASTQ reads to a reference genome and emit a BAM file.",
+  "category": "alignment",
+  "container": {
+    "engine": "docker",
+    "image": "quay.io/biocontainers/bwa:0.7.17--he4a0461_11"
+  },
+  "inputs": [
+    {
+      "name": "reference",
+      "label": "Reference FASTA",
+      "wdl_type": "File",
+      "semantic_type": "bio.reference.fasta",
+      "required": true
+    },
+    {
+      "name": "reads_1",
+      "label": "Clean read 1 FASTQ",
+      "wdl_type": "File",
+      "semantic_type": "bio.fastq.gz.r1",
+      "required": true
+    },
+    {
+      "name": "reads_2",
+      "label": "Clean read 2 FASTQ",
+      "wdl_type": "File",
+      "semantic_type": "bio.fastq.gz.r2",
+      "required": true
+    },
+    {
+      "name": "threads",
+      "wdl_type": "Int",
+      "semantic_type": "core.integer",
+      "required": false,
+      "default": 8,
+      "constraints": {
+        "minimum": 1,
+        "maximum": 64
+      }
+    }
+  ],
+  "outputs": [
+    {
+      "name": "aligned_bam",
+      "label": "Aligned BAM",
+      "wdl_type": "File",
+      "semantic_type": "bio.alignment.bam",
+      "capture": {
+        "mode": "path",
+        "value": "outputs/aligned.bam"
+      }
+    }
+  ],
+  "command": {
+    "shell": "bash",
+    "strict_mode": true,
+    "template": "mkdir -p outputs\nbwa mem -t {{ inputs.threads }} {{ inputs.reference }} {{ inputs.reads_1 }} {{ inputs.reads_2 }} | samtools view -b -o outputs/aligned.bam -\n"
+  },
+  "runtime": {
+    "cpu": 8,
+    "memory_gb": 16,
+    "disk_gb": 40
+  },
+  "metadata": {
+    "license": "GPL-3.0",
+    "tags": [
+      "alignment",
+      "bwa",
+      "bam"
+    ]
+  }
+}

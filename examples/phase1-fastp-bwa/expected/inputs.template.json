@@ -1,0 +1,5 @@
+{
+  "fastp_bwa_demo.input_reads_1": "/path/to/input_reads_1",
+  "fastp_bwa_demo.input_reads_2": "/path/to/input_reads_2",
+  "fastp_bwa_demo.input_reference": "/path/to/input_reference"
+}

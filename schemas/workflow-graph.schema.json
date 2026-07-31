@@ -43,6 +43,9 @@
             "$ref": "#/$defs/toolNode"
           },
           {
+            "$ref": "#/$defs/subworkflowNode"
+          },
+          {
             "$ref": "#/$defs/workflowOutputNode"
           }
         ]
@@ -232,6 +235,39 @@
             "$ref": "#/$defs/parameterValue"
           },
           "maxProperties": 256
+        }
+      }
+    },
+    "subworkflowRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slug", "version", "digest"],
+      "properties": {
+        "slug": { "$ref": "#/$defs/identifier" },
+        "version": { "type": "integer", "minimum": 1 },
+        "digest": {
+          "type": "string",
+          "pattern": "^sha256:[a-fA-F0-9]{64}$"
+        }
+      }
+    },
+    "subworkflowNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "subworkflow_ref", "interface_contract"],
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" },
+        "type": { "const": "subworkflow" },
+        "label": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "subworkflow_ref": { "$ref": "#/$defs/subworkflowRef" },
+        "interface_contract": {
+          "type": "object",
+          "required": ["inputs", "outputs"],
+          "properties": {
+            "contract_version": { "type": "string" },
+            "inputs": { "type": "array" },
+            "outputs": { "type": "array" }
+          }
         }
       }
     },

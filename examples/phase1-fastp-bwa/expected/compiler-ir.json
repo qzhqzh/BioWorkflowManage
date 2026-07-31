@@ -1,0 +1,350 @@
+{
+  "ir_version": "1.0.0",
+  "source": {
+    "workflow_id": "fastp_bwa_demo",
+    "workflow_schema_version": "1.0.0",
+    "workflow_semantic_digest": "sha256:d31efa4020ab45a5964b1f906503eda97a8fb9ece0accf0526bbbad771c6b87e",
+    "tool_digests": [
+      "sha256:55e326f6622aa2fbf9c5fa209e77f2ad08514dbfe8ff169b863941f2b1379bd2",
+      "sha256:f65755c1e908864e19c2eefd7781a7dc035de02a90538b2ec527823bdab41bcc"
+    ]
+  },
+  "target": {
+    "language": "wdl",
+    "version": "1.0",
+    "profile": "miniwdl-compatible"
+  },
+  "imports": [],
+  "tasks": [
+    {
+      "name": "bwa_mem",
+      "source_tool": {
+        "id": "bwa_mem",
+        "tool_version": "0.7.17",
+        "spec_version": "1.0.0",
+        "digest": "sha256:55e326f6622aa2fbf9c5fa209e77f2ad08514dbfe8ff169b863941f2b1379bd2"
+      },
+      "inputs": [
+        {
+          "name": "reads_1",
+          "type": {
+            "wdl_type": "File",
+            "optional": false,
+            "semantic_type": "bio.fastq.gz.r1"
+          }
+        },
+        {
+          "name": "reads_2",
+          "type": {
+            "wdl_type": "File",
+            "optional": false,
+            "semantic_type": "bio.fastq.gz.r2"
+          }
+        },
+        {
+          "name": "reference",
+          "type": {
+            "wdl_type": "File",
+            "optional": false,
+            "semantic_type": "bio.reference.fasta"
+          }
+        },
+        {
+          "name": "threads",
+          "type": {
+            "wdl_type": "Int",
+            "optional": true,
+            "semantic_type": "core.integer"
+          },
+          "default": {
+            "kind": "literal",
+            "wdl_type": "Int",
+            "value": 8
+          }
+        }
+      ],
+      "command": {
+        "shell": "bash",
+        "strict_mode": true,
+        "segments": [
+          {
+            "kind": "literal",
+            "value": "mkdir -p outputs\nbwa mem -t "
+          },
+          {
+            "kind": "input_ref",
+            "name": "threads"
+          },
+          {
+            "kind": "literal",
+            "value": " "
+          },
+          {
+            "kind": "input_ref",
+            "name": "reference"
+          },
+          {
+            "kind": "literal",
+            "value": " "
+          },
+          {
+            "kind": "input_ref",
+            "name": "reads_1"
+          },
+          {
+            "kind": "literal",
+            "value": " "
+          },
+          {
+            "kind": "input_ref",
+            "name": "reads_2"
+          },
+          {
+            "kind": "literal",
+            "value": " | samtools view -b -o outputs/aligned.bam -\n"
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "name": "aligned_bam",
+          "type": {
+            "wdl_type": "File",
+            "optional": false,
+            "semantic_type": "bio.alignment.bam"
+          },
+          "expression": {
+            "kind": "path",
+            "value": "outputs/aligned.bam"
+          }
+        }
+      ],
+      "runtime": {
+        "docker": "quay.io/biocontainers/bwa:0.7.17--he4a0461_11",
+        "cpu": 8,
+        "memory_gb": 16,
+        "disk_gb": 40
+      }
+    },
+    {
+      "name": "fastp",
+      "source_tool": {
+        "id": "fastp",
+        "tool_version": "0.23.4",
+        "spec_version": "1.0.0",
+        "digest": "sha256:f65755c1e908864e19c2eefd7781a7dc035de02a90538b2ec527823bdab41bcc"
+      },
+      "inputs": [
+        {
+          "name": "reads_1",
+          "type": {
+            "wdl_type": "File",
+            "optional": false,
+            "semantic_type": "bio.fastq.gz.r1"
+          }
+        },
+        {
+          "name": "reads_2",
+          "type": {
+            "wdl_type": "File",
+            "optional": false,
+            "semantic_type": "bio.fastq.gz.r2"
+          }
+        },
+        {
+          "name": "threads",
+          "type": {
+            "wdl_type": "Int",
+            "optional": true,
+            "semantic_type": "core.integer"
+          },
+          "default": {
+            "kind": "literal",
+            "wdl_type": "Int",
+            "value": 4
+          }
+        }
+      ],
+      "command": {
+        "shell": "bash",
+        "strict_mode": true,
+        "segments": [
+          {
+            "kind": "literal",
+            "value": "mkdir -p outputs\nfastp \\\n  --in1 "
+          },
+          {
+            "kind": "input_ref",
+            "name": "reads_1"
+          },
+          {
+            "kind": "literal",
+            "value": " \\\n  --in2 "
+          },
+          {
+            "kind": "input_ref",
+            "name": "reads_2"
+          },
+          {
+            "kind": "literal",
+            "value": " \\\n  --out1 outputs/clean_R1.fastq.gz \\\n  --out2 outputs/clean_R2.fastq.gz \\\n  --html outputs/fastp.html \\\n  --json outputs/fastp.json \\\n  --thread "
+          },
+          {
+            "kind": "input_ref",
+            "name": "threads"
+          },
+          {
+            "kind": "literal",
+            "value": "\n"
+          }
+        ]
+      },
+      "outputs": [
+        {
+          "name": "clean_reads_1",
+          "type": {
+            "wdl_type": "File",
+            "optional": false,
+            "semantic_type": "bio.fastq.gz.r1"
+          },
+          "expression": {
+            "kind": "path",
+            "value": "outputs/clean_R1.fastq.gz"
+          }
+        },
+        {
+          "name": "clean_reads_2",
+          "type": {
+            "wdl_type": "File",
+            "optional": false,
+            "semantic_type": "bio.fastq.gz.r2"
+          },
+          "expression": {
+            "kind": "path",
+            "value": "outputs/clean_R2.fastq.gz"
+          }
+        },
+        {
+          "name": "html_report",
+          "type": {
+            "wdl_type": "File",
+            "optional": false,
+            "semantic_type": "bio.report.html"
+          },
+          "expression": {
+            "kind": "path",
+            "value": "outputs/fastp.html"
+          }
+        },
+        {
+          "name": "json_report",
+          "type": {
+            "wdl_type": "File",
+            "optional": false,
+            "semantic_type": "bio.report.json"
+          },
+          "expression": {
+            "kind": "path",
+            "value": "outputs/fastp.json"
+          }
+        }
+      ],
+      "runtime": {
+        "docker": "quay.io/biocontainers/fastp:0.23.4--h5f740d0_0",
+        "cpu": 4,
+        "memory_gb": 8,
+        "disk_gb": 20
+      }
+    }
+  ],
+  "workflow": {
+    "name": "fastp_bwa_demo",
+    "inputs": [
+      {
+        "name": "input_reads_1",
+        "type": {
+          "wdl_type": "File",
+          "optional": false,
+          "semantic_type": "bio.fastq.gz.r1"
+        }
+      },
+      {
+        "name": "input_reads_2",
+        "type": {
+          "wdl_type": "File",
+          "optional": false,
+          "semantic_type": "bio.fastq.gz.r2"
+        }
+      },
+      {
+        "name": "input_reference",
+        "type": {
+          "wdl_type": "File",
+          "optional": false,
+          "semantic_type": "bio.reference.fasta"
+        }
+      }
+    ],
+    "calls": [
+      {
+        "alias": "fastp_1",
+        "task": "fastp",
+        "bindings": {
+          "reads_1": {
+            "kind": "workflow_input_ref",
+            "name": "input_reads_1"
+          },
+          "reads_2": {
+            "kind": "workflow_input_ref",
+            "name": "input_reads_2"
+          },
+          "threads": {
+            "kind": "literal",
+            "wdl_type": "Int",
+            "value": 4
+          }
+        }
+      },
+      {
+        "alias": "bwa_mem_1",
+        "task": "bwa_mem",
+        "bindings": {
+          "reads_1": {
+            "kind": "call_output_ref",
+            "call": "fastp_1",
+            "output": "clean_reads_1"
+          },
+          "reads_2": {
+            "kind": "call_output_ref",
+            "call": "fastp_1",
+            "output": "clean_reads_2"
+          },
+          "reference": {
+            "kind": "workflow_input_ref",
+            "name": "input_reference"
+          },
+          "threads": {
+            "kind": "literal",
+            "wdl_type": "Int",
+            "value": 8
+          }
+        }
+      }
+    ],
+    "outputs": [
+      {
+        "name": "output_aligned_bam",
+        "type": {
+          "wdl_type": "File",
+          "optional": false,
+          "semantic_type": "bio.alignment.bam"
+        },
+        "expression": {
+          "kind": "call_output_ref",
+          "call": "bwa_mem_1",
+          "output": "aligned_bam"
+        }
+      }
+    ]
+  }
+}
