@@ -143,6 +143,10 @@ jobs:
         working-directory: frontend
         run: bun install --frozen-lockfile
 
+      - name: Prepare Nuxt types
+        working-directory: frontend
+        run: bunx nuxi prepare
+
       - name: Install Playwright Chromium
         working-directory: frontend
         run: bunx playwright install --with-deps chromium
