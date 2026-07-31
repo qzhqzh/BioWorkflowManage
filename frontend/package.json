@@ -1,0 +1,28 @@
+{
+  "name": "bioworkflow-manage-frontend",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "nuxt build",
+    "dev": "nuxt dev --host 0.0.0.0",
+    "preview": "nuxt preview --host 0.0.0.0",
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
+    "typecheck": "nuxt typecheck"
+  },
+  "dependencies": {
+    "@vue-flow/core": "1.48.2",
+    "diff": "8.0.4",
+    "elkjs": "^0.12.0",
+    "monaco-editor": "0.52.2",
+    "nuxt": "4.5.0",
+    "vue": "^3.5.0",
+    "vue-router": "5.2.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.62.0",
+    "typescript": "^5.9.0",
+    "vue-tsc": "^3.2.0"
+  },
+  "packageManager": "bun@1.3.14"
+}
