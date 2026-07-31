@@ -17,7 +17,7 @@ from workflows.models import (
 
 
 class Command(BaseCommand):
-    help = "Create the deterministic fastp → BWA-MEM Phase 1 demo when it is absent."
+    help = "Create the deterministic Phase 1 demos when they are absent."
 
     def handle(self, *args, **options):
         root = Path(__file__).resolve().parents[4]
@@ -42,6 +42,31 @@ class Command(BaseCommand):
                 "tool_specs": tools,
             },
         )
+
+        fastp_graph = json.loads(
+            (fastp_fixture / "workflow-graph.json").read_text(encoding="utf-8")
+        )
+        fastp_positions = fastp_graph.get("layout", {}).get("nodes", {})
+        fastp_editor = {
+            "nodes": [
+                {"id": node_id, "position": position}
+                for node_id, position in fastp_positions.items()
+            ],
+            "viewport": fastp_graph.get("layout", {}).get(
+                "viewport", {"x": 0, "y": 0, "zoom": 1
+            ),
+        }
+        WorkflowDocument.objects.get_or_create(
+            slug=fastp_graph["id"],
+            defaults={
+                "name": fastp_graph["name"],
+                "description": fastp_graph.get("description", ""),
+                "workflow_graph": fastp_graph,
+                "editor_document": fastp_editor,
+                "tool_specs": [tools[0]],
+            },
+        )
+
         subflow_graph = json.loads(
             (fastp_fixture / "workflow-graph.json").read_text(encoding="utf-8")
         )
@@ -62,7 +87,7 @@ class Command(BaseCommand):
                 for node_id, position in subflow_positions.items()
             ],
             "viewport": subflow_graph.get("layout", {}).get(
-                "viewport", {"x": 0, "y": 0, "zoom": 1}
+                "viewport", {"x": 0, "y": 0, "zoom": 1
             ),
         }
         subflow, _ = WorkflowDocument.objects.get_or_create(
@@ -122,7 +147,7 @@ class Command(BaseCommand):
                     "tool_spec": tool,
                 },
             )
-        self.stdout.write("Created fastp → BWA-MEM demo." if created else "fastp → BWA-MEM demo already exists.")
+        self.stdout.write("Created Phase 1 demos." if created else "Phase 1 demos already exist.")
 
     @staticmethod
     def _contract_port(node):
