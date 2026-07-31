@@ -1,5 +1,9 @@
 # 第一阶段完成定义（Definition of Done）
 
+> 当前状态（2026-07）：核心编译闭环和线性 fastp -> BWA 验收已经实现，但第 5 节
+> 要求的三套完整验收资产尚未全部具备，因此不能宣布本 DoD 全部完成。工具、流程和
+> 子流程版本属于后来落地的 Phase 2 能力，不改变本文件记录的 Phase 1 历史边界。
+
 ## 1. 阶段目标
 
 第一阶段只验证一个核心闭环：
@@ -84,7 +88,7 @@ Workflow Graph + resolved ToolSpecs
 
 ## 3. 第一阶段明确不做
 
-以下能力全部进入第二阶段，不得阻塞第一阶段交付：
+以下能力在原始规划中进入第二阶段，不阻塞 Phase 1 编译器原型：
 
 - 用户、组织、角色和权限体系；
 - Tool Registry 审核、发布和市场；
@@ -96,6 +100,15 @@ Workflow Graph + resolved ToolSpecs
 - 生信软件自动 Benchmark；
 - scatter、conditional、subworkflow 等高级 WDL 语义；
 - WDL 1.1/1.2/1.3 渲染器。
+
+当前实际进展：
+
+- 工具、流程、WDL 和子流程不可变版本已经实现；
+- 固定版本子流程节点已经实现，并可编译为 WDL `import/call`；
+- 用户权限、执行调度、运行日志、Benchmark、AI、scatter 和 conditional 仍未实现。
+
+这里的“生成 WDL 并由 miniwdl 校验”仅表示静态编译成立，不表示平台已经拥有执行
+引擎。真实任务调度、重试、日志、资源和产物回收属于后续独立阶段。
 
 ## 4. 第一阶段支持边界
 
@@ -137,6 +150,20 @@ Workflow Graph + resolved ToolSpecs
 - 正向校验测试；
 - 至少一个故意构造的错误图测试。
 
+### 当前验收资产差距
+
+- `examples/phase1-fastp` 已提供当前 contracts/golden 基线，但不等同于上述 FastQC
+  单节点验收；
+- `examples/phase1-fastp-bwa` 已提供线性流程完整工具束、Workflow Graph、四类
+  expected 产物、确定性编译测试和语义类型错误图；
+- 分支流程的 ToolSpec、Graph、golden 和错误图尚待补齐；
+- 后端已有编译 API 测试；Playwright 已连接真实 Docker Compose 服务并覆盖多流程
+  切换、WDL 滚动预览、节点参数刷新持久化、语义类型冲突诊断、工具不可变版本冲突
+  和完整四类编译产物。编译边界用例使用请求拦截，证明界面行为且不污染真实版本历史。
+
+因此当前 CI 能证明已有契约、两套 golden、后端测试、前端构建和浏览器主链路没有
+回归，但仍不能替代尚缺的 FastQC 单节点与分支产品验收场景。
+
 ## 6. 质量门槛
 
 满足以下条件才能宣布第一阶段完成：
@@ -149,3 +176,13 @@ Workflow Graph + resolved ToolSpecs
 - 三套验收流程在 CI 中生成并校验成功；
 - 文档中的示例与机器可读 Schema 保持一致；
 - 第二阶段功能没有侵入第一阶段核心模型。
+
+## 7. 后续 Beta 门槛
+
+在本 DoD 之外，多流程 Beta 还需要：
+
+- 多流程切换贯穿打开、保存、验证、发布、编译和历史；
+- 工具端口和参数编辑后能够校验并发布不可变新版本；
+- 子流程内部画布可查看，并可显式升级父流程固定的版本；
+- 真实后端 Playwright happy path 和验证失败场景已经具备；
+- 认证授权、并发编辑保护、备份恢复在进入生产环境前完成。

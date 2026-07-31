@@ -269,6 +269,16 @@ java -jar womtool.jar validate workflow.wdl
 
 第一阶段不执行 workflow，不下载容器，不处理真实生信数据。
 
+多流程 Beta 在这条编译器基线之外增加独立的 miniwdl 执行验收 job：
+
+- 无业务数据的容器 smoke 必须真实执行；
+- runner 使用隔离 Docker-in-Docker，不挂宿主 Docker socket；
+- fastp 与 fastp→BWA 案例在测试数据到位后通过独立 preflight/run 命令执行；
+- 运行 smoke 失败不应降级成只有 `miniwdl check` 的假成功。
+
+具体命令、持久化目录和安全边界见
+[`12-miniwdl-execution.md`](12-miniwdl-execution.md)。
+
 ## 11. API Tests
 
 ### 11.1 Contract

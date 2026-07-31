@@ -135,12 +135,31 @@ frontend/
     identifiers.ts
     diagnostics.ts
   generated/contracts/
+  components/
+    layout/
+      AppTopbar.vue
+      AppRail.vue
+    editor/
+      EditorNodeLibraryPanel.vue
+      WorkflowInspectorPanel.vue
+      ArtifactPreviewDrawer.vue
+    libraries/
+      ToolLibraryWorkspace.vue
+      WorkflowLibraryWorkspace.vue
+      HelpWorkspace.vue
   pages/
     index.vue
+    wdl/
+      index.vue
+      [slug].vue
   tests/
 ```
 
 `generated/contracts` 由机器 Schema 生成或同步，不手工维护重复类型。
+页面组件只负责路由级数据编排；共享框架、独立工作区和大块交互面板必须下沉到
+`components`。`index.vue` 当前仍保留 Vue Flow 的核心状态与动作，后续继续按
+`useWorkflowEditor`、`useCanvasLayout`、`useToolRegistry` 等领域 composable 拆分，
+不再把新的业务面板直接堆回页面。
 
 ## 6. 节点类型
 

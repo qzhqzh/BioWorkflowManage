@@ -15,6 +15,8 @@
 9. [Phase 1 REST API](09-rest-api-design.md)
 10. [前端 Workflow Editor](10-frontend-workflow-editor.md)
 11. [测试与 CI](11-testing-and-ci.md)
+12. [miniwdl 校验与隔离执行框架](12-miniwdl-execution.md)
+13. [历史 WDL 资产与工作台](13-historical-wdl-workbench.md)
 
 ## Architecture Decision Records
 
@@ -82,6 +84,7 @@ GitHub Actions 配置：`.github/workflows/validate-contracts.yml`。
 - Stateless REST API；
 - Vue Flow 编辑器边界；
 - 测试、golden fixture 和 CI；
+- miniwdl 静态检查、隔离容器 smoke 和真实数据案例框架；
 - 四项关键架构决策。
 
 下一步可以进入编译器代码骨架和 negative fixtures。用户权限、AI、执行调度和 Benchmark 相关文档暂不进入第一阶段主线。
