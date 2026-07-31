@@ -148,6 +148,8 @@ jobs:
         run: bunx playwright install --with-deps chromium
 
       - name: Build and start the application
+        env:
+          DJANGO_SEED_DEMO: "1"
         run: docker compose up -d --build --wait
 
       - name: Run browser smoke tests
