@@ -1,0 +1,1021 @@
+from __future__ import annotations
+
+import difflib
+import hashlib
+import subprocess
+import tempfile
+import uuid
+from collections import Counter
+from pathlib import Path
+
+import WDL
+from django.conf import settings
+from django.db import transaction
+from django.db.models import Count, Q
+from django.utils.text import slugify
+from rest_framework import status
+from rest_framework.decorators import api_view
+from rest_framework.response import Response
+
+from .models import WDLAuditEvent, WDLAsset, WDLSourceRevision, WDLTag
+
+
+MAX_WDL_CONTENT_LENGTH = 2_000_000
+
+
+class WDLFormatterUnavailable(RuntimeError):
+    pass
+
+
+class WDLFormatterRejected(RuntimeError):
+    pass
+
+
+def _request_id(request) -> str:
+    candidate = request.headers.get("X-Request-ID", "")
+    if candidate and len(candidate) <= 128 and candidate.replace("-", "_").isalnum():
+        return candidate
+    return f"req_{uuid.uuid4().hex}"
+
+
+def _with_request_id(response: Response, request_id: str) -> Response:
+    response["X-Request-ID"] = request_id
+    return response
+
+
+def _actor(request) -> str:
+    user = getattr(request, "user", None)
+    if user is not None and getattr(user, "is_authenticated", False):
+        username = user.get_username()
+        if username:
+            return username[:256]
+    return "local-user"
+
+
+def _digest(content: str) -> str:
+    return "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _normalize_newlines(content: str) -> str:
+    return content.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _source_position(item) -> dict:
+    position = getattr(item, "pos", None)
+    if position is None:
+        return {}
+    return {
+        "line": getattr(position, "line", None),
+        "column": getattr(position, "column", None),
+        "end_line": getattr(position, "end_line", None),
+        "end_column": getattr(position, "end_column", None),
+    }
+
+
+def _declaration_payload(declaration) -> dict:
+    return {
+        "name": declaration.name,
+        "type": str(getattr(declaration, "type", "")),
+        **_source_position(declaration),
+    }
+
+
+def _diagnostic_from_error(error: Exception, code: str) -> dict:
+    position = getattr(error, "pos", None)
+    location = {}
+    if position is not None:
+        location = {
+            "line": getattr(position, "line", None),
+            "column": getattr(position, "column", None),
+        }
+    return {
+        "code": code,
+        "stage": "wdl_analysis",
+        "severity": "error",
+        "message": str(error).strip() or type(error).__name__,
+        **({"location": location} if any(location.values()) else {}),
+    }
+
+
+def analyze_wdl(content: str, filename: str) -> dict:
+    normalized_content = _normalize_newlines(content)
+    try:
+        document = WDL.parse_document(normalized_content, uri=filename)
+    except Exception as error:
+        diagnostics = [_diagnostic_from_error(error, "WDL_PARSE_ERROR")]
+        return {
+            "status": "invalid",
+            "parsed": False,
+            "wdl_version": None,
+            "summary": {
+                "task_count": 0,
+                "workflow_count": 0,
+                "import_count": 0,
+                "error_count": len(diagnostics),
+            },
+            "imports": [],
+            "tasks": [],
+            "workflows": [],
+            "diagnostics": diagnostics,
+        }
+
+    diagnostics = []
+    try:
+        document.typecheck()
+    except Exception as error:
+        diagnostics.append(_diagnostic_from_error(error, "WDL_TYPE_ERROR"))
+
+    tasks = []
+    for task in document.tasks:
+        inputs = [
+            *(getattr(task, "inputs", None) or []),
+            *(getattr(task, "postinputs", None) or []),
+        ]
+        tasks.append(
+            {
+                "name": task.name,
+                **_source_position(task),
+                "inputs": [_declaration_payload(item) for item in inputs],
+                "outputs": [
+                    _declaration_payload(item)
+                    for item in (getattr(task, "outputs", None) or [])
+                ],
+                "runtime_keys": sorted(getattr(task, "runtime", {}).keys()),
+            }
+        )
+
+    workflows = []
+    if document.workflow is not None:
+        body_counts = Counter(
+            type(item).__name__.lower() for item in getattr(document.workflow, "body", [])
+        )
+        workflows.append(
+            {
+                "name": document.workflow.name,
+                **_source_position(document.workflow),
+                "inputs": [
+                    _declaration_payload(item)
+                    for item in (getattr(document.workflow, "inputs", None) or [])
+                ],
+                "outputs": [
+                    _declaration_payload(item)
+                    for item in (getattr(document.workflow, "outputs", None) or [])
+                ],
+                "structure": {
+                    "call_count": body_counts.get("call", 0),
+                    "scatter_count": body_counts.get("scatter", 0),
+                    "conditional_count": body_counts.get("conditional", 0),
+                },
+            }
+        )
+
+    imports = [
+        {
+            "uri": item.uri,
+            "namespace": item.namespace,
+            **_source_position(item),
+        }
+        for item in document.imports
+    ]
+    return {
+        "status": "invalid" if diagnostics else "valid",
+        "parsed": True,
+        "wdl_version": str(document.wdl_version),
+        "summary": {
+            "task_count": len(tasks),
+            "workflow_count": len(workflows),
+            "import_count": len(imports),
+            "error_count": len(diagnostics),
+        },
+        "imports": imports,
+        "tasks": tasks,
+        "workflows": workflows,
+        "diagnostics": diagnostics,
+    }
+
+
+def _unified_diff(before: str, after: str, filename: str) -> str:
+    normalized_before = _normalize_newlines(before)
+    normalized_after = _normalize_newlines(after)
+    if normalized_before == normalized_after:
+        return ""
+    lines = difflib.unified_diff(
+        normalized_before.splitlines(),
+        normalized_after.splitlines(),
+        fromfile=f"{filename} (before)",
+        tofile=f"{filename} (after)",
+        lineterm="",
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _brace_delta(line: str) -> tuple[int, int]:
+    opens = 0
+    closes = 0
+    quote = None
+    escaped = False
+    for character in line:
+        if escaped:
+            escaped = False
+            continue
+        if quote and character == "\\":
+            escaped = True
+            continue
+        if character in {'"', "'"}:
+            quote = None if quote == character else character if quote is None else quote
+            continue
+        if quote is not None:
+            continue
+        if character == "#":
+            break
+        if character == "{":
+            opens += 1
+        elif character == "}":
+            closes += 1
+    return opens, closes
+
+
+def _format_legacy_wdl(content: str, filename: str) -> str:
+    normalized_content = _normalize_newlines(content)
+    document = WDL.parse_document(normalized_content, uri=filename)
+    command_lines: dict[int, tuple[str, int]] = {}
+    source_lines = normalized_content.splitlines()
+    for task in document.tasks:
+        position = getattr(task.command, "pos", None)
+        if position is not None:
+            body_lines = source_lines[position.line : position.end_line - 1]
+            body_indents = [
+                len(line) - len(line.lstrip(" \t"))
+                for line in body_lines
+                if line.strip()
+            ]
+            common_indent = min(body_indents, default=0)
+            command_lines[position.line] = ("delimiter", 0)
+            command_lines[position.end_line] = ("delimiter", 0)
+            for line_number in range(position.line + 1, position.end_line):
+                command_lines[line_number] = ("body", common_indent)
+
+    formatted = []
+    indent = 0
+    continuation_indent = 0
+    blank_count = 0
+    for line_number, raw_line in enumerate(source_lines, start=1):
+        command_line = command_lines.get(line_number)
+        if command_line and command_line[0] == "body":
+            common_indent = command_line[1]
+            if raw_line.strip():
+                formatted.append(f"{'  ' * (indent + 1)}{raw_line[common_indent:]}")
+            else:
+                formatted.append("")
+            blank_count = 0
+            continue
+        stripped = raw_line.strip()
+        if not stripped:
+            blank_count += 1
+            if blank_count <= 1 and formatted:
+                formatted.append("")
+            continue
+        blank_count = 0
+        if stripped.startswith("}") and continuation_indent:
+            indent = max(0, indent - continuation_indent)
+            continuation_indent = 0
+        if command_line and command_line[0] == "delimiter":
+            formatted.append(f"{'  ' * indent}{stripped}")
+            continue
+        leading_closes = len(stripped) - len(stripped.lstrip("}"))
+        line_indent = max(0, indent - leading_closes)
+        formatted.append(f"{'  ' * line_indent}{stripped}")
+        opens, closes = _brace_delta(stripped)
+        indent = max(0, indent + opens - closes)
+        if stripped.endswith(":") and not opens and not closes:
+            indent += 1
+            continuation_indent += 1
+
+    result = "\n".join(formatted).rstrip() + "\n"
+    WDL.parse_document(result, uri=filename)
+    return result
+
+
+def _format_wdl_with_sprocket(content: str, filename: str) -> str:
+    config_path = Path(settings.SPROCKET_FORMAT_CONFIG)
+    if not config_path.is_file():
+        raise WDLFormatterUnavailable("Sprocket formatter configuration is missing.")
+
+    with tempfile.TemporaryDirectory(prefix="bioworkflow-wdl-format-") as temp_dir:
+        source_path = Path(temp_dir) / "source.wdl"
+        source_path.write_text(content, encoding="utf-8", newline="\n")
+        command = [
+            settings.SPROCKET_BINARY,
+            "format",
+            "--skip-config-search",
+            "--config",
+            str(config_path),
+            "view",
+            str(source_path),
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                check=False,
+                encoding="utf-8",
+                timeout=settings.SPROCKET_FORMAT_TIMEOUT_SECONDS,
+            )
+        except FileNotFoundError as error:
+            raise WDLFormatterUnavailable(
+                "Sprocket formatter executable is unavailable."
+            ) from error
+        except subprocess.TimeoutExpired as error:
+            raise WDLFormatterUnavailable(
+                "Sprocket formatter timed out."
+            ) from error
+        except OSError as error:
+            raise WDLFormatterUnavailable(
+                "Sprocket formatter could not be started."
+            ) from error
+
+        if completed.returncode != 0:
+            message = completed.stderr.strip() or "Sprocket rejected the WDL document."
+            message = message.replace(str(source_path), filename)
+            raise WDLFormatterRejected(message[:2000])
+        if not completed.stdout.strip():
+            raise WDLFormatterRejected("Sprocket returned an empty WDL document.")
+        return _normalize_newlines(completed.stdout)
+
+
+def format_wdl(content: str, filename: str) -> str:
+    normalized_content = _normalize_newlines(content)
+    document = WDL.parse_document(normalized_content, uri=filename)
+    if document.wdl_version is None:
+        return _format_legacy_wdl(normalized_content, filename)
+
+    formatted = _format_wdl_with_sprocket(normalized_content, filename)
+    WDL.parse_document(formatted, uri=filename)
+    return formatted
+
+
+def _tag_names(value) -> list[str] | None:
+    if not isinstance(value, list):
+        return None
+    names = []
+    seen = set()
+    for item in value:
+        if not isinstance(item, str):
+            return None
+        name = item.strip()
+        key = name.casefold()
+        if not name or len(name) > 64 or key in seen:
+            continue
+        seen.add(key)
+        names.append(name)
+    return names
+
+
+def _resolve_tags(names: list[str]) -> list[WDLTag]:
+    tags = []
+    for name in names:
+        tag = WDLTag.objects.filter(name__iexact=name).first()
+        if tag is None:
+            tag = WDLTag.objects.create(name=name)
+        tags.append(tag)
+    return tags
+
+
+def _set_tags(asset: WDLAsset, names: list[str]) -> list[str]:
+    tags = _resolve_tags(names)
+    asset.tags.set(tags)
+    return [tag.name for tag in tags]
+
+
+def _tag_payload(tag: WDLTag) -> dict:
+    asset_count = getattr(tag, "asset_count", None)
+    if asset_count is None:
+        asset_count = tag.wdl_assets.count()
+    return {
+        "id": tag.id,
+        "name": tag.name,
+        "asset_count": asset_count,
+    }
+
+
+def _unique_slug(name: str, requested_slug: str | None = None) -> str:
+    base = slugify(requested_slug or name)[:112] or f"wdl-{uuid.uuid4().hex[:8]}"
+    candidate = base
+    suffix = 2
+    while WDLAsset.objects.filter(slug=candidate).exists():
+        candidate = f"{base[:112]}-{suffix}"
+        suffix += 1
+    return candidate
+
+
+def _revision_payload(
+    revision: WDLSourceRevision, *, include_content: bool = False
+) -> dict:
+    payload = {
+        "version": revision.version,
+        "operation": revision.operation,
+        "digest": revision.digest,
+        "diff": revision.diff,
+        "note": revision.note,
+        "actor": revision.actor,
+        "analysis": revision.analysis,
+        "created_at": revision.created_at.isoformat(),
+    }
+    if include_content:
+        payload["content"] = revision.content
+    return payload
+
+
+def _audit_payload(event: WDLAuditEvent) -> dict:
+    return {
+        "id": event.id,
+        "action": event.action,
+        "actor": event.actor,
+        "note": event.note,
+        "changes": event.changes,
+        "diff": event.diff,
+        "revision": event.revision.version if event.revision_id else None,
+        "created_at": event.created_at.isoformat(),
+    }
+
+
+def _asset_payload(asset: WDLAsset, *, include_detail: bool = False) -> dict:
+    latest = asset.source_revisions.first()
+    payload = {
+        "slug": asset.slug,
+        "name": asset.name,
+        "description": asset.description,
+        "source_filename": asset.source_filename,
+        "lifecycle": asset.lifecycle,
+        "tags": [tag.name for tag in asset.tags.all()],
+        "created_by": asset.created_by,
+        "created_at": asset.created_at.isoformat(),
+        "updated_at": asset.updated_at.isoformat(),
+        "revision_count": asset.source_revisions.count(),
+        "current_revision": (
+            _revision_payload(latest, include_content=include_detail) if latest else None
+        ),
+    }
+    if include_detail:
+        payload["revisions"] = [
+            _revision_payload(item) for item in asset.source_revisions.all()[:100]
+        ]
+        payload["audit_events"] = [
+            _audit_payload(item)
+            for item in asset.audit_events.select_related("revision").all()[:200]
+        ]
+    return payload
+
+
+def _content_error(content) -> str | None:
+    if not isinstance(content, str) or not content.strip():
+        return "content must be a non-empty WDL document."
+    if len(content) > MAX_WDL_CONTENT_LENGTH:
+        return "content exceeds the 2,000,000 character limit."
+    return None
+
+
+@api_view(["GET", "POST"])
+def wdl_assets(request):
+    request_id = _request_id(request)
+    if request.method == "GET":
+        assets = WDLAsset.objects.prefetch_related("tags", "source_revisions")
+        query = request.query_params.get("q", "").strip()
+        if query:
+            assets = assets.filter(
+                Q(name__icontains=query)
+                | Q(slug__icontains=query)
+                | Q(description__icontains=query)
+                | Q(source_filename__icontains=query)
+            )
+        lifecycle = request.query_params.get("lifecycle", "").strip()
+        if lifecycle:
+            assets = assets.filter(lifecycle=lifecycle)
+        tags = [item for item in request.query_params.getlist("tag") if item]
+        if tags:
+            assets = assets.filter(tags__name__in=tags).distinct()
+        return _with_request_id(
+            Response({"results": [_asset_payload(item) for item in assets]}),
+            request_id,
+        )
+
+    content = request.data.get("content")
+    error = _content_error(content)
+    if error:
+        return _with_request_id(
+            Response(
+                {"error": {"code": "WDL_CONTENT_INVALID", "message": error}},
+                status=status.HTTP_400_BAD_REQUEST,
+            ),
+            request_id,
+        )
+    name = str(request.data.get("name") or "").strip()
+    filename = str(request.data.get("filename") or "workflow.wdl").strip()
+    tags = _tag_names(request.data.get("tags", []))
+    lifecycle = request.data.get("lifecycle", WDLAsset.Lifecycle.ACTIVE)
+    if not name or len(name) > 256 or not filename or len(filename) > 512:
+        return _with_request_id(
+            Response(
+                {
+                    "error": {
+                        "code": "WDL_ASSET_METADATA_INVALID",
+                        "message": "name and filename are required.",
+                    }
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            ),
+            request_id,
+        )
+    if tags is None or lifecycle not in WDLAsset.Lifecycle.values:
+        return _with_request_id(
+            Response(
+                {
+                    "error": {
+                        "code": "WDL_ASSET_METADATA_INVALID",
+                        "message": "tags or lifecycle is invalid.",
+                    }
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            ),
+            request_id,
+        )
+
+    actor = _actor(request)
+    note = str(request.data.get("note") or "").strip()
+    analysis = analyze_wdl(content, filename)
+    with transaction.atomic():
+        asset = WDLAsset.objects.create(
+            slug=_unique_slug(name, request.data.get("slug")),
+            name=name,
+            description=str(request.data.get("description") or "").strip(),
+            source_filename=filename,
+            lifecycle=lifecycle,
+            created_by=actor,
+        )
+        tags = _set_tags(asset, tags)
+        revision = WDLSourceRevision.objects.create(
+            asset=asset,
+            version=1,
+            operation=WDLSourceRevision.Operation.IMPORT,
+            content=content,
+            digest=_digest(content),
+            note=note,
+            actor=actor,
+            analysis=analysis,
+        )
+        WDLAuditEvent.objects.create(
+            asset=asset,
+            revision=revision,
+            action="import",
+            actor=actor,
+            note=note,
+            changes={"tags": {"before": [], "after": tags}},
+        )
+    return _with_request_id(
+        Response(_asset_payload(asset, include_detail=True), status=status.HTTP_201_CREATED),
+        request_id,
+    )
+
+
+@api_view(["GET", "PATCH"])
+def wdl_asset_detail(request, slug: str):
+    request_id = _request_id(request)
+    asset = (
+        WDLAsset.objects.prefetch_related("tags", "source_revisions")
+        .filter(slug=slug)
+        .first()
+    )
+    if asset is None:
+        return _with_request_id(
+            Response(
+                {"error": {"code": "WDL_ASSET_NOT_FOUND", "message": "WDL asset not found."}},
+                status=status.HTTP_404_NOT_FOUND,
+            ),
+            request_id,
+        )
+    if request.method == "GET":
+        return _with_request_id(
+            Response(_asset_payload(asset, include_detail=True)), request_id
+        )
+
+    changes = {}
+    for field, max_length in (
+        ("name", 256),
+        ("description", None),
+        ("source_filename", 512),
+    ):
+        if field not in request.data:
+            continue
+        value = str(request.data[field] or "").strip()
+        if field != "description" and (not value or len(value) > max_length):
+            return _with_request_id(
+                Response(
+                    {
+                        "error": {
+                            "code": "WDL_ASSET_METADATA_INVALID",
+                            "message": f"{field} is invalid.",
+                        }
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                ),
+                request_id,
+            )
+        if value != getattr(asset, field):
+            changes[field] = {"before": getattr(asset, field), "after": value}
+            setattr(asset, field, value)
+
+    if "lifecycle" in request.data:
+        lifecycle = request.data["lifecycle"]
+        if lifecycle not in WDLAsset.Lifecycle.values:
+            return _with_request_id(
+                Response(
+                    {
+                        "error": {
+                            "code": "WDL_ASSET_METADATA_INVALID",
+                            "message": "lifecycle is invalid.",
+                        }
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                ),
+                request_id,
+            )
+        if lifecycle != asset.lifecycle:
+            changes["lifecycle"] = {"before": asset.lifecycle, "after": lifecycle}
+            asset.lifecycle = lifecycle
+
+    if "tags" in request.data:
+        tags = _tag_names(request.data["tags"])
+        if tags is None:
+            return _with_request_id(
+                Response(
+                    {
+                        "error": {
+                            "code": "WDL_ASSET_METADATA_INVALID",
+                            "message": "tags must be an array of names.",
+                        }
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                ),
+                request_id,
+            )
+        current_tags = [tag.name for tag in asset.tags.all()]
+        if {tag.casefold() for tag in current_tags} != {
+            tag.casefold() for tag in tags
+        }:
+            canonical_tags = _set_tags(asset, tags)
+            changes["tags"] = {"before": current_tags, "after": canonical_tags}
+
+    if changes:
+        asset.save()
+        WDLAuditEvent.objects.create(
+            asset=asset,
+            action="metadata_update",
+            actor=_actor(request),
+            note=str(request.data.get("note") or "").strip(),
+            changes=changes,
+        )
+    return _with_request_id(
+        Response(_asset_payload(asset, include_detail=True)), request_id
+    )
+
+
+@api_view(["GET", "POST"])
+def wdl_asset_revisions(request, slug: str):
+    request_id = _request_id(request)
+    asset = WDLAsset.objects.filter(slug=slug).first()
+    if asset is None:
+        return _with_request_id(
+            Response(
+                {"error": {"code": "WDL_ASSET_NOT_FOUND", "message": "WDL asset not found."}},
+                status=status.HTTP_404_NOT_FOUND,
+            ),
+            request_id,
+        )
+    if request.method == "GET":
+        return _with_request_id(
+            Response(
+                {
+                    "results": [
+                        _revision_payload(item)
+                        for item in asset.source_revisions.all()[:100]
+                    ]
+                }
+            ),
+            request_id,
+        )
+
+    content = request.data.get("content")
+    error = _content_error(content)
+    operation = request.data.get("operation", WDLSourceRevision.Operation.EDIT)
+    if error or operation not in {
+        WDLSourceRevision.Operation.EDIT,
+        WDLSourceRevision.Operation.FORMAT,
+    }:
+        return _with_request_id(
+            Response(
+                {
+                    "error": {
+                        "code": "WDL_REVISION_INVALID",
+                        "message": error or "operation must be edit or format.",
+                    }
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            ),
+            request_id,
+        )
+
+    actor = _actor(request)
+    note = str(request.data.get("note") or "").strip()
+    with transaction.atomic():
+        locked = WDLAsset.objects.select_for_update().get(pk=asset.pk)
+        latest = locked.source_revisions.first()
+        if latest is not None and latest.content == content:
+            return _with_request_id(
+                Response(
+                    {
+                        "error": {
+                            "code": "WDL_REVISION_UNCHANGED",
+                            "message": "The WDL content has not changed.",
+                        }
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                ),
+                request_id,
+            )
+        version = (latest.version if latest else 0) + 1
+        diff = _unified_diff(
+            latest.content if latest else "",
+            content,
+            locked.source_filename,
+        )
+        revision = WDLSourceRevision.objects.create(
+            asset=locked,
+            version=version,
+            operation=operation,
+            content=content,
+            digest=_digest(content),
+            diff=diff,
+            note=note,
+            actor=actor,
+            analysis=analyze_wdl(content, locked.source_filename),
+        )
+        locked.save(update_fields=["updated_at"])
+        WDLAuditEvent.objects.create(
+            asset=locked,
+            revision=revision,
+            action=operation,
+            actor=actor,
+            note=note,
+            diff=diff,
+            changes={
+                "revision": {
+                    "before": latest.version if latest else None,
+                    "after": version,
+                }
+            },
+        )
+    return _with_request_id(
+        Response(
+            _revision_payload(revision, include_content=True),
+            status=status.HTTP_201_CREATED,
+        ),
+        request_id,
+    )
+
+
+@api_view(["GET"])
+def wdl_asset_revision_detail(request, slug: str, version: int):
+    request_id = _request_id(request)
+    revision = WDLSourceRevision.objects.filter(
+        asset__slug=slug, version=version
+    ).first()
+    if revision is None:
+        return _with_request_id(
+            Response(
+                {
+                    "error": {
+                        "code": "WDL_SOURCE_REVISION_NOT_FOUND",
+                        "message": "WDL source revision not found.",
+                    }
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            ),
+            request_id,
+        )
+    return _with_request_id(
+        Response(_revision_payload(revision, include_content=True)), request_id
+    )
+
+
+@api_view(["POST"])
+def format_wdl_asset(request, slug: str):
+    request_id = _request_id(request)
+    asset = WDLAsset.objects.filter(slug=slug).first()
+    if asset is None:
+        return _with_request_id(
+            Response(
+                {"error": {"code": "WDL_ASSET_NOT_FOUND", "message": "WDL asset not found."}},
+                status=status.HTTP_404_NOT_FOUND,
+            ),
+            request_id,
+        )
+    content = request.data.get("content")
+    error = _content_error(content)
+    if error:
+        return _with_request_id(
+            Response(
+                {"error": {"code": "WDL_CONTENT_INVALID", "message": error}},
+                status=status.HTTP_400_BAD_REQUEST,
+            ),
+            request_id,
+        )
+    try:
+        formatted = format_wdl(content, asset.source_filename)
+    except WDLFormatterUnavailable as format_error:
+        return _with_request_id(
+            Response(
+                {
+                    "status": "unavailable",
+                    "error": {
+                        "code": "WDL_FORMATTER_UNAVAILABLE",
+                        "message": str(format_error),
+                    },
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            ),
+            request_id,
+        )
+    except Exception as format_error:
+        analysis = analyze_wdl(content, asset.source_filename)
+        diagnostics = analysis.get("diagnostics") or []
+        message = str(format_error).strip()
+        if not message and diagnostics:
+            message = str(diagnostics[0].get("message") or "").strip()
+        message = message or type(format_error).__name__
+        return _with_request_id(
+            Response(
+                {
+                    "status": "rejected",
+                    "error": {
+                        "code": "WDL_FORMAT_REQUIRES_VALID_SYNTAX",
+                        "message": message,
+                    },
+                    "analysis": analysis,
+                },
+                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            ),
+            request_id,
+        )
+    return _with_request_id(
+        Response(
+            {
+                "content": formatted,
+                "changed": formatted != content,
+                "diff": _unified_diff(content, formatted, asset.source_filename),
+                "analysis": analyze_wdl(formatted, asset.source_filename),
+            }
+        ),
+        request_id,
+    )
+
+
+@api_view(["GET", "POST"])
+def wdl_tags(request):
+    request_id = _request_id(request)
+    if request.method == "GET":
+        tags = WDLTag.objects.annotate(asset_count=Count("wdl_assets")).order_by(
+            "-asset_count", "name"
+        )
+        return _with_request_id(
+            Response(
+                {
+                    "results": [
+                        _tag_payload(tag) for tag in tags
+                    ]
+                }
+            ),
+            request_id,
+        )
+    name = str(request.data.get("name") or "").strip()
+    if not name or len(name) > 64:
+        return _with_request_id(
+            Response(
+                {
+                    "error": {
+                        "code": "WDL_TAG_INVALID",
+                        "message": "name is required and must be at most 64 characters.",
+                    }
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            ),
+            request_id,
+        )
+    tag = WDLTag.objects.filter(name__iexact=name).first()
+    created = tag is None
+    if tag is None:
+        tag = WDLTag.objects.create(name=name)
+    return _with_request_id(
+        Response(
+            _tag_payload(tag),
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        ),
+        request_id,
+    )
+
+
+@api_view(["PATCH", "DELETE"])
+@transaction.atomic
+def wdl_tag_detail(request, tag_id: int):
+    request_id = _request_id(request)
+    tag = WDLTag.objects.select_for_update().filter(id=tag_id).first()
+    if tag is None:
+        return _with_request_id(
+            Response(
+                {
+                    "error": {
+                        "code": "WDL_TAG_NOT_FOUND",
+                        "message": "WDL tag not found.",
+                    }
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            ),
+            request_id,
+        )
+
+    asset_count = tag.wdl_assets.count()
+    if request.method == "DELETE":
+        if asset_count:
+            return _with_request_id(
+                Response(
+                    {
+                        "error": {
+                            "code": "WDL_TAG_IN_USE",
+                            "message": "Used WDL tags cannot be deleted.",
+                        },
+                        "asset_count": asset_count,
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                ),
+                request_id,
+            )
+        tag.delete()
+        return _with_request_id(
+            Response(status=status.HTTP_204_NO_CONTENT),
+            request_id,
+        )
+
+    name = str(request.data.get("name") or "").strip()
+    if not name or len(name) > 64:
+        return _with_request_id(
+            Response(
+                {
+                    "error": {
+                        "code": "WDL_TAG_INVALID",
+                        "message": "name is required and must be at most 64 characters.",
+                    }
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            ),
+            request_id,
+        )
+    if (
+        WDLTag.objects.filter(name__iexact=name)
+        .exclude(id=tag.id)
+        .exists()
+    ):
+        return _with_request_id(
+            Response(
+                {
+                    "error": {
+                        "code": "WDL_TAG_CONFLICT",
+                        "message": "A WDL tag with this name already exists.",
+                    }
+                },
+                status=status.HTTP_409_CONFLICT,
+            ),
+            request_id,
+        )
+    if name == tag.name:
+        return _with_request_id(Response(_tag_payload(tag)), request_id)
+
+    assets = list(tag.wdl_assets.prefetch_related("tags"))
+    previous_name = tag.name
+    previous_tags = {
+        asset.id: [item.name for item in asset.tags.all()]
+        for asset in assets
+    }
+    tag.name = name
+    tag.save(update_fields=["name"])
+    for asset in assets:
+        before = previous_tags[asset.id]
+        after = [name if item == previous_name else item for item in before]
+        asset.save(update_fields=["updated_at"])
+        WDLAuditEvent.objects.create(
+            asset=asset,
+            action="metadata_update",
+            actor=_actor(request),
+            note=f"重命名标签 {previous_name} → {name}",
+            changes={"tags": {"before": before, "after": after}},
+        )
+
+    return _with_request_id(Response(_tag_payload(tag)), request_id)
