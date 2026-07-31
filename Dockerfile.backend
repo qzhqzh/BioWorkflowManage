@@ -1,0 +1,30 @@
+FROM ghcr.io/stjude-rust-labs/sprocket:v0.28.0@sha256:6054fcaab0d512d11737717a2bab7e76f36c1225cf15fc2479f5bfa650b95f0b AS sprocket
+
+FROM python:3.12-slim
+
+WORKDIR /app
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app/backend \
+    SPROCKET_BINARY=/usr/local/bin/sprocket \
+    SPROCKET_FORMAT_CONFIG=/app/docker/sprocket-format.toml
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends musl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=sprocket /opt/sprocket/bin/sprocket /usr/local/bin/sprocket
+
+COPY pyproject.toml ./
+RUN pip install --no-cache-dir .
+
+COPY backend ./backend
+COPY schemas ./schemas
+COPY examples ./examples
+COPY docker/sprocket-format.toml ./docker/sprocket-format.toml
+COPY docker/backend-entrypoint.sh /usr/local/bin/backend-entrypoint
+RUN chmod +x /usr/local/bin/backend-entrypoint \
+    && sprocket --version
+
+EXPOSE 8000
+ENTRYPOINT ["backend-entrypoint"]

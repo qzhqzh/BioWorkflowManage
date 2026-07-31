@@ -1,0 +1,24 @@
+[project]
+name = "bioworkflow-manage"
+version = "0.1.0"
+description = "Contract-driven visual bioinformatics workflow compiler"
+requires-python = ">=3.11"
+dependencies = [
+  "Django>=5.2,<5.3",
+  "djangorestframework>=3.16,<3.17",
+  "gunicorn>=23,<24",
+  "jsonschema>=4.23,<5",
+  "miniwdl>=1.13,<2",
+  "psycopg[binary]>=3.2,<4",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3,<9",
+  "pytest-django>=4.11,<5",
+]
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "config.settings"
+pythonpath = ["backend"]
+testpaths = ["backend/tests"]

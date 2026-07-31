@@ -1,0 +1,11 @@
+[format]
+indent = 2
+max_line_length = 120
+sort_imports = false
+sort_inputs = false
+trailing_commas = false
+newline_style = "unix"
+
+[common]
+color = "never"
+report_mode = "one-line"

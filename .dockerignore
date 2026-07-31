@@ -1,0 +1,9 @@
+.git
+.venv
+data
+frontend/.nuxt
+frontend/.output
+frontend/node_modules
+.playwright-mcp
+__pycache__
+*.pyc

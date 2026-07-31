@@ -1,0 +1,23 @@
+# miniwdl's complete Python dependency closure, aligned with uv.lock.
+argcomplete==3.7.0
+certifi==2026.7.22
+charset-normalizer==3.4.9
+coloredlogs==15.0.1
+docker==7.2.0
+humanfriendly==10.0
+idna==3.18
+importlib-metadata==9.0.0
+lark==1.3.1
+miniwdl==1.14.2
+prompt-toolkit==3.0.52
+psutil==7.2.2
+pygtail==0.14.0
+python-json-logger==4.1.0
+questionary==2.1.1
+regex==2026.7.19
+requests==2.34.2
+ruamel.yaml==0.19.1
+urllib3==2.7.0
+wcwidth==0.8.2
+xdg==6.0.0
+zipp==4.1.0
