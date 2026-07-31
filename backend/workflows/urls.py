@@ -1,6 +1,15 @@
 from django.urls import path
 
-from . import views, wdl_assets
+from . import api_overrides, views, wdl_assets
+from .request_ids import request_id, with_request_id
+
+
+# Existing endpoint functions resolve these module globals at request time. Binding both
+# modules here makes request tracing use one validated implementation everywhere.
+views._request_id = request_id
+views._with_request_id = with_request_id
+wdl_assets._request_id = request_id
+wdl_assets._with_request_id = with_request_id
 
 
 urlpatterns = [
@@ -10,7 +19,7 @@ urlpatterns = [
     path("validations/tool-spec", views.validate_tool),
     path("validations/workflow-graph", views.validate_graph),
     path("compilations", views.compile_graph),
-    path("tools", views.tools),
+    path("tools", api_overrides.tools),
     path("tools/<str:tool_id>/drafts", views.tool_document),
     path("tools/<path:tool_id>/publish", views.publish_tool_document),
     path("tools/<path:tool_id>/versions", views.tool_versions),

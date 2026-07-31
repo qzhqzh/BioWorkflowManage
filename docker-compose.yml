@@ -25,7 +25,9 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-bioworkflow}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-bioworkflow-dev-only}
       DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:-development-only-change-me}
-      DJANGO_ALLOWED_HOSTS: "*"
+      DJANGO_ALLOWED_HOSTS: "${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1,[::1]}"
+      CORS_ALLOWED_ORIGINS: "${CORS_ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}"
+      DJANGO_SEED_DEMO: "${DJANGO_SEED_DEMO:-0}"
     depends_on:
       db:
         condition: service_healthy

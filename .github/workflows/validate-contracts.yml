@@ -143,11 +143,17 @@ jobs:
         working-directory: frontend
         run: bun install --frozen-lockfile
 
+      - name: Prepare Nuxt types
+        working-directory: frontend
+        run: bunx nuxi prepare
+
       - name: Install Playwright Chromium
         working-directory: frontend
         run: bunx playwright install --with-deps chromium
 
       - name: Build and start the application
+        env:
+          DJANGO_SEED_DEMO: "1"
         run: docker compose up -d --build --wait
 
       - name: Run browser smoke tests
