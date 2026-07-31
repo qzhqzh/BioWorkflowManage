@@ -9,10 +9,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     SPROCKET_BINARY=/usr/local/bin/sprocket \
     SPROCKET_FORMAT_CONFIG=/app/docker/sprocket-format.toml
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends musl \
-    && rm -rf /var/lib/apt/lists/*
-
 COPY --from=sprocket /opt/sprocket/bin/sprocket /usr/local/bin/sprocket
 
 COPY pyproject.toml ./
