@@ -53,7 +53,7 @@ class Command(BaseCommand):
                 for node_id, position in fastp_positions.items()
             ],
             "viewport": fastp_graph.get("layout", {}).get(
-                "viewport", {"x": 0, "y": 0, "zoom": 1
+                "viewport", {"x": 0, "y": 0, "zoom": 1}
             ),
         }
         WorkflowDocument.objects.get_or_create(
@@ -87,7 +87,7 @@ class Command(BaseCommand):
                 for node_id, position in subflow_positions.items()
             ],
             "viewport": subflow_graph.get("layout", {}).get(
-                "viewport", {"x": 0, "y": 0, "zoom": 1
+                "viewport", {"x": 0, "y": 0, "zoom": 1}
             ),
         }
         subflow, _ = WorkflowDocument.objects.get_or_create(
