@@ -1,16 +1,19 @@
+import hashlib
 import json
 from pathlib import Path
 
-from django.core.management.base import BaseCommand
+from django.core.management.base import BaseCommand, CommandError
 
 from compiler_core import (
     canonical_digest,
+    compile_workflow,
     validate_tool_spec,
-    validate_workflow_graph,
 )
 from workflows.models import (
+    CompilationRecord,
     ToolDocument,
     ToolVersion,
+    WDLRevision,
     WorkflowDocument,
     WorkflowVersion,
 )
@@ -28,35 +31,47 @@ class Command(BaseCommand):
             json.loads((fastp_fixture / "tool-fastp.json").read_text(encoding="utf-8")),
             json.loads((fixture / "tool-bwa-mem.json").read_text(encoding="utf-8")),
         ]
-        positions = graph.get("layout", {}).get("nodes", {})
-        editor_document = {
-            "nodes": [{"id": node_id, "position": position} for node_id, position in positions.items()],
-            "viewport": graph.get("layout", {}).get("viewport", {"x": 0, "y": 0, "zoom": 1}),
-        }
-        _, created = WorkflowDocument.objects.get_or_create(
+        for tool in tools:
+            ToolDocument.objects.get_or_create(
+                tool_id=tool["id"],
+                defaults={
+                    "draft_spec": tool,
+                    "validation": validate_tool_spec(tool),
+                },
+            )
+            ToolVersion.objects.get_or_create(
+                tool_id=tool["id"],
+                version=tool["tool_version"],
+                defaults={
+                    "name": tool.get("display_name") or tool["name"],
+                    "digest": canonical_digest(tool),
+                    "tool_spec": tool,
+                },
+            )
+
+        editor_document = self._editor_document(graph)
+        workflow, created = WorkflowDocument.objects.get_or_create(
             slug=graph["id"],
             defaults={
                 "name": graph["name"],
+                "description": graph.get("description", ""),
                 "workflow_graph": graph,
                 "editor_document": editor_document,
                 "tool_specs": tools,
             },
         )
+        self._seed_compiled_snapshot(
+            workflow=workflow,
+            graph=graph,
+            editor_document=editor_document,
+            tools=tools,
+        )
 
         fastp_graph = json.loads(
             (fastp_fixture / "workflow-graph.json").read_text(encoding="utf-8")
         )
-        fastp_positions = fastp_graph.get("layout", {}).get("nodes", {})
-        fastp_editor = {
-            "nodes": [
-                {"id": node_id, "position": position}
-                for node_id, position in fastp_positions.items()
-            ],
-            "viewport": fastp_graph.get("layout", {}).get(
-                "viewport", {"x": 0, "y": 0, "zoom": 1}
-            ),
-        }
-        WorkflowDocument.objects.get_or_create(
+        fastp_editor = self._editor_document(fastp_graph)
+        fastp_workflow, _ = WorkflowDocument.objects.get_or_create(
             slug=fastp_graph["id"],
             defaults={
                 "name": fastp_graph["name"],
@@ -65,6 +80,12 @@ class Command(BaseCommand):
                 "editor_document": fastp_editor,
                 "tool_specs": [tools[0]],
             },
+        )
+        self._seed_compiled_snapshot(
+            workflow=fastp_workflow,
+            graph=fastp_graph,
+            editor_document=fastp_editor,
+            tools=[tools[0]],
         )
 
         subflow_graph = json.loads(
@@ -80,16 +101,7 @@ class Command(BaseCommand):
                 ),
             }
         )
-        subflow_positions = subflow_graph.get("layout", {}).get("nodes", {})
-        subflow_editor = {
-            "nodes": [
-                {"id": node_id, "position": position}
-                for node_id, position in subflow_positions.items()
-            ],
-            "viewport": subflow_graph.get("layout", {}).get(
-                "viewport", {"x": 0, "y": 0, "zoom": 1}
-            ),
-        }
+        subflow_editor = self._editor_document(subflow_graph)
         subflow, _ = WorkflowDocument.objects.get_or_create(
             slug=subflow_graph["id"],
             defaults={
@@ -114,40 +126,102 @@ class Command(BaseCommand):
                 if node["type"] == "workflow_output"
             ],
         }
-        validation, _ = validate_workflow_graph(subflow_graph, [tools[0]])
-        WorkflowVersion.objects.get_or_create(
+        self._seed_compiled_snapshot(
             workflow=subflow,
+            graph=subflow_graph,
+            editor_document=subflow_editor,
+            tools=[tools[0]],
+            kind=WorkflowDocument.Kind.SUBWORKFLOW,
+            interface_contract=contract,
+        )
+        self.stdout.write(
+            "Created Phase 1 demos." if created else "Phase 1 demos already exist."
+        )
+
+    @staticmethod
+    def _editor_document(graph):
+        positions = graph.get("layout", {}).get("nodes", {})
+        return {
+            "nodes": [
+                {"id": node_id, "position": position}
+                for node_id, position in positions.items()
+            ],
+            "viewport": graph.get("layout", {}).get(
+                "viewport", {"x": 0, "y": 0, "zoom": 1}
+            ),
+        }
+
+    @staticmethod
+    def _seed_compiled_snapshot(
+        *,
+        workflow,
+        graph,
+        editor_document,
+        tools,
+        kind=WorkflowDocument.Kind.WORKFLOW,
+        interface_contract=None,
+    ):
+        request_id = f"seed_demo:{workflow.slug}:v1"
+        has_version = WorkflowVersion.objects.filter(
+            workflow=workflow,
+            version=1,
+        ).exists()
+        has_compilation = CompilationRecord.objects.filter(
+            workflow=workflow,
+            request_id=request_id,
+        ).exists()
+        has_revision = WDLRevision.objects.filter(
+            workflow=workflow,
+            version=1,
+        ).exists()
+        if has_version and has_compilation and has_revision:
+            return
+
+        validation, artifacts = compile_workflow(graph, tools)
+        if validation["status"] != "valid":
+            raise CommandError(f"Demo workflow {workflow.slug} did not compile.")
+        workflow_version, _ = WorkflowVersion.objects.get_or_create(
+            workflow=workflow,
             version=1,
             defaults={
-                "name": subflow.name,
-                "description": subflow.description,
-                "kind": WorkflowDocument.Kind.SUBWORKFLOW,
+                "name": workflow.name,
+                "description": workflow.description,
+                "kind": kind,
                 "semantic_digest": validation["source"]["digest"],
-                "workflow_graph": subflow_graph,
-                "editor_document": subflow_editor,
-                "tool_specs": [tools[0]],
-                "interface_contract": contract,
+                "workflow_graph": graph,
+                "editor_document": editor_document,
+                "tool_specs": tools,
+                "interface_contract": interface_contract or {},
                 "subworkflow_references": [],
             },
         )
-        for tool in tools:
-            ToolDocument.objects.get_or_create(
-                tool_id=tool["id"],
-                defaults={
-                    "draft_spec": tool,
-                    "validation": validate_tool_spec(tool),
-                },
-            )
-            ToolVersion.objects.get_or_create(
-                tool_id=tool["id"],
-                version=tool["tool_version"],
-                defaults={
-                    "name": tool.get("display_name") or tool["name"],
-                    "digest": canonical_digest(tool),
-                    "tool_spec": tool,
-                },
-            )
-        self.stdout.write("Created Phase 1 demos." if created else "Phase 1 demos already exist.")
+        CompilationRecord.objects.get_or_create(
+            workflow=workflow,
+            request_id=request_id,
+            defaults={
+                "workflow_version": workflow_version,
+                "status": "succeeded",
+                "semantic_digest": validation["source"]["digest"],
+                "validation": validation,
+                "artifacts": artifacts,
+            },
+        )
+        wdl_artifact = next(
+            item for item in artifacts if item.get("name") == "workflow.wdl"
+        )
+        content = wdl_artifact["content"]
+        WDLRevision.objects.get_or_create(
+            workflow=workflow,
+            version=1,
+            defaults={
+                "workflow_version": workflow_version,
+                "source": WDLRevision.Source.SYSTEM,
+                "content": content,
+                "digest": "sha256:"
+                + hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                "validation": {"status": "valid", "diagnostics": []},
+            },
+        )
 
     @staticmethod
     def _contract_port(node):
