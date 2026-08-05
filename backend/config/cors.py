@@ -34,5 +34,7 @@ class CorsMiddleware:
         response["Access-Control-Allow-Headers"] = ", ".join(
             settings.CORS_ALLOWED_HEADERS
         )
+        if settings.CORS_ALLOW_CREDENTIALS:
+            response["Access-Control-Allow-Credentials"] = "true"
         response["Access-Control-Max-Age"] = str(settings.CORS_PREFLIGHT_MAX_AGE)
         return response

@@ -8,7 +8,7 @@ dependencies = [
   "djangorestframework>=3.16,<3.17",
   "gunicorn>=23,<24",
   "jsonschema>=4.23,<5",
-  "miniwdl>=1.13,<2",
+  "miniwdl==1.14.2",
   "psycopg[binary]>=3.2,<4",
 ]
 

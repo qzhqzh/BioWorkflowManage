@@ -15,6 +15,10 @@ dist/
 coverage/
 *.log
 data/
+workspace/rawdata/**
+workspace/databases/**
+!workspace/databases/README.md
+!workspace/databases/catalog.json
 .env
 __pycache__/
 *.py[cod]

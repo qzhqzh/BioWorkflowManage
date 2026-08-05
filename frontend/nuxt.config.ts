@@ -2,6 +2,12 @@ export default defineNuxtConfig({
   compatibilityDate: '2026-07-23',
   css: ['~/assets/css/main.css'],
   devtools: { enabled: false },
+  runtimeConfig: {
+    apiBase: 'http://backend:8000',
+    public: {
+      apiBase: '',
+    },
+  },
   nitro: {
     preset: 'node-server',
     devProxy: {

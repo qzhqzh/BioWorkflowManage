@@ -32,10 +32,12 @@ import HelpWorkspace from '~/components/libraries/HelpWorkspace.vue'
 import ToolLibraryWorkspace from '~/components/libraries/ToolLibraryWorkspace.vue'
 import WorkflowLibraryWorkspace from '~/components/libraries/WorkflowLibraryWorkspace.vue'
 
+const { $api: $fetch } = useNuxtApp()
+
 type CompileState = 'idle' | 'running' | 'success' | 'error'
 type LibraryTab = 'tools' | 'subworkflows' | 'inputs' | 'outputs'
 type LayoutState = 'idle' | 'running' | 'success' | 'error'
-type RailSection = 'edit' | 'tools' | 'artifacts' | 'wdl' | 'help'
+type RailSection = 'edit' | 'tools' | 'packages' | 'artifacts' | 'runs' | 'wdl' | 'help'
 type SaveState = 'loading' | 'saved' | 'saving' | 'error'
 
 interface Diagnostic {
@@ -1930,6 +1932,14 @@ async function validateWorkflow() {
 }
 
 function selectRail(section: RailSection) {
+  if (section === 'packages') {
+    void navigateTo('/wdl-packages')
+    return
+  }
+  if (section === 'runs') {
+    void navigateTo('/runs')
+    return
+  }
   if (section === 'wdl') {
     void navigateTo('/wdl')
     return
@@ -2377,7 +2387,12 @@ onMounted(() => {
   narrowViewport = window.matchMedia('(max-width: 48rem)')
   syncCanvasMode()
   narrowViewport.addEventListener('change', syncCanvasMode)
-  void Promise.all([loadWorkflow(), loadToolRegistry()])
+  void Promise.all([loadWorkflow(), loadToolRegistry()]).then(() => {
+    const requestedTool = route.query.tool
+    if (typeof requestedTool === 'string' && requestedTool) {
+      void loadToolVersions(requestedTool)
+    }
+  })
   const requestedSection = route.query.section
   if (
     typeof requestedSection === 'string'

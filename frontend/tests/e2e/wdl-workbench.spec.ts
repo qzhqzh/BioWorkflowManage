@@ -62,7 +62,9 @@ function analysis(version = '1.0') {
     },
     imports: [],
     tasks: [{
+      id: 'solid-tumor.wdl::hello',
       name: 'hello',
+      file_path: 'solid-tumor.wdl',
       line: 33,
       end_line: 43,
       inputs: [{ name: 'name', type: 'String', line: 35 }],
@@ -71,6 +73,7 @@ function analysis(version = '1.0') {
     }],
     workflows: [{
       name: 'greeting',
+      file_path: 'solid-tumor.wdl',
       line: 45,
       end_line: 47,
       inputs: [],
@@ -82,6 +85,11 @@ function analysis(version = '1.0') {
 }
 
 async function mockWdlApi(page: Page) {
+  await page.route('**/api/v1/auth/me', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ user: { username: 'zhuqin' } }),
+  }))
   let revisionVersion = 1
   let revisionContent = source
   let assetName = '实体瘤 WES hg38'
@@ -117,6 +125,13 @@ async function mockWdlApi(page: Page) {
     analysis: analysis(),
     created_at: revisionVersion === 1 ? '2026-07-29T10:00:00Z' : '2026-07-29T11:00:00Z',
     content: revisionContent,
+    entrypoint: 'solid-tumor.wdl',
+    files: [{
+      path: 'solid-tumor.wdl',
+      digest: `sha256:${'a'.repeat(54)}${revisionVersion.toString().padStart(10, '0')}`,
+      is_entry: true,
+      content: revisionContent,
+    }],
   })
 
   const asset = () => ({
@@ -124,12 +139,15 @@ async function mockWdlApi(page: Page) {
     name: assetName,
     description: assetDescription,
     source_filename: 'solid-tumor.wdl',
+    source_repository: '',
+    source_revision: '',
     lifecycle,
     tags,
     created_by: 'local-user',
     created_at: '2026-07-29T10:00:00Z',
     updated_at: '2026-07-29T10:00:00Z',
     revision_count: revisionVersion,
+    file_count: 1,
     current_revision: currentRevision(),
     revisions: Array.from({ length: revisionVersion }, (_, index) => ({
       ...currentRevision(),
@@ -201,7 +219,7 @@ async function mockWdlApi(page: Page) {
     await route.fallback()
   })
 
-  await page.route('**/api/v1/wdl-assets', async (route) => {
+  await page.route(/\/api\/v1\/wdl-assets(?:\?.*)?$/, async (route) => {
     if (route.request().method() !== 'GET') return route.fallback()
     await route.fulfill({
       status: 200,
@@ -219,6 +237,13 @@ async function mockWdlApi(page: Page) {
       diff: '@@ -4,8 +4,8 @@\n-input {\n+  input {\n-String name\n+    String name\n',
       analysis: analysis(),
     }),
+  }))
+
+  await page.route('**/api/v1/wdl-assets/solid-tumor-hg38/export', route => route.fulfill({
+    status: 200,
+    contentType: 'application/wdl',
+    headers: { 'Content-Disposition': 'attachment; filename="solid-tumor.wdl"' },
+    body: revisionContent,
   }))
 
   await page.route('**/api/v1/wdl-assets/solid-tumor-hg38/revisions', async (route) => {
@@ -294,8 +319,156 @@ async function mockWdlApi(page: Page) {
     })
   })
 
+  await page.route(/\/api\/v1\/wdl-packages(?:\?.*)?$/, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ results: [] }),
+    })
+  })
+
   return { metadataRequests, tagRequests }
 }
+
+test('references a fixed tool-package version without copying package files into the revision', async ({ page }) => {
+  await mockWdlApi(page)
+  const packageDigest = `sha256:${'b'.repeat(64)}`
+  const fileDigest = `sha256:${'c'.repeat(64)}`
+  const packageFile = {
+    path: 'task/qc.wdl',
+    digest: fileDigest,
+    content: `version 1.0\n\ntask QC {\n  command <<< echo qc >>>\n}\n`,
+    analysis: {},
+  }
+  const packageVersion = {
+    version: '1.0.0',
+    digest: packageDigest,
+    source_repository: 'example/minwdl',
+    source_revision: 'abc123',
+    note: '',
+    actor: 'zhuqin',
+    analysis: analysis(),
+    file_count: 1,
+    files: [packageFile],
+    created_at: '2026-08-04T02:00:00Z',
+  }
+  const packageAsset = {
+    slug: 'solid-tumor-tools',
+    name: 'Solid Tumor Tools',
+    description: '实体瘤公共 Task',
+    lifecycle: 'active',
+    tags: ['实体瘤'],
+    created_by: 'zhuqin',
+    created_at: '2026-08-04T02:00:00Z',
+    updated_at: '2026-08-04T02:00:00Z',
+    version_count: 1,
+    reference_count: 0,
+    latest_version: packageVersion,
+    versions: [packageVersion],
+    audit_events: [],
+  }
+  await page.route('**/api/v1/wdl-packages/solid-tumor-tools/versions/1.0.0', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(packageVersion),
+  }))
+  await page.route('**/api/v1/wdl-packages/solid-tumor-tools', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(packageAsset),
+  }))
+  await page.route(/\/api\/v1\/wdl-packages(?:\?.*)?$/, route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ results: [packageAsset] }),
+  }))
+
+  const revisionRequests: Record<string, any>[] = []
+  await page.route('**/api/v1/wdl-assets/solid-tumor-hg38/revisions', async (route) => {
+    if (route.request().method() !== 'POST') {
+      await route.fallback()
+      return
+    }
+    const body = route.request().postDataJSON() as Record<string, any>
+    revisionRequests.push(body)
+    const main = body.files[0]
+    const reference = {
+      package_slug: 'solid-tumor-tools',
+      package_name: 'Solid Tumor Tools',
+      package_lifecycle: 'active',
+      version: '1.0.0',
+      digest: packageDigest,
+      mount_prefix: 'packages/solid-tumor-tools/1.0.0',
+      file_count: 1,
+      files: [{
+        path: packageFile.path,
+        digest: fileDigest,
+        mounted_path: 'packages/solid-tumor-tools/1.0.0/task/qc.wdl',
+      }],
+    }
+    await route.fulfill({
+      status: 201,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        version: 2,
+        operation: 'edit',
+        digest: `sha256:${'d'.repeat(64)}`,
+        diff: '',
+        note: body.note,
+        actor: 'zhuqin',
+        analysis: analysis(),
+        created_at: '2026-08-04T03:00:00Z',
+        content: main.content,
+        entrypoint: 'solid-tumor.wdl',
+        package_references: [reference],
+        files: [
+          { ...main, digest: `sha256:${'d'.repeat(64)}`, is_entry: true, origin: 'asset', read_only: false },
+          {
+            path: reference.files[0].mounted_path,
+            content: packageFile.content,
+            digest: fileDigest,
+            is_entry: false,
+            origin: 'package',
+            read_only: true,
+            package_reference: {
+              package_slug: reference.package_slug,
+              package_name: reference.package_name,
+              version: reference.version,
+              digest: reference.digest,
+              mount_prefix: reference.mount_prefix,
+              package_file_path: packageFile.path,
+            },
+          },
+        ],
+      }),
+    })
+  })
+
+  await page.goto('/wdl/solid-tumor-hg38')
+  await expect(page.locator('.monaco-editor')).toBeVisible({ timeout: 15_000 })
+  await page.getByRole('button', { name: '引用工具包' }).click()
+  await page.getByLabel('工具包').selectOption('solid-tumor-tools')
+  await expect(page.getByRole('combobox', { name: '版本', exact: true })).toHaveValue('1.0.0')
+  await page.getByRole('button', { name: '确认引用' }).click()
+
+  await expect(page.getByText(/已引用 Solid Tumor Tools 1.0.0/)).toBeVisible()
+  await expect(page.getByRole('button', { name: /qc\.wdl 包/ })).toBeVisible()
+  await page.keyboard.press('Control+S')
+  await expect(page.locator('.save-state')).toContainText('WDL v2')
+
+  expect(revisionRequests).toHaveLength(1)
+  expect(revisionRequests[0]!.files).toHaveLength(1)
+  expect(revisionRequests[0]!.files[0].path).toBe('solid-tumor.wdl')
+  expect(revisionRequests[0]!.files[0].content).toContain(
+    'import "packages/solid-tumor-tools/1.0.0/task/qc.wdl" as qc',
+  )
+  expect(revisionRequests[0]!.package_references).toEqual([{
+    package_slug: 'solid-tumor-tools',
+    version: '1.0.0',
+    digest: packageDigest,
+    mount_prefix: 'packages/solid-tumor-tools/1.0.0',
+  }])
+})
 
 test('lists tagged historical assets and opens the WDL workbench', async ({ page }) => {
   await mockWdlApi(page)

@@ -3,7 +3,9 @@ import AppRail from '~/components/layout/AppRail.vue'
 import AppTopbar from '~/components/layout/AppTopbar.vue'
 import type { WdlAsset, WdlTag } from '~/types/wdl'
 
-type WorkspaceSection = 'edit' | 'tools' | 'artifacts' | 'wdl' | 'help'
+const { $api: $fetch } = useNuxtApp()
+
+type WorkspaceSection = 'edit' | 'tools' | 'packages' | 'artifacts' | 'runs' | 'wdl' | 'help'
 
 const assets = ref<WdlAsset[]>([])
 const availableTags = ref<WdlTag[]>([])
@@ -12,6 +14,8 @@ const selectedTags = ref<string[]>([])
 const loadState = ref<'loading' | 'ready' | 'error'>('loading')
 const showImport = ref(false)
 const fileInput = ref<HTMLInputElement>()
+const selectedImportFile = ref<File>()
+const entrypointCandidates = ref<string[]>([])
 const importState = ref<'idle' | 'saving' | 'error'>('idle')
 const importError = ref('')
 const tagPoolState = ref<'idle' | 'saving' | 'error'>('idle')
@@ -26,10 +30,21 @@ const importDraft = ref({
   content: '',
   tags: '',
   note: '',
+  entrypoint: '',
+  sourceRepository: '',
+  sourceRevision: '',
 })
 
 function navigateSection(section: WorkspaceSection) {
   if (section === 'wdl') return
+  if (section === 'packages') {
+    void navigateTo('/wdl-packages')
+    return
+  }
+  if (section === 'runs') {
+    void navigateTo('/runs')
+    return
+  }
   void navigateTo(`/?section=${section}`)
 }
 
@@ -152,9 +167,11 @@ function toggleTag(tag: string) {
 async function selectImportFile(event: Event) {
   const file = (event.target as HTMLInputElement).files?.[0]
   if (!file) return
+  selectedImportFile.value = file
+  entrypointCandidates.value = []
   importDraft.value.filename = file.name
-  importDraft.value.name = importDraft.value.name || file.name.replace(/\.wdl$/i, '')
-  importDraft.value.content = await file.text()
+  importDraft.value.name = importDraft.value.name || file.name.replace(/\.(?:wdl|zip)$/i, '')
+  importDraft.value.content = file.name.toLowerCase().endsWith('.zip') ? '' : await file.text()
   importError.value = ''
 }
 
@@ -177,12 +194,17 @@ function resetImport() {
     content: '',
     tags: '',
     note: '',
+    entrypoint: '',
+    sourceRepository: '',
+    sourceRevision: '',
   }
+  selectedImportFile.value = undefined
+  entrypointCandidates.value = []
   if (fileInput.value) fileInput.value.value = ''
 }
 
 async function importAsset() {
-  if (!importDraft.value.name.trim() || !importDraft.value.content.trim()) {
+  if (!importDraft.value.name.trim() || !selectedImportFile.value) {
     importState.value = 'error'
     importError.value = '请选择 WDL 文件并填写资产名称。'
     return
@@ -190,23 +212,26 @@ async function importAsset() {
   importState.value = 'saving'
   importError.value = ''
   try {
+    const body = new FormData()
+    body.append('archive', selectedImportFile.value)
+    body.append('name', importDraft.value.name.trim())
+    body.append('description', importDraft.value.description.trim())
+    body.append('entrypoint', importDraft.value.entrypoint)
+    body.append('tags', JSON.stringify(importDraft.value.tags
+      .split(',')
+      .map(item => item.trim())
+      .filter(Boolean)))
+    body.append('note', importDraft.value.note.trim())
+    body.append('source_repository', importDraft.value.sourceRepository.trim())
+    body.append('source_revision', importDraft.value.sourceRevision.trim())
     const asset = await $fetch<WdlAsset>('/api/v1/wdl-assets', {
       method: 'POST',
-      body: {
-        name: importDraft.value.name.trim(),
-        description: importDraft.value.description.trim(),
-        filename: importDraft.value.filename,
-        content: importDraft.value.content,
-        tags: importDraft.value.tags
-          .split(',')
-          .map(item => item.trim())
-          .filter(Boolean),
-        note: importDraft.value.note.trim(),
-      },
+      body,
     })
     await navigateTo(`/wdl/${encodeURIComponent(asset.slug)}`)
   } catch (error: any) {
     importState.value = 'error'
+    entrypointCandidates.value = error?.data?.error?.details?.candidates ?? []
     importError.value = error?.data?.error?.message ?? 'WDL 导入失败，请检查文件后重试。'
   }
 }
@@ -254,15 +279,16 @@ onBeforeUnmount(() => {
             ref="fileInput"
             class="visually-hidden"
             type="file"
-            accept=".wdl,text/plain"
+            accept=".wdl,.zip,text/plain,application/zip"
             @change="selectImportFile"
           />
           <button class="button button--ghost" type="button" @click="fileInput?.click()">
-            {{ importDraft.filename || '选择 .wdl 文件' }}
+            {{ importDraft.filename || '选择 .wdl 或 .zip' }}
           </button>
           <small v-if="importDraft.content">
             {{ importDraft.content.split('\n').length }} 行 · {{ importDraft.content.length.toLocaleString('zh-CN') }} 字符
           </small>
+          <small v-else-if="selectedImportFile">{{ (selectedImportFile.size / 1024).toFixed(1) }} KB</small>
         </div>
         <div class="wdl-import-fields">
           <label class="field">
@@ -286,6 +312,21 @@ onBeforeUnmount(() => {
           <label class="field field--wide">
             <span>说明</span>
             <input v-model="importDraft.description" placeholder="该流程的用途、来源或维护范围" />
+          </label>
+          <label v-if="entrypointCandidates.length" class="field field--wide">
+            <span>入口 WDL</span>
+            <select v-model="importDraft.entrypoint" required>
+              <option value="" disabled>选择工作流入口</option>
+              <option v-for="path in entrypointCandidates" :key="path" :value="path">{{ path }}</option>
+            </select>
+          </label>
+          <label class="field field--wide">
+            <span>来源仓库</span>
+            <input v-model="importDraft.sourceRepository" placeholder="可选，例如 easygene/tumor_wdl" />
+          </label>
+          <label class="field">
+            <span>来源版本</span>
+            <input v-model="importDraft.sourceRevision" placeholder="可选，Git commit 或 tag" />
           </label>
           <label class="field field--wide">
             <span>导入备注</span>
@@ -399,6 +440,7 @@ onBeforeUnmount(() => {
                 <span class="structure-summary">
                   {{ asset.current_revision?.analysis.summary.task_count ?? 0 }} task
                   · {{ asset.current_revision?.analysis.summary.workflow_count ?? 0 }} workflow
+                  <template v-if="asset.file_count > 1"> · {{ asset.file_count }} 文件</template>
                 </span>
               </td>
               <td>

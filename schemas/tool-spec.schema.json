@@ -93,7 +93,8 @@
         "Array[String]",
         "Array[Int]",
         "Array[Float]",
-        "Array[Boolean]"
+        "Array[Boolean]",
+        "Pair[File,File]"
       ]
     },
     "semanticType": {
@@ -204,24 +205,35 @@
       "properties": {
         "mode": {
           "type": "string",
-          "enum": ["path", "glob"]
+          "enum": ["path", "glob", "expression"]
         },
         "value": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 2048,
-          "not": {
-            "anyOf": [
-              {
-                "pattern": "^(?:/|[A-Za-z]:[\\\\/])"
-              },
-              {
-                "pattern": "(^|/)\\.\\.(/|$)"
+          "maxLength": 2048
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "mode": { "enum": ["path", "glob"] }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "not": {
+                  "anyOf": [
+                    { "pattern": "^(?:/|[A-Za-z]:[\\\\/])" },
+                    { "pattern": "(^|/)\\.\\.(/|$)" }
+                  ]
+                }
               }
-            ]
+            }
           }
         }
-      }
+      ]
     },
     "outputPort": {
       "type": "object",
@@ -245,6 +257,9 @@
         "description": {
           "type": "string",
           "maxLength": 2048
+        },
+        "optional": {
+          "type": "boolean"
         },
         "capture": {
           "$ref": "#/$defs/capture"
@@ -334,6 +349,24 @@
         "created_by": {
           "type": "string",
           "maxLength": 256
+        },
+        "source_wdl": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["asset_slug", "revision", "file_path", "task_name", "source_digest"],
+          "properties": {
+            "asset_slug": { "type": "string", "maxLength": 128 },
+            "revision": { "type": "integer", "minimum": 1 },
+            "file_path": { "type": "string", "maxLength": 512 },
+            "task_name": { "$ref": "#/$defs/identifier" },
+            "source_digest": { "type": "string", "pattern": "^sha256:[a-fA-F0-9]{64}$" },
+            "repository_revision": { "type": "string", "maxLength": 128 }
+          }
+        },
+        "migration_warnings": {
+          "type": "array",
+          "items": { "type": "string", "maxLength": 2048 },
+          "maxItems": 128
         }
       }
     }

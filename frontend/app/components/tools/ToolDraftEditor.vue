@@ -29,6 +29,7 @@ const wdlTypes = [
   'Array[Int]',
   'Array[Float]',
   'Array[Boolean]',
+  'Pair[File,File]',
 ]
 
 function addInput() {
@@ -266,17 +267,22 @@ function removeOutput(index: number) {
               <select v-model="output.capture.mode" aria-label="输出捕获方式">
                 <option value="path">固定路径</option>
                 <option value="glob">Glob</option>
+                <option value="expression">WDL 表达式</option>
               </select>
             </label>
             <label class="field">
-              <span>产物路径</span>
-              <input v-model="output.capture.value" aria-label="输出产物路径" />
+              <span>{{ output.capture.mode === 'expression' ? 'WDL 表达式' : '产物路径' }}</span>
+              <input v-model="output.capture.value" aria-label="输出捕获值" />
             </label>
             <label class="field port-description-field">
               <span>说明</span>
               <input v-model="output.description" aria-label="输出说明" />
             </label>
           </div>
+          <label class="checkbox-field">
+            <input v-model="output.optional" type="checkbox" />
+            <span>可选输出</span>
+          </label>
         </article>
       </section>
     </div>

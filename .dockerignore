@@ -1,6 +1,8 @@
 .git
 .venv
 data
+workspace/rawdata
+workspace/databases
 frontend/.nuxt
 frontend/.output
 frontend/node_modules
