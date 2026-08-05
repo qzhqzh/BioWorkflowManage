@@ -2,14 +2,32 @@
 
 ## 目标与边界
 
-本框架负责三件事：
+本框架负责四件事：
 
 1. 用 miniwdl 对编译产物和执行案例做语法、类型静态校验；
 2. 真实启动一个 task 容器，验证 miniwdl 到 Docker 和持久化输出的完整链路；
 3. 为后续 FASTQ/FASTA 数据准备可重复的 preflight、运行目录和结果记录。
+4. 由独立 Worker 执行运行页提交的受管历史 WDL，并把进度、事件和输出记录到数据库。
 
-它目前是独立的开发/CI 验收框架，不是 Django 请求内的执行调度器，也不包含任务队列、
-取消、日志流、资源配额和多用户隔离。
+miniwdl 不在 Django 请求内运行。开发/CI 案例仍使用独立脚本；产品运行通过数据库队列
+交给 `analysis-worker`。当前不包含取消、暂停、资源配额和执行节点多租户隔离。
+
+## 运行分析页面
+
+```bash
+docker compose --profile wdl-runtime up -d backend frontend gateway miniwdl-docker analysis-worker
+```
+
+- 页面入口：`/runs`；
+- 原始数据：`workspace/rawdata`，自动识别完整的 gzip FASTQ R1/R2；
+- 参考数据库和 Panel：`workspace/databases`，清单见该目录的 `catalog.json` 和
+  `README.md`；
+- 运行结果：`data/analysis-runs/<run UUID>`；
+- 每次运行固定到提交当时的历史 WDL revision 与工具包版本，之后修改流程不会影响
+  已排队或已完成运行。
+
+页面只允许数据库清单、FASTQ 配对和 WDL 静态检查全部通过后提交。配对流程还要求选择
+另一组对照 FASTQ。
 
 ## 一键命令
 
@@ -45,6 +63,30 @@
 ```
 
 ## 测试数据位置
+
+### 初始化应用测试数据
+
+新环境不需要复制本地 PostgreSQL 或大型参考数据库即可初始化可运行的测试流程：
+
+```bash
+docker compose run --rm backend python backend/manage.py seed_test_data
+```
+
+该命令幂等地创建默认测试用户和 3 个 Phase 1 示例流程。若同时需要导入历史实体瘤/血液肿瘤 WDL，先把 WDL 源码目录挂载到新环境，再执行：
+
+```bash
+docker compose run --rm \
+  -v /path/to/tumor_wdl:/mnt/tumor_wdl:ro \
+  backend python backend/manage.py seed_test_data \
+  --wdl-source-dir /mnt/tumor_wdl \
+  --repository git@gitea.kindstarzhenyuan.cn:zhuqin/minwdl.git \
+  --revision <git-revision> \
+  --actor zhuqin
+```
+
+参考数据库和原始测序数据不属于测试数据命令的提交内容。生产环境将
+`ANALYSIS_DATABASE_HOST_PATH` 设置为 NAS 上的数据库目录即可，例如
+`/mnt/nas/databases`；未设置时仍使用 `./workspace/databases`。
 
 运行 `prepare` 后补入以下文件：
 
@@ -88,15 +130,15 @@ Compose profile 关系如下：
 ```text
 miniwdl-check (无网络、无 Docker)
 
-miniwdl-runner --mTLS 2376--> miniwdl-docker (隔离 DIND)
-       |                         |
-       +---- 相同绝对路径挂载 ----+
-                    |
-          data/miniwdl/work
+miniwdl-runner / analysis-worker --mTLS 2376--> miniwdl-docker (隔离 DIND)
+                 |                                  |
+                 +-------- 相同绝对路径挂载 --------+
+                              |
+                 data/miniwdl/work 或 data/analysis-runs
 ```
 
 - 日常 `docker compose up` 不会启动 miniwdl profile；
-- runner 不挂宿主机 `/var/run/docker.sock`；
+- runner 和 analysis-worker 都不挂宿主机 `/var/run/docker.sock`；
 - Docker API 使用自动生成的 mTLS 客户端证书，只存在于 Compose 内部网络，不发布到
   宿主机；
 - `data/miniwdl/work/runs/` 持久保存 `request.json`、解析后的输入、miniwdl
@@ -105,6 +147,7 @@ miniwdl-runner --mTLS 2376--> miniwdl-docker (隔离 DIND)
 - `data/miniwdl-certs/` 保存本机隔离引擎证书，目录权限为 `0700`，runner 只读挂载
   client 证书；
 - runner 和 DIND 必须看到完全相同的绝对运行路径，这是 miniwdl 容器输入挂载的要求。
+- analysis-worker 以非 root 用户运行，原始数据和数据库只读挂载，只有运行结果目录可写。
 
 两个专用网络默认使用 `10.253.0.0/24` 和 `10.253.1.0/24`，避免依赖 Docker
 已耗尽的默认地址池。如果宿主机或 VPN 已使用这些网段，可在 `.env` 中修改

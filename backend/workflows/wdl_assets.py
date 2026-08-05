@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import json
 import subprocess
 import tempfile
 import uuid
@@ -12,15 +13,47 @@ import WDL
 from django.conf import settings
 from django.db import transaction
 from django.db.models import Count, Q
+from django.http import HttpResponse
 from django.utils.text import slugify
 from rest_framework import status
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 
-from .models import WDLAuditEvent, WDLAsset, WDLSourceRevision, WDLTag
+from .models import WDLAuditEvent, WDLAsset, WDLSourceFile, WDLSourceRevision, WDLTag
+from .wdl_packages import (
+    WDLPackageError,
+    analyze_wdl_bundle,
+    build_wdl_archive,
+    digest,
+    normalize_bundle_files,
+    read_wdl_archive,
+)
+from .wdl_source_references import (
+    PackageReferenceSpec,
+    effective_package_files,
+    package_reference_payload,
+    parse_reference_specs,
+    persist_reference_specs,
+    reference_spec_key,
+    reference_specs_for_revision,
+)
+from .wdl_task_import import (
+    ResolvedWDLTaskSource,
+    WDLTaskImportError,
+    import_task_as_tool_draft,
+)
 
 
 MAX_WDL_CONTENT_LENGTH = 2_000_000
+REVISION_REFERENCE_PREFETCHES = (
+    "package_references__package_version__package",
+    "package_references__package_version__files",
+)
+ASSET_REVISION_PREFETCHES = (
+    "source_revisions__files",
+    "source_revisions__package_references__package_version__package",
+    "source_revisions__package_references__package_version__files",
+)
 
 
 class WDLFormatterUnavailable(RuntimeError):
@@ -207,6 +240,123 @@ def _unified_diff(before: str, after: str, filename: str) -> str:
         lineterm="",
     )
     return "\n".join(lines) + "\n"
+
+
+def _bundle_diff(before: dict[str, str], after: dict[str, str]) -> str:
+    chunks = []
+    for path in sorted(set(before) | set(after)):
+        diff = _unified_diff(before.get(path, ""), after.get(path, ""), path)
+        if diff:
+            chunks.append(diff.rstrip())
+    return "\n\n".join(chunks) + ("\n" if chunks else "")
+
+
+def _revision_files(revision: WDLSourceRevision | None) -> tuple[dict[str, str], str]:
+    if revision is None:
+        return {}, ""
+    source_files = list(revision.files.all())
+    if not source_files:
+        return {revision.asset.source_filename: revision.content}, revision.asset.source_filename
+    entry = next((item.path for item in source_files if item.is_entry), source_files[0].path)
+    return {item.path: item.content for item in source_files}, entry
+
+
+def _save_source_files(
+    revision: WDLSourceRevision,
+    files: dict[str, str],
+    entrypoint: str,
+    analysis: dict,
+) -> None:
+    file_analysis = {item["path"]: item for item in analysis.get("files", [])}
+    WDLSourceFile.objects.bulk_create(
+        [
+            WDLSourceFile(
+                revision=revision,
+                path=path,
+                content=content,
+                digest=digest(content),
+                is_entry=path == entrypoint,
+                analysis=file_analysis.get(path, {}),
+            )
+            for path, content in sorted(files.items())
+        ]
+    )
+
+
+def _json_list(value):
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return value
+        return parsed
+    return value
+
+
+def _request_reference_specs(
+    request,
+    *,
+    fallback_revision: WDLSourceRevision | None = None,
+) -> list[PackageReferenceSpec]:
+    raw = request.data.get("package_references")
+    return parse_reference_specs(
+        _json_list(raw) if raw is not None else None,
+        fallback_revision=fallback_revision,
+    )
+
+
+def _request_bundle(request, *, fallback_revision: WDLSourceRevision | None = None):
+    entrypoint = str(request.data.get("entrypoint") or request.data.get("filename") or "").strip()
+    archive = request.FILES.get("archive")
+    if archive is not None:
+        if str(getattr(archive, "name", "")).lower().endswith(".wdl"):
+            try:
+                content = archive.read(MAX_WDL_CONTENT_LENGTH + 1).decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise WDLPackageError(
+                    "WDL_PACKAGE_ENCODING_INVALID", "The uploaded WDL is not UTF-8."
+                ) from error
+            if len(content) > MAX_WDL_CONTENT_LENGTH:
+                raise WDLPackageError(
+                    "WDL_CONTENT_INVALID",
+                    "content exceeds the 2,000,000 character limit.",
+                )
+            path = entrypoint or Path(archive.name).name
+            return normalize_bundle_files([{"path": path, "content": content}], path)
+        return read_wdl_archive(archive, entrypoint)
+    raw_files = _json_list(request.data.get("files"))
+    if raw_files is not None:
+        return normalize_bundle_files(raw_files, entrypoint)
+    content = request.data.get("content")
+    if content is not None:
+        error = _content_error(content)
+        if error:
+            raise WDLPackageError("WDL_CONTENT_INVALID", error)
+        filename = entrypoint or (
+            fallback_revision.asset.source_filename if fallback_revision else "workflow.wdl"
+        )
+        return normalize_bundle_files([{"path": filename, "content": content}], filename)
+    if fallback_revision is not None:
+        return _revision_files(fallback_revision)
+    raise WDLPackageError("WDL_CONTENT_INVALID", "A WDL document or package is required.")
+
+
+def _package_error_response(error: WDLPackageError, request_id: str) -> Response:
+    return _with_request_id(
+        Response(
+            {
+                "error": {
+                    "code": error.code,
+                    "message": error.message,
+                    **({"details": error.details} if error.details else {}),
+                }
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        ),
+        request_id,
+    )
 
 
 def _brace_delta(line: str) -> tuple[int, int]:
@@ -411,6 +561,60 @@ def _unique_slug(name: str, requested_slug: str | None = None) -> str:
 def _revision_payload(
     revision: WDLSourceRevision, *, include_content: bool = False
 ) -> dict:
+    local_source_files = list(revision.files.all())
+    specifications = reference_specs_for_revision(revision)
+    reference_payloads = [
+        package_reference_payload(specification) for specification in specifications
+    ]
+    if local_source_files:
+        entrypoint = next(
+            (item.path for item in local_source_files if item.is_entry),
+            local_source_files[0].path,
+        )
+        local_files = {item.path: item.content for item in local_source_files}
+        local_by_path = {item.path: item for item in local_source_files}
+    else:
+        entrypoint = revision.asset.source_filename
+        local_files = {entrypoint: revision.content}
+        local_by_path = {}
+    effective_files, package_origins = effective_package_files(
+        local_files, specifications
+    )
+    files = []
+    for path, content in sorted(effective_files.items()):
+        local_file = local_by_path.get(path)
+        package_origin = package_origins.get(path)
+        if package_origin:
+            specification, package_file = package_origin
+            package_version = specification.package_version
+            file_payload = {
+                "path": path,
+                "digest": package_file.digest,
+                "is_entry": False,
+                "analysis": package_file.analysis,
+                "origin": "package",
+                "read_only": True,
+                "package_reference": {
+                    "package_slug": package_version.package.slug,
+                    "package_name": package_version.package.name,
+                    "version": package_version.version,
+                    "digest": specification.digest,
+                    "mount_prefix": specification.mount_prefix,
+                    "package_file_path": package_file.path,
+                },
+            }
+        else:
+            file_payload = {
+                "path": path,
+                "digest": local_file.digest if local_file else revision.digest,
+                "is_entry": local_file.is_entry if local_file else path == entrypoint,
+                "analysis": local_file.analysis if local_file else {},
+                "origin": "asset",
+                "read_only": False,
+            }
+        if include_content:
+            file_payload["content"] = content
+        files.append(file_payload)
     payload = {
         "version": revision.version,
         "operation": revision.operation,
@@ -419,6 +623,9 @@ def _revision_payload(
         "note": revision.note,
         "actor": revision.actor,
         "analysis": revision.analysis,
+        "entrypoint": entrypoint,
+        "files": files,
+        "package_references": reference_payloads,
         "created_at": revision.created_at.isoformat(),
     }
     if include_content:
@@ -441,20 +648,24 @@ def _audit_payload(event: WDLAuditEvent) -> dict:
 
 def _asset_payload(asset: WDLAsset, *, include_detail: bool = False) -> dict:
     latest = asset.source_revisions.first()
+    latest_payload = (
+        _revision_payload(latest, include_content=include_detail) if latest else None
+    )
     payload = {
         "slug": asset.slug,
         "name": asset.name,
         "description": asset.description,
         "source_filename": asset.source_filename,
+        "source_repository": asset.source_repository,
+        "source_revision": asset.source_revision,
         "lifecycle": asset.lifecycle,
         "tags": [tag.name for tag in asset.tags.all()],
         "created_by": asset.created_by,
         "created_at": asset.created_at.isoformat(),
         "updated_at": asset.updated_at.isoformat(),
         "revision_count": asset.source_revisions.count(),
-        "current_revision": (
-            _revision_payload(latest, include_content=include_detail) if latest else None
-        ),
+        "file_count": len(latest_payload["files"]) if latest_payload else 0,
+        "current_revision": latest_payload,
     }
     if include_detail:
         payload["revisions"] = [
@@ -479,7 +690,7 @@ def _content_error(content) -> str | None:
 def wdl_assets(request):
     request_id = _request_id(request)
     if request.method == "GET":
-        assets = WDLAsset.objects.prefetch_related("tags", "source_revisions")
+        assets = WDLAsset.objects.prefetch_related("tags", *ASSET_REVISION_PREFETCHES)
         query = request.query_params.get("q", "").strip()
         if query:
             assets = assets.filter(
@@ -499,19 +710,15 @@ def wdl_assets(request):
             request_id,
         )
 
-    content = request.data.get("content")
-    error = _content_error(content)
-    if error:
-        return _with_request_id(
-            Response(
-                {"error": {"code": "WDL_CONTENT_INVALID", "message": error}},
-                status=status.HTTP_400_BAD_REQUEST,
-            ),
-            request_id,
-        )
+    try:
+        files, entrypoint = _request_bundle(request)
+        reference_specs = _request_reference_specs(request)
+        effective_files, _ = effective_package_files(files, reference_specs)
+    except WDLPackageError as error:
+        return _package_error_response(error, request_id)
     name = str(request.data.get("name") or "").strip()
-    filename = str(request.data.get("filename") or "workflow.wdl").strip()
-    tags = _tag_names(request.data.get("tags", []))
+    filename = entrypoint
+    tags = _tag_names(_json_list(request.data.get("tags", [])))
     lifecycle = request.data.get("lifecycle", WDLAsset.Lifecycle.ACTIVE)
     if not name or len(name) > 256 or not filename or len(filename) > 512:
         return _with_request_id(
@@ -542,13 +749,16 @@ def wdl_assets(request):
 
     actor = _actor(request)
     note = str(request.data.get("note") or "").strip()
-    analysis = analyze_wdl(content, filename)
+    analysis = analyze_wdl_bundle(effective_files, entrypoint)
+    content = files[entrypoint]
     with transaction.atomic():
         asset = WDLAsset.objects.create(
             slug=_unique_slug(name, request.data.get("slug")),
             name=name,
             description=str(request.data.get("description") or "").strip(),
             source_filename=filename,
+            source_repository=str(request.data.get("source_repository") or "").strip()[:512],
+            source_revision=str(request.data.get("source_revision") or "").strip()[:128],
             lifecycle=lifecycle,
             created_by=actor,
         )
@@ -563,13 +773,24 @@ def wdl_assets(request):
             actor=actor,
             analysis=analysis,
         )
+        _save_source_files(revision, files, entrypoint, analysis)
+        persist_reference_specs(revision, reference_specs)
         WDLAuditEvent.objects.create(
             asset=asset,
             revision=revision,
             action="import",
             actor=actor,
             note=note,
-            changes={"tags": {"before": [], "after": tags}},
+            changes={
+                "tags": {"before": [], "after": tags},
+                "package": {
+                    "entrypoint": entrypoint,
+                    "file_count": len(effective_files),
+                    "references": [
+                        package_reference_payload(item) for item in reference_specs
+                    ],
+                },
+            },
         )
     return _with_request_id(
         Response(_asset_payload(asset, include_detail=True), status=status.HTTP_201_CREATED),
@@ -581,7 +802,7 @@ def wdl_assets(request):
 def wdl_asset_detail(request, slug: str):
     request_id = _request_id(request)
     asset = (
-        WDLAsset.objects.prefetch_related("tags", "source_revisions")
+        WDLAsset.objects.prefetch_related("tags", *ASSET_REVISION_PREFETCHES)
         .filter(slug=slug)
         .first()
     )
@@ -682,7 +903,11 @@ def wdl_asset_detail(request, slug: str):
 @api_view(["GET", "POST"])
 def wdl_asset_revisions(request, slug: str):
     request_id = _request_id(request)
-    asset = WDLAsset.objects.filter(slug=slug).first()
+    asset = (
+        WDLAsset.objects.prefetch_related(*ASSET_REVISION_PREFETCHES)
+        .filter(slug=slug)
+        .first()
+    )
     if asset is None:
         return _with_request_id(
             Response(
@@ -704,10 +929,8 @@ def wdl_asset_revisions(request, slug: str):
             request_id,
         )
 
-    content = request.data.get("content")
-    error = _content_error(content)
     operation = request.data.get("operation", WDLSourceRevision.Operation.EDIT)
-    if error or operation not in {
+    if operation not in {
         WDLSourceRevision.Operation.EDIT,
         WDLSourceRevision.Operation.FORMAT,
     }:
@@ -716,20 +939,41 @@ def wdl_asset_revisions(request, slug: str):
                 {
                     "error": {
                         "code": "WDL_REVISION_INVALID",
-                        "message": error or "operation must be edit or format.",
+                        "message": "operation must be edit or format.",
                     }
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             ),
             request_id,
         )
+    latest_snapshot = asset.source_revisions.first()
+    try:
+        files, entrypoint = _request_bundle(request, fallback_revision=latest_snapshot)
+        reference_specs = _request_reference_specs(
+            request, fallback_revision=latest_snapshot
+        )
+        effective_files, _ = effective_package_files(files, reference_specs)
+    except WDLPackageError as error:
+        return _package_error_response(error, request_id)
 
     actor = _actor(request)
     note = str(request.data.get("note") or "").strip()
     with transaction.atomic():
         locked = WDLAsset.objects.select_for_update().get(pk=asset.pk)
-        latest = locked.source_revisions.first()
-        if latest is not None and latest.content == content:
+        latest = locked.source_revisions.prefetch_related(
+            "files", *REVISION_REFERENCE_PREFETCHES
+        ).first()
+        before_files, _ = _revision_files(latest)
+        before_reference_specs = reference_specs_for_revision(latest)
+        before_reference_keys = {
+            reference_spec_key(item) for item in before_reference_specs
+        }
+        reference_keys = {reference_spec_key(item) for item in reference_specs}
+        if (
+            latest is not None
+            and before_files == files
+            and before_reference_keys == reference_keys
+        ):
             return _with_request_id(
                 Response(
                     {
@@ -743,11 +987,9 @@ def wdl_asset_revisions(request, slug: str):
                 request_id,
             )
         version = (latest.version if latest else 0) + 1
-        diff = _unified_diff(
-            latest.content if latest else "",
-            content,
-            locked.source_filename,
-        )
+        diff = _bundle_diff(before_files, files)
+        analysis = analyze_wdl_bundle(effective_files, entrypoint)
+        content = files[entrypoint]
         revision = WDLSourceRevision.objects.create(
             asset=locked,
             version=version,
@@ -757,9 +999,12 @@ def wdl_asset_revisions(request, slug: str):
             diff=diff,
             note=note,
             actor=actor,
-            analysis=analyze_wdl(content, locked.source_filename),
+            analysis=analysis,
         )
-        locked.save(update_fields=["updated_at"])
+        _save_source_files(revision, files, entrypoint, analysis)
+        persist_reference_specs(revision, reference_specs)
+        locked.source_filename = entrypoint
+        locked.save(update_fields=["source_filename", "updated_at"])
         WDLAuditEvent.objects.create(
             asset=locked,
             revision=revision,
@@ -771,7 +1016,26 @@ def wdl_asset_revisions(request, slug: str):
                 "revision": {
                     "before": latest.version if latest else None,
                     "after": version,
-                }
+                },
+                "package": {
+                    "entrypoint": entrypoint,
+                    "file_count": len(effective_files),
+                    "changed_files": sorted(
+                        path
+                        for path in set(before_files) | set(files)
+                        if before_files.get(path) != files.get(path)
+                    ),
+                    "references": {
+                        "before": [
+                            package_reference_payload(item)
+                            for item in before_reference_specs
+                        ],
+                        "after": [
+                            package_reference_payload(item)
+                            for item in reference_specs
+                        ],
+                    },
+                },
             },
         )
     return _with_request_id(
@@ -786,9 +1050,12 @@ def wdl_asset_revisions(request, slug: str):
 @api_view(["GET"])
 def wdl_asset_revision_detail(request, slug: str, version: int):
     request_id = _request_id(request)
-    revision = WDLSourceRevision.objects.filter(
-        asset__slug=slug, version=version
-    ).first()
+    revision = (
+        WDLSourceRevision.objects.select_related("asset")
+        .prefetch_related("files", *REVISION_REFERENCE_PREFETCHES)
+        .filter(asset__slug=slug, version=version)
+        .first()
+    )
     if revision is None:
         return _with_request_id(
             Response(
@@ -829,8 +1096,9 @@ def format_wdl_asset(request, slug: str):
             ),
             request_id,
         )
+    filename = str(request.data.get("filename") or asset.source_filename).strip()
     try:
-        formatted = format_wdl(content, asset.source_filename)
+        formatted = format_wdl(content, filename)
     except WDLFormatterUnavailable as format_error:
         return _with_request_id(
             Response(
@@ -846,7 +1114,7 @@ def format_wdl_asset(request, slug: str):
             request_id,
         )
     except Exception as format_error:
-        analysis = analyze_wdl(content, asset.source_filename)
+        analysis = analyze_wdl(content, filename)
         diagnostics = analysis.get("diagnostics") or []
         message = str(format_error).strip()
         if not message and diagnostics:
@@ -871,9 +1139,148 @@ def format_wdl_asset(request, slug: str):
             {
                 "content": formatted,
                 "changed": formatted != content,
-                "diff": _unified_diff(content, formatted, asset.source_filename),
-                "analysis": analyze_wdl(formatted, asset.source_filename),
+                "diff": _unified_diff(content, formatted, filename),
+                "analysis": analyze_wdl(formatted, filename),
             }
+        ),
+        request_id,
+    )
+
+
+@api_view(["GET", "POST"])
+def export_wdl_asset(request, slug: str):
+    asset = WDLAsset.objects.filter(slug=slug).first()
+    if asset is None:
+        return Response(
+            {"error": {"code": "WDL_ASSET_NOT_FOUND", "message": "WDL asset not found."}},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+    requested_version = request.query_params.get("version") or request.data.get("version")
+    revisions = asset.source_revisions.prefetch_related(
+        "files", *REVISION_REFERENCE_PREFETCHES
+    )
+    revision = revisions.filter(version=requested_version).first() if requested_version else revisions.first()
+    if revision is None:
+        return Response(
+            {"error": {"code": "WDL_SOURCE_REVISION_NOT_FOUND", "message": "WDL source revision not found."}},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+    try:
+        local_files, entrypoint = (
+            _request_bundle(request, fallback_revision=revision)
+            if request.method == "POST"
+            else _revision_files(revision)
+        )
+        reference_specs = (
+            _request_reference_specs(request, fallback_revision=revision)
+            if request.method == "POST"
+            else reference_specs_for_revision(revision)
+        )
+        files, _ = effective_package_files(local_files, reference_specs)
+    except WDLPackageError as error:
+        return _package_error_response(error, _request_id(request))
+    if len(files) == 1:
+        response = HttpResponse(files[entrypoint], content_type="application/wdl; charset=utf-8")
+        response["Content-Disposition"] = f'attachment; filename="{Path(entrypoint).name}"'
+        return response
+    archive = build_wdl_archive(
+        files,
+        entrypoint,
+        asset={
+            "slug": asset.slug,
+            "name": asset.name,
+            "version": revision.version,
+            "packageReferences": [
+                package_reference_payload(item) for item in reference_specs
+            ],
+        },
+    )
+    response = HttpResponse(archive, content_type="application/zip")
+    response["Content-Disposition"] = f'attachment; filename="{asset.slug}-v{revision.version}.zip"'
+    return response
+
+
+@api_view(["POST"])
+def import_wdl_task(request, slug: str):
+    request_id = _request_id(request)
+    asset = WDLAsset.objects.filter(slug=slug).first()
+    if asset is None:
+        return _with_request_id(
+            Response(
+                {"error": {"code": "WDL_ASSET_NOT_FOUND", "message": "WDL asset not found."}},
+                status=status.HTTP_404_NOT_FOUND,
+            ),
+            request_id,
+        )
+    version = request.data.get("version")
+    revisions = asset.source_revisions.prefetch_related(
+        "files", *REVISION_REFERENCE_PREFETCHES
+    )
+    revision = revisions.filter(version=version).first() if version else revisions.first()
+    file_path = str(request.data.get("file_path") or "").strip()
+    task_name = str(request.data.get("task_name") or "").strip()
+    source_file = revision.files.filter(path=file_path).first() if revision else None
+    if revision is not None and source_file is None and file_path:
+        try:
+            local_files, _ = _revision_files(revision)
+            effective_files, _ = effective_package_files(
+                local_files, reference_specs_for_revision(revision)
+            )
+        except WDLPackageError as error:
+            return _package_error_response(error, request_id)
+        if file_path in effective_files:
+            source_file = ResolvedWDLTaskSource(
+                path=file_path,
+                content=effective_files[file_path],
+            )
+    if revision is None or source_file is None or not task_name:
+        return _with_request_id(
+            Response(
+                {"error": {"code": "WDL_TASK_NOT_FOUND", "message": "Select a task from a saved WDL revision."}},
+                status=status.HTTP_404_NOT_FOUND,
+            ),
+            request_id,
+        )
+    actor = _actor(request)
+    try:
+        document, created, warnings = import_task_as_tool_draft(
+            asset=asset,
+            revision=revision,
+            source_file=source_file,
+            task_name=task_name,
+            actor=actor,
+            tool_id=str(request.data.get("tool_id") or "").strip(),
+            replace=bool(request.data.get("replace", False)),
+        )
+    except WDLTaskImportError as error:
+        return _with_request_id(
+            Response(
+                {"error": {"code": error.code, "message": error.message}},
+                status=status.HTTP_409_CONFLICT if error.code == "TOOL_DRAFT_EXISTS" else status.HTTP_400_BAD_REQUEST,
+            ),
+            request_id,
+        )
+    WDLAuditEvent.objects.create(
+        asset=asset,
+        revision=revision,
+        action="tool_import",
+        actor=actor,
+        changes={
+            "tool_id": document.tool_id,
+            "file_path": source_file.path,
+            "task_name": task_name,
+            "created": created,
+        },
+    )
+    return _with_request_id(
+        Response(
+            {
+                "tool_id": document.tool_id,
+                "created": created,
+                "warnings": warnings,
+                "validation": document.validation,
+            },
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
         ),
         request_id,
     )

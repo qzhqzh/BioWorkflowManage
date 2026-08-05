@@ -58,6 +58,7 @@ def test_default_host_and_cors_configuration_is_restricted():
     common_index = settings.MIDDLEWARE.index("django.middleware.common.CommonMiddleware")
     assert cors_index < common_index
     assert settings.CORS_ALLOWED_ORIGINS == [
+        "https://wdl.qzhqzh.com",
         "http://localhost:3000",
         "http://127.0.0.1:3000",
     ]

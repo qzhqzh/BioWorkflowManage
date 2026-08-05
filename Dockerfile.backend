@@ -7,7 +7,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app/backend \
     SPROCKET_BINARY=/usr/local/bin/sprocket \
-    SPROCKET_FORMAT_CONFIG=/app/docker/sprocket-format.toml
+    SPROCKET_FORMAT_CONFIG=/app/docker/sprocket-format.toml \
+    MINIWDL_CFG=/etc/miniwdl/miniwdl.cfg
 
 COPY --from=sprocket /opt/sprocket/bin/sprocket /usr/local/bin/sprocket
 
@@ -18,8 +19,10 @@ COPY backend ./backend
 COPY schemas ./schemas
 COPY examples ./examples
 COPY docker/sprocket-format.toml ./docker/sprocket-format.toml
+COPY docker/miniwdl.cfg /etc/miniwdl/miniwdl.cfg
 COPY docker/backend-entrypoint.sh /usr/local/bin/backend-entrypoint
-RUN chmod +x /usr/local/bin/backend-entrypoint \
+RUN chmod -R a+rX /app/backend /app/schemas /app/examples /app/docker \
+    && chmod +x /usr/local/bin/backend-entrypoint \
     && sprocket --version
 
 EXPOSE 8000

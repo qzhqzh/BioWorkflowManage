@@ -19,29 +19,49 @@ SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "development-only-change-me")
 DEBUG = os.environ.get("DJANGO_DEBUG", "0") == "1"
 ALLOWED_HOSTS = _csv_environment(
     "DJANGO_ALLOWED_HOSTS",
-    "localhost,127.0.0.1,[::1]",
+    "localhost,127.0.0.1,[::1],wdl.qzhqzh.com",
 )
+CSRF_TRUSTED_ORIGINS = _csv_environment(
+    "DJANGO_CSRF_TRUSTED_ORIGINS",
+    "https://wdl.qzhqzh.com,http://localhost:8082,http://127.0.0.1:8082",
+)
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
 INSTALLED_APPS = [
     "django.contrib.contenttypes",
     "django.contrib.auth",
+    "django.contrib.sessions",
     "rest_framework",
     "workflows",
 ]
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    "django.contrib.sessions.middleware.SessionMiddleware",
     "config.cors.CorsMiddleware",
     "django.middleware.common.CommonMiddleware",
+    "django.middleware.csrf.CsrfViewMiddleware",
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
 ]
 CORS_ALLOWED_ORIGINS = _csv_environment(
     "CORS_ALLOWED_ORIGINS",
-    "http://localhost:3000,http://127.0.0.1:3000",
+    "https://wdl.qzhqzh.com,http://localhost:3000,http://127.0.0.1:3000",
 )
 CORS_ALLOWED_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
-CORS_ALLOWED_HEADERS = ["Accept", "Content-Type", "X-Request-ID"]
+CORS_ALLOWED_HEADERS = ["Accept", "Content-Type", "X-Request-ID", "X-CSRFToken"]
 CORS_PREFLIGHT_MAX_AGE = 600
+CORS_ALLOW_CREDENTIALS = True
 ROOT_URLCONF = "config.urls"
 WSGI_APPLICATION = "config.wsgi.application"
+
+# Authentication is enabled by default for deployed services. Test settings turn
+# this off by default so the pre-authentication API tests remain focused on their
+# existing contracts; authentication tests opt back in explicitly.
+AUTH_REQUIRED = os.environ.get("DJANGO_AUTH_REQUIRED", "1") == "1"
+SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SAMESITE = os.environ.get("DJANGO_SESSION_COOKIE_SAMESITE", "Lax")
+SESSION_COOKIE_SECURE = os.environ.get("DJANGO_SESSION_COOKIE_SECURE", "0") == "1"
+CSRF_COOKIE_SAMESITE = os.environ.get("DJANGO_CSRF_COOKIE_SAMESITE", "Lax")
+CSRF_COOKIE_SECURE = os.environ.get("DJANGO_CSRF_COOKIE_SECURE", "0") == "1"
 
 if os.environ.get("POSTGRES_HOST"):
     DATABASES = {
@@ -70,6 +90,12 @@ USE_TZ = True
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 REST_FRAMEWORK = {
     "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"],
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "workflows.auth_permissions.SessionAuthenticationWithHeader",
+    ],
+    "DEFAULT_PERMISSION_CLASSES": [
+        "workflows.auth_permissions.AuthenticationRequiredPermission",
+    ],
     "UNAUTHENTICATED_USER": None,
 }
 
@@ -80,4 +106,23 @@ SPROCKET_FORMAT_CONFIG = os.environ.get(
 )
 SPROCKET_FORMAT_TIMEOUT_SECONDS = float(
     os.environ.get("SPROCKET_FORMAT_TIMEOUT_SECONDS", "10")
+)
+
+ANALYSIS_RAWDATA_ROOT = Path(
+    os.environ.get("ANALYSIS_RAWDATA_ROOT", BASE_DIR / "workspace" / "rawdata")
+)
+ANALYSIS_DATABASE_ROOT = Path(
+    os.environ.get("ANALYSIS_DATABASE_ROOT", BASE_DIR / "workspace" / "databases")
+)
+ANALYSIS_DATABASE_CATALOG = Path(
+    os.environ.get(
+        "ANALYSIS_DATABASE_CATALOG",
+        ANALYSIS_DATABASE_ROOT / "catalog.json",
+    )
+)
+ANALYSIS_RUN_ROOT = Path(
+    os.environ.get("ANALYSIS_RUN_ROOT", BASE_DIR / "data" / "analysis-runs")
+)
+ANALYSIS_WORKER_POLL_SECONDS = float(
+    os.environ.get("ANALYSIS_WORKER_POLL_SECONDS", "2")
 )

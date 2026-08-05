@@ -56,7 +56,14 @@ function applyFormattedValue(value: string) {
   }
 }
 
-defineExpose({ applyFormattedValue })
+function revealLine(line: number) {
+  if (!editor || !Number.isFinite(line)) return
+  editor.revealLineInCenter(line)
+  editor.setPosition({ lineNumber: Math.max(1, line), column: 1 })
+  editor.focus()
+}
+
+defineExpose({ applyFormattedValue, revealLine })
 
 function registerWdlLanguage(monaco: MonacoApi) {
   if (!monaco.languages.getLanguages().some(language => language.id === 'wdl')) {

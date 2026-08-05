@@ -15,7 +15,17 @@ async function selectWorkflow(page: Page, name: string) {
   await workflowButton.click()
 }
 
+async function csrfHeaders(page: Page) {
+  const cookie = (await page.context().cookies()).find(item => item.name === 'csrftoken')
+  return cookie ? { 'X-CSRFToken': decodeURIComponent(cookie.value) } : {}
+}
+
 test.beforeEach(async ({ page }) => {
+  await page.goto('/login')
+  await page.getByLabel('用户名').fill('zhuqin')
+  await page.getByLabel('密码').fill('zhuqin')
+  await page.getByRole('button', { name: '登录', exact: true }).click()
+  await page.waitForURL('**/wdl')
   await page.goto('/')
   await expect(page.getByText('BioWorkflowManage', { exact: true })).toBeVisible()
   await expect(page.getByRole('button', { name: '保存草稿' })).toContainText('草稿已保存')
@@ -50,7 +60,8 @@ test('shows a scrollable WDL preview for the compiled demo', async ({ page }) =>
   expect(canScroll).toBe(true)
 })
 
-test('persists a tool parameter edit and restores the original workflow', async ({ page, request }) => {
+test('persists a tool parameter edit and restores the original workflow', async ({ page }) => {
+  const request = page.request
   const workflowUrl = '/api/v1/editor/workflows/fastp_bwa_demo'
   const originalResponse = await request.get(workflowUrl)
   expect(originalResponse.ok()).toBe(true)
@@ -93,13 +104,17 @@ test('persists a tool parameter edit and restores the original workflow', async 
     await expect(page.locator('.parameter-field').filter({ hasText: 'threads' }).locator('input'))
       .toHaveValue(String(nextThreads))
   } finally {
-    await page.close()
-    const restored = await request.put(workflowUrl, { data: originalDocument })
+    const restored = await request.put(workflowUrl, {
+      data: originalDocument,
+      headers: await csrfHeaders(page),
+    })
     expect(restored.ok()).toBe(true)
+    await page.close()
   }
 })
 
-test('shows validation diagnostics for an incompatible semantic type', async ({ page, request }) => {
+test('shows validation diagnostics for an incompatible semantic type', async ({ page }) => {
+  const request = page.request
   const workflowUrl = '/api/v1/editor/workflows/fastp_bwa_demo'
   const originalResponse = await request.get(workflowUrl)
   expect(originalResponse.ok()).toBe(true)
@@ -133,13 +148,17 @@ test('shows validation diagnostics for an incompatible semantic type', async ({ 
     await expect(page.getByRole('tab', { name: /诊断/ })).toHaveAttribute('aria-selected', 'true')
     await expect(page.locator('.diagnostic').first()).toBeVisible()
   } finally {
-    await page.close()
-    const restored = await request.put(workflowUrl, { data: originalDocument })
+    const restored = await request.put(workflowUrl, {
+      data: originalDocument,
+      headers: await csrfHeaders(page),
+    })
     expect(restored.ok()).toBe(true)
+    await page.close()
   }
 })
 
-test('rejects changing a published tool version and restores the original draft', async ({ page, request }) => {
+test('rejects changing a published tool version and restores the original draft', async ({ page }) => {
+  const request = page.request
   const toolId = 'fastp'
   const draftUrl = `/api/v1/tools/${toolId}/drafts`
   const publishUrl = `/api/v1/tools/${toolId}/publish`
@@ -191,9 +210,9 @@ test('rejects changing a published tool version and restores the original draft'
     await expect(publishError).toContainText('TOOL_VERSION_IMMUTABLE')
     await expect(publishError).toContainText(/该工具版本已发布且内容不可修改.*提升软件版本/)
   } finally {
-    await page.close()
     const restored = await request.put(draftUrl, {
       data: { tool_spec: originalDraft.draft_spec },
+      headers: await csrfHeaders(page),
     })
     expect(restored.ok()).toBe(true)
 
@@ -206,10 +225,12 @@ test('rejects changing a published tool version and restores the original draft'
     const restoredVersionsResponse = await request.get(versionsUrl)
     expect(restoredVersionsResponse.ok()).toBe(true)
     expect(await restoredVersionsResponse.json()).toEqual(originalVersions)
+    await page.close()
   }
 })
 
-test('shows all mocked compile artifacts without writing compilation history', async ({ page, request }) => {
+test('shows all mocked compile artifacts without writing compilation history', async ({ page }) => {
+  const request = page.request
   const workflowSlug = 'fastp_bwa_demo'
   const workflowUrl = `/api/v1/editor/workflows/${workflowSlug}`
   const versionsUrl = `${workflowUrl}/versions`

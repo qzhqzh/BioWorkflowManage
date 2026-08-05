@@ -3,17 +3,25 @@ import { createTwoFilesPatch } from 'diff'
 import AppRail from '~/components/layout/AppRail.vue'
 import AppTopbar from '~/components/layout/AppTopbar.vue'
 import WdlCodeEditor from '~/components/wdl/WdlCodeEditor.vue'
+import WdlFileTree from '~/components/wdl/WdlFileTree.vue'
+import WdlPackageReferencePanel from '~/components/wdl/WdlPackageReferencePanel.vue'
 import type {
   WdlAsset,
   WdlAuditEvent,
+  WdlSourceFile,
+  WdlSourcePackageReference,
   WdlSourceRevision,
   WdlTag,
+  WdlToolPackageVersion,
 } from '~/types/wdl'
 
-type WorkspaceSection = 'edit' | 'tools' | 'artifacts' | 'wdl' | 'help'
+const { $api: $fetch } = useNuxtApp()
+
+type WorkspaceSection = 'edit' | 'tools' | 'packages' | 'artifacts' | 'runs' | 'wdl' | 'help'
 type InspectorTab = 'structure' | 'diagnostics' | 'diff' | 'history'
 type WdlCodeEditorHandle = {
   applyFormattedValue: (value: string) => void
+  revealLine: (line: number) => void
 }
 type MetadataField = 'name' | 'description'
 type MetadataPatch = Partial<Pick<WdlAsset, 'name' | 'description' | 'tags'>> & {
@@ -25,8 +33,12 @@ const slug = computed(() => String(route.params.slug))
 const asset = ref<WdlAsset>()
 const availableTags = ref<WdlTag[]>([])
 const selectedRevision = ref<WdlSourceRevision>()
-const content = ref('')
-const baseContent = ref('')
+const sourceFiles = ref<WdlSourceFile[]>([])
+const packageReferences = ref<WdlSourcePackageReference[]>([])
+const basePackageReferences = ref<WdlSourcePackageReference[]>([])
+const fileContents = ref<Record<string, string>>({})
+const baseFileContents = ref<Record<string, string>>({})
+const activeFilePath = ref('')
 const pendingOperation = ref<'edit' | 'format'>('edit')
 const revisionNote = ref('')
 const editingMetadataField = ref<MetadataField>()
@@ -44,11 +56,38 @@ const assetNameInput = ref<HTMLInputElement>()
 const assetDescriptionInput = ref<HTMLTextAreaElement>()
 let metadataSaveQueue = Promise.resolve()
 
-const dirty = computed(() => content.value !== baseContent.value)
+const activeSourceFile = computed(() =>
+  sourceFiles.value.find(file => file.path === activeFilePath.value),
+)
+const isActiveFileReadOnly = computed(() =>
+  Boolean(isHistoricalRevision.value || activeSourceFile.value?.read_only),
+)
+const content = computed({
+  get: () => fileContents.value[activeFilePath.value] ?? '',
+  set: (value: string) => {
+    if (activeFilePath.value && !isActiveFileReadOnly.value) {
+      fileContents.value[activeFilePath.value] = value
+    }
+  },
+})
+const baseContent = computed(() => baseFileContents.value[activeFilePath.value] ?? '')
 const latestVersion = computed(() => asset.value?.current_revision?.version)
 const isHistoricalRevision = computed(
   () => selectedRevision.value?.version !== latestVersion.value,
 )
+const editablePaths = computed(() => new Set(
+  sourceFiles.value.filter(file => !file.read_only).map(file => file.path),
+))
+const dirtyPaths = computed(() =>
+  [...new Set([...Object.keys(baseFileContents.value), ...Object.keys(fileContents.value)])]
+    .filter(path => editablePaths.value.has(path))
+    .filter(path => baseFileContents.value[path] !== fileContents.value[path]),
+)
+const referencesDirty = computed(() =>
+  JSON.stringify(packageReferences.value.map(referenceKey).sort())
+  !== JSON.stringify(basePackageReferences.value.map(referenceKey).sort()),
+)
+const dirty = computed(() => dirtyPaths.value.length > 0 || referencesDirty.value)
 const isRawImportedRevision = computed(
   () => selectedRevision.value?.operation === 'import' && !dirty.value,
 )
@@ -57,31 +96,83 @@ const auditEvents = computed(() => asset.value?.audit_events ?? [])
 const popularTags = computed(() => availableTags.value.slice(0, 3))
 const changeDiff = computed(() => {
   if (!dirty.value) return ''
-  const filename = asset.value?.source_filename || 'workflow.wdl'
   const version = selectedRevision.value?.version ?? '—'
-  return createTwoFilesPatch(
-    `${filename} (v${version})`,
-    `${filename} (working)`,
-    baseContent.value,
-    content.value,
-    '',
-    '',
-    { context: 3 },
-  )
+  const sourceDiff = dirtyPaths.value.map(path => createTwoFilesPatch(
+    `${path} (v${version})`,
+    `${path} (working)`,
+    baseFileContents.value[path] ?? '',
+    fileContents.value[path] ?? '',
+    '', '', { context: 3 },
+  )).join('\n')
+  if (!referencesDirty.value) return sourceDiff
+  const before = basePackageReferences.value.map(referenceLabel)
+  const after = packageReferences.value.map(referenceLabel)
+  return [
+    sourceDiff,
+    '--- tool-packages (saved)',
+    '+++ tool-packages (working)',
+    ...before.filter(item => !after.includes(item)).map(item => `-${item}`),
+    ...after.filter(item => !before.includes(item)).map(item => `+${item}`),
+  ].filter(Boolean).join('\n')
 })
+const importedTasks = computed(() => new Set(
+  auditEvents.value
+    .filter(event => event.action === 'tool_import')
+    .map(event => `${event.changes.file_path}::${event.changes.task_name}`),
+))
+const taskImportState = ref<Record<string, 'saving' | 'done' | 'error'>>({})
 const operationLabels: Record<WdlSourceRevision['operation'], string> = {
   import: '导入',
   edit: '编辑',
   format: '格式化',
+  package_link: '引用工具包',
 }
 const actionLabels: Record<string, string> = {
   import: '导入源码',
   edit: '保存修改',
   format: '格式化源码',
+  package_link: '引用工具包',
   metadata_update: '更新信息与标签',
+  tool_import: '导入工具草稿',
+}
+
+function referenceKey(reference: WdlSourcePackageReference) {
+  return [
+    reference.package_slug,
+    reference.version,
+    reference.digest,
+    reference.mount_prefix,
+  ].join(':')
+}
+
+function referenceLabel(reference: WdlSourcePackageReference) {
+  return `${reference.package_slug}@${reference.version} → ${reference.mount_prefix || '.'}`
+}
+
+function referenceRequestPayload() {
+  return packageReferences.value.map(reference => ({
+    package_slug: reference.package_slug,
+    version: reference.version,
+    digest: reference.digest,
+    mount_prefix: reference.mount_prefix,
+  }))
+}
+
+function localFileRequestPayload() {
+  return sourceFiles.value
+    .filter(file => !file.read_only && file.origin !== 'package')
+    .map(file => ({ path: file.path, content: fileContents.value[file.path] ?? '' }))
 }
 
 function navigateSection(section: WorkspaceSection) {
+  if (section === 'packages') {
+    void navigateTo('/wdl-packages')
+    return
+  }
+  if (section === 'runs') {
+    void navigateTo('/runs')
+    return
+  }
   if (section === 'wdl') {
     void navigateTo('/wdl')
     return
@@ -91,8 +182,25 @@ function navigateSection(section: WorkspaceSection) {
 
 function applyRevision(revision: WdlSourceRevision) {
   selectedRevision.value = revision
-  content.value = revision.content ?? ''
-  baseContent.value = revision.content ?? ''
+  const files = revision.files?.length
+    ? revision.files
+    : [{ path: asset.value?.source_filename || 'workflow.wdl', content: revision.content ?? '', digest: revision.digest, is_entry: true }]
+  sourceFiles.value = files.map(file => ({ ...file }))
+  packageReferences.value = (revision.package_references ?? []).map(reference => ({
+    ...reference,
+    files: reference.files.map(file => ({ ...file })),
+  }))
+  basePackageReferences.value = packageReferences.value.map(reference => ({
+    ...reference,
+    files: reference.files.map(file => ({ ...file })),
+  }))
+  const nextContents = Object.fromEntries(files.map(file => [file.path, file.content ?? '']))
+  fileContents.value = { ...nextContents }
+  baseFileContents.value = { ...nextContents }
+  activeFilePath.value = revision.entrypoint
+    || files.find(file => file.is_entry)?.path
+    || files[0]?.path
+    || ''
   pendingOperation.value = 'edit'
   revisionNote.value = ''
   feedback.value = ''
@@ -134,7 +242,7 @@ async function returnToLatest() {
 }
 
 async function formatSource() {
-  if (isHistoricalRevision.value || !content.value.trim()) return
+  if (isActiveFileReadOnly.value || !content.value.trim()) return
   saveState.value = 'saving'
   feedback.value = ''
   try {
@@ -144,7 +252,7 @@ async function formatSource() {
       diff: string
     }>(`/api/v1/wdl-assets/${encodeURIComponent(slug.value)}/format`, {
       method: 'POST',
-      body: { content: content.value },
+      body: { content: content.value, filename: activeFilePath.value },
     })
     if (!result.changed) {
       feedback.value = '当前源码已经符合格式。'
@@ -179,19 +287,16 @@ async function saveRevision() {
       {
         method: 'POST',
         body: {
-          content: content.value,
+          files: localFileRequestPayload(),
+          package_references: referenceRequestPayload(),
+          entrypoint: selectedRevision.value?.entrypoint || asset.value?.source_filename,
           operation: pendingOperation.value,
           note: revisionNote.value.trim(),
         },
       },
     )
     await loadAsset()
-    selectedRevision.value = {
-      ...revision,
-      content: revision.content,
-    }
-    content.value = revision.content ?? ''
-    baseContent.value = revision.content ?? ''
+    applyRevision(revision)
     saveState.value = 'saved'
     feedback.value = `WDL v${revision.version} 已保存并写入操作历史。`
     window.setTimeout(() => {
@@ -358,7 +463,7 @@ function sanitizeDownloadName(value: string) {
     .slice(0, 120) || 'workflow'
 }
 
-function exportWdl() {
+async function exportWdl() {
   if (!asset.value || !content.value) return
   const version = selectedRevision.value?.version ?? 1
   const versionLabel = `v${version}${dirty.value ? '-draft' : ''}`
@@ -366,10 +471,21 @@ function exportWdl() {
     sanitizeDownloadName(asset.value.name),
     versionLabel,
     exportTimestamp(),
-  ].join('-') + '.wdl'
-  const url = URL.createObjectURL(new Blob([content.value], {
-    type: 'text/plain;charset=utf-8',
-  }))
+  ].join('-') + (sourceFiles.value.length > 1 ? '.zip' : '.wdl')
+  const response = await $fetch<Blob>(
+    `/api/v1/wdl-assets/${encodeURIComponent(slug.value)}/export`,
+    {
+      method: 'POST',
+      responseType: 'blob',
+      body: {
+        version,
+        files: localFileRequestPayload(),
+        package_references: referenceRequestPayload(),
+        entrypoint: selectedRevision.value?.entrypoint || asset.value.source_filename,
+      },
+    },
+  )
+  const url = URL.createObjectURL(response)
   const anchor = document.createElement('a')
   anchor.href = url
   anchor.download = filename
@@ -378,6 +494,161 @@ function exportWdl() {
   anchor.remove()
   window.setTimeout(() => URL.revokeObjectURL(url), 0)
   feedback.value = `已导出 ${filename}`
+}
+
+function relativeImportPath(fromPath: string, toPath: string) {
+  const from = fromPath.split('/').slice(0, -1)
+  const to = toPath.split('/')
+  let common = 0
+  while (common < from.length && common < to.length && from[common] === to[common]) {
+    common += 1
+  }
+  return [
+    ...Array.from({ length: from.length - common }, () => '..'),
+    ...to.slice(common),
+  ].join('/')
+}
+
+function importNamespace(path: string, used: Set<string>) {
+  const base = (path.split('/').at(-1) ?? 'tools')
+    .replace(/\.wdl$/i, '')
+    .replace(/[^A-Za-z0-9_]+/g, '_')
+    .replace(/^([0-9])/, '_$1') || 'tools'
+  let candidate = base
+  let suffix = 2
+  while (used.has(candidate)) {
+    candidate = `${base}_${suffix}`
+    suffix += 1
+  }
+  used.add(candidate)
+  return candidate
+}
+
+function insertPackageImports(reference: WdlSourcePackageReference, selectedPaths: string[]) {
+  const entrypoint = selectedRevision.value?.entrypoint || asset.value?.source_filename || ''
+  const entryContent = fileContents.value[entrypoint]
+  if (!entrypoint || entryContent === undefined || !selectedPaths.length) return 0
+
+  const existingUris = new Set(
+    [...entryContent.matchAll(/^\s*import\s+"([^"]+)"/gm)].map(match => match[1]!),
+  )
+  const usedNamespaces = new Set(
+    [...entryContent.matchAll(/^\s*import\s+"[^"]+"\s+as\s+([A-Za-z_][A-Za-z0-9_]*)/gm)]
+      .map(match => match[1]!),
+  )
+  const imports = selectedPaths.flatMap((path) => {
+    const mounted = reference.files.find(file => file.path === path)?.mounted_path
+    if (!mounted) return []
+    const uri = relativeImportPath(entrypoint, mounted)
+    if (existingUris.has(uri)) return []
+    existingUris.add(uri)
+    return [`import "${uri}" as ${importNamespace(path, usedNamespaces)}`]
+  })
+  if (!imports.length) return 0
+
+  const lines = entryContent.split('\n')
+  const existingImportIndexes = lines.flatMap((line, index) =>
+    /^\s*import\s+"/.test(line) ? [index] : [],
+  )
+  let insertAt = existingImportIndexes.length
+    ? existingImportIndexes.at(-1)! + 1
+    : Math.max(0, lines.findIndex(line => /^\s*version\s+/.test(line)) + 1)
+  if (!existingImportIndexes.length) {
+    while (insertAt < lines.length && !lines[insertAt]?.trim()) insertAt += 1
+  }
+  const insertion = existingImportIndexes.length ? imports : [...imports, '']
+  lines.splice(insertAt, 0, ...insertion)
+  fileContents.value[entrypoint] = lines.join('\n')
+  return imports.length
+}
+
+function addPackageReference(payload: {
+  reference: WdlSourcePackageReference
+  version: WdlToolPackageVersion
+  selectedPaths: string[]
+}) {
+  if (isHistoricalRevision.value) return
+  const { reference, version, selectedPaths } = payload
+  if (
+    !reference.mount_prefix
+    || reference.mount_prefix.split('/').some(part => !part || part === '.' || part === '..')
+  ) {
+    feedback.value = '挂载目录无效。'
+    return
+  }
+  if (packageReferences.value.some(item => referenceKey(item) === referenceKey(reference))) {
+    feedback.value = `${reference.package_name} ${reference.version} 已引用。`
+    return
+  }
+  const occupied = new Set(sourceFiles.value.map(file => file.path))
+  const conflict = reference.files.find(file => occupied.has(file.mounted_path))
+  if (conflict) {
+    feedback.value = `文件路径冲突：${conflict.mounted_path}`
+    return
+  }
+
+  const packageFileByPath = new Map(version.files.map(file => [file.path, file]))
+  const mountedFiles: WdlSourceFile[] = reference.files.map((file) => {
+    const source = packageFileByPath.get(file.path)
+    return {
+      path: file.mounted_path,
+      content: source?.content ?? '',
+      digest: file.digest,
+      is_entry: false,
+      analysis: source?.analysis,
+      origin: 'package',
+      read_only: true,
+      package_reference: {
+        package_slug: reference.package_slug,
+        package_name: reference.package_name,
+        version: reference.version,
+        digest: reference.digest,
+        mount_prefix: reference.mount_prefix,
+        package_file_path: file.path,
+      },
+    }
+  })
+  sourceFiles.value = [...sourceFiles.value, ...mountedFiles]
+  for (const file of mountedFiles) {
+    fileContents.value[file.path] = file.content ?? ''
+    baseFileContents.value[file.path] = file.content ?? ''
+  }
+  packageReferences.value = [...packageReferences.value, reference]
+  const importCount = insertPackageImports(reference, selectedPaths)
+  pendingOperation.value = 'edit'
+  revisionNote.value ||= `引用 ${reference.package_name} ${reference.version}`
+  inspectorTab.value = 'diff'
+  feedback.value = `已引用 ${reference.package_name} ${reference.version}${importCount ? `，补入 ${importCount} 条 import` : ''}。保存后生成新版本。`
+}
+
+function selectFile(path: string, line?: number) {
+  activeFilePath.value = path
+  if (line) void nextTick(() => codeEditor.value?.revealLine(line))
+}
+
+async function importTask(task: NonNullable<typeof analysis.value>['tasks'][number]) {
+  if (!task.file_path || !selectedRevision.value || dirty.value) return
+  const key = `${task.file_path}::${task.name}`
+  taskImportState.value[key] = 'saving'
+  try {
+    const response = await $fetch<{ tool_id: string }>(
+      `/api/v1/wdl-assets/${encodeURIComponent(slug.value)}/tasks/import`,
+      {
+        method: 'POST',
+        body: {
+          version: selectedRevision.value.version,
+          file_path: task.file_path,
+          task_name: task.name,
+        },
+      },
+    )
+    taskImportState.value[key] = 'done'
+    feedback.value = `工具草稿 ${response.tool_id} 已创建。`
+    await navigateTo({ path: '/', query: { section: 'tools', tool: response.tool_id } })
+  } catch (error: any) {
+    taskImportState.value[key] = 'error'
+    feedback.value = error?.data?.error?.message ?? '工具草稿导入失败。'
+  }
 }
 
 function diffLineClass(line: string) {
@@ -392,6 +663,12 @@ function handleSaveShortcut(event: KeyboardEvent) {
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
     event.preventDefault()
     void saveRevision()
+  } else if (event.shiftKey && event.altKey && event.key.toLowerCase() === 'e') {
+    event.preventDefault()
+    void exportWdl()
+  } else if (event.shiftKey && event.altKey && event.key.toLowerCase() === 'f') {
+    event.preventDefault()
+    void formatSource()
   }
 }
 
@@ -543,6 +820,16 @@ onBeforeRouteLeave(() => {
           </div>
         </section>
 
+        <section v-if="sourceFiles.length" class="wdl-sidebar-section wdl-source-files">
+          <h2>文件 <span>{{ sourceFiles.length }}</span></h2>
+          <WdlFileTree
+            :files="sourceFiles"
+            :active-path="activeFilePath"
+            :dirty-paths="dirtyPaths"
+            @select="selectFile"
+          />
+        </section>
+
         <section class="wdl-sidebar-section wdl-revision-list">
           <h2>源码版本</h2>
           <button
@@ -564,11 +851,12 @@ onBeforeRouteLeave(() => {
       <section class="wdl-workbench__editor">
         <header class="wdl-editor-toolbar">
           <div>
-            <strong>{{ asset.source_filename }}</strong>
+            <strong>{{ activeFilePath || asset.source_filename }}</strong>
             <small>
               WDL {{ analysis?.wdl_version ?? '未知版本' }}
               · {{ content.split('\n').length }} 行
-              · sha256 {{ selectedRevision?.digest.slice(-10) }}
+              <template v-if="activeSourceFile?.origin === 'package'"> · 工具包只读</template>
+              <template v-if="analysis?.package"> · {{ analysis.package.reachable_file_count }}/{{ analysis.package.file_count }} 文件</template>
             </small>
           </div>
           <div class="wdl-editor-toolbar__actions">
@@ -591,7 +879,7 @@ onBeforeRouteLeave(() => {
               <kbd>⇧ Alt E</kbd>
             </button>
             <button
-              v-if="!isHistoricalRevision"
+              v-if="!isActiveFileReadOnly"
               class="button button--ghost wdl-format-button"
               type="button"
               aria-label="格式化"
@@ -609,6 +897,9 @@ onBeforeRouteLeave(() => {
           <div v-if="isHistoricalRevision" class="historical-notice">
             正在查看不可变历史版本 v{{ selectedRevision?.version }}。返回最新版本后才能继续编辑。
           </div>
+          <div v-else-if="activeSourceFile?.origin === 'package'" class="editor-ready-notice">
+            {{ activeSourceFile.package_reference?.package_name }} {{ activeSourceFile.package_reference?.version }} · 只读
+          </div>
           <div v-else-if="feedback" class="workbench-feedback" :class="{ 'workbench-feedback--error': saveState === 'error' || metadataState === 'error' }">
             {{ feedback }}
           </div>
@@ -624,7 +915,7 @@ onBeforeRouteLeave(() => {
           <WdlCodeEditor
             ref="codeEditor"
             v-model="content"
-            :read-only="isHistoricalRevision"
+            :read-only="isActiveFileReadOnly"
             :formatting="saveState === 'saving'"
             :aria-label="`${asset.name} WDL 源码`"
             @export="exportWdl"
@@ -703,20 +994,56 @@ onBeforeRouteLeave(() => {
             </span>
           </div>
 
+          <WdlPackageReferencePanel
+            :references="packageReferences"
+            :read-only="isHistoricalRevision"
+            @add="addPackageReference"
+          />
+
           <section v-if="analysis?.imports.length" class="definition-group">
             <h2>Imports</h2>
-            <article v-for="item in analysis.imports" :key="item.uri">
+            <article
+              v-for="item in analysis.imports"
+              :key="`${item.file_path}-${item.uri}`"
+              class="definition-group__interactive"
+              @click="item.target_path && selectFile(item.target_path)"
+            >
               <strong>{{ item.namespace || item.uri }}</strong>
               <code>{{ item.uri }}</code>
-              <small>第 {{ item.line ?? '—' }} 行 · 当前按单文件资产记录，依赖包将在后续版本补齐</small>
+              <small>
+                {{ item.file_path }} · 第 {{ item.line ?? '—' }} 行
+                · {{ item.status === 'resolved' ? '已解析' : item.status === 'external' ? '外部依赖' : '缺少文件' }}
+              </small>
             </article>
           </section>
 
           <section class="definition-group">
             <h2>Tasks</h2>
-            <article v-for="task in analysis?.tasks" :key="task.name">
-              <strong>{{ task.name }}</strong>
-              <small>第 {{ task.line ?? '—' }}–{{ task.end_line ?? '—' }} 行</small>
+            <article
+              v-for="task in analysis?.tasks"
+              :key="task.id || `${task.file_path}-${task.name}`"
+              class="definition-group__interactive"
+              @click="task.file_path && selectFile(task.file_path, task.line)"
+            >
+              <div class="definition-title-row">
+                <strong>{{ task.name }}</strong>
+                <button
+                  class="task-import-button"
+                  type="button"
+                  :disabled="dirty || taskImportState[`${task.file_path}::${task.name}`] === 'saving'"
+                  @click.stop="importTask(task)"
+                >
+                  {{
+                    importedTasks.has(`${task.file_path}::${task.name}`)
+                      || taskImportState[`${task.file_path}::${task.name}`] === 'done'
+                      ? '已导入'
+                      : taskImportState[`${task.file_path}::${task.name}`] === 'saving'
+                        ? '导入中…'
+                        : '导入工具'
+                  }}
+                </button>
+              </div>
+              <small>{{ task.file_path }} · 第 {{ task.line ?? '—' }}–{{ task.end_line ?? '—' }} 行</small>
               <code>{{ task.inputs.length }} inputs → {{ task.outputs.length }} outputs</code>
               <div v-if="task.runtime_keys.length" class="tag-list tag-list--compact">
                 <span v-for="key in task.runtime_keys" :key="key">{{ key }}</span>
@@ -729,7 +1056,7 @@ onBeforeRouteLeave(() => {
             <h2>Workflows</h2>
             <article v-for="workflow in analysis?.workflows" :key="workflow.name">
               <strong>{{ workflow.name }}</strong>
-              <small>第 {{ workflow.line ?? '—' }}–{{ workflow.end_line ?? '—' }} 行</small>
+              <small>{{ workflow.file_path }} · 第 {{ workflow.line ?? '—' }}–{{ workflow.end_line ?? '—' }} 行</small>
               <code>
                 {{ workflow.structure.call_count }} calls
                 · {{ workflow.structure.scatter_count }} scatter
@@ -760,7 +1087,7 @@ onBeforeRouteLeave(() => {
               <span>错误</span>
             </div>
             <p>{{ item.message }}</p>
-            <small v-if="item.location">第 {{ item.location.line ?? '—' }} 行，第 {{ item.location.column ?? '—' }} 列</small>
+            <small>{{ item.file_path || activeFilePath }}<template v-if="item.location"> · 第 {{ item.location.line ?? '—' }} 行，第 {{ item.location.column ?? '—' }} 列</template></small>
           </article>
           <p v-if="analysis?.diagnostics.length === 0" class="empty-state">当前版本没有诊断信息。</p>
         </div>

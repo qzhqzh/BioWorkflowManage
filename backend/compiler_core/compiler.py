@@ -24,7 +24,7 @@ INPUT_PATTERN = re.compile(r"\{\{\s*inputs\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 def _type(port: dict[str, Any]) -> dict[str, Any]:
     return {
         "wdl_type": port["wdl_type"],
-        "optional": not port.get("required", True),
+        "optional": port.get("optional", not port.get("required", True)),
         "semantic_type": port["semantic_type"],
     }
 
@@ -242,7 +242,13 @@ def render_wdl(ir: dict[str, Any]) -> str:
         lines.extend(f"    {line}" for line in command.splitlines())
         lines += ["  >>>", "", "  output {"]
         for item in task["outputs"]:
-            lines.append(f"    {_wdl_type(item)} {item['name']} = {_wdl_literal(item['expression']['value'])}")
+            expression = item["expression"]
+            value = (
+                expression["value"]
+                if expression["kind"] == "expression"
+                else _wdl_literal(expression["value"])
+            )
+            lines.append(f"    {_wdl_type(item)} {item['name']} = {value}")
         lines += ["  }", "", "  runtime {", f"    docker: {_wdl_literal(task['runtime']['docker'])}"]
         if "cpu" in task["runtime"]:
             lines.append(f"    cpu: {task['runtime']['cpu']}")
