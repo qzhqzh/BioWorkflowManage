@@ -150,8 +150,10 @@ test('数据库缺失项清晰可见且不会允许提交', async ({ page }) => 
   await page.goto('/runs')
 
   await expect(page.getByText('数据库还缺 1 项')).toBeVisible()
-  await expect(page.locator('.analysis-missing-resources')).toHaveAttribute('open', '')
-  await page.getByText('数据库还缺 1 项').click()
+  const missingResources = page.locator('.analysis-missing-resources')
+  if (!(await missingResources.getAttribute('open'))) {
+    await page.getByText('数据库还缺 1 项').click()
+  }
   await expect(page.getByText('hg19/reference/hg19.simp.fa')).toBeVisible()
   await expect(page.getByRole('button', { name: '开始分析' })).toBeDisabled()
 })

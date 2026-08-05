@@ -153,6 +153,7 @@ jobs:
 
       - name: Build and start the application
         env:
+          DJANGO_SEED_USERS: "1"
           DJANGO_SEED_DEMO: "1"
         run: docker compose up -d --build --wait
 
