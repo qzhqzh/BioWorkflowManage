@@ -17,7 +17,14 @@ from rest_framework import status
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 
-from .models import AnalysisRun, AnalysisRunEvent, WDLAsset
+from .annotation_tools import ANNOVAR_CANONICAL_IDS, ANNOVAR_RESOURCE_PATTERNS
+from .models import (
+    AnalysisRun,
+    AnalysisRunEvent,
+    WDLAsset,
+    WorkflowDocument,
+    WorkflowVersion,
+)
 
 
 FASTQ_PATTERN = re.compile(
@@ -27,6 +34,12 @@ FASTQ_PATTERN = re.compile(
 SAFE_SAMPLE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 SAFE_DISPLAY_VALUE = re.compile(r"^[\w\u4e00-\u9fff .()_-]{1,128}$", re.UNICODE)
 MAX_DISCOVERED_FASTQ = 2000
+PUBLISHED_WORKFLOW_PREFIX = "published:"
+SUPPORTED_PUBLISHED_INPUTS = {
+    "bio.fastq.gz.r1",
+    "bio.fastq.gz.r2",
+    "bio.annotation.database_dir",
+}
 
 WORKFLOW_PROFILES = {
     "solidtumorsingle": {
@@ -63,6 +76,38 @@ def _actor(request) -> str:
     if user is not None and getattr(user, "is_authenticated", False):
         return user.get_username()
     return "local-user"
+
+
+def _actor_user(request):
+    user = getattr(request, "user", None)
+    if user is not None and getattr(user, "is_authenticated", False):
+        return user
+    return None
+
+
+def _canonical_digest(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def _visible_runs(request):
+    queryset = AnalysisRun.objects.select_related(
+        "asset",
+        "revision",
+        "workflow_version",
+        "workflow_version__workflow",
+    )
+    user = getattr(request, "user", None)
+    if user is not None and getattr(user, "is_authenticated", False):
+        if getattr(user, "is_superuser", False) or getattr(user, "is_staff", False):
+            return queryset
+        return queryset.filter(submitted_by=user)
+    return queryset.filter(actor="local-user")
 
 
 def _safe_path(root: Path, relative_path: str) -> Path:
@@ -194,10 +239,8 @@ def _run_timing_payload(run: AnalysisRun) -> dict[str, Any]:
         timing["total_seconds"] = _seconds((end - run.started_at).total_seconds())
     if not run.work_directory:
         return timing
-    root = Path(settings.ANALYSIS_RUN_ROOT).resolve()
     try:
-        run_directory = Path(run.work_directory).resolve()
-        run_directory.relative_to(root)
+        run_directory = _accessible_run_path(Path(run.work_directory))
     except (OSError, ValueError):
         return timing
     log_path = run_directory / "miniwdl.log"
@@ -254,7 +297,8 @@ def discover_fastq_datasets() -> list[dict[str, Any]]:
         total_size = 0
         for mate in (1, 2):
             path = mates[mate]
-            size = path.stat().st_size
+            stat = path.stat()
+            size = stat.st_size
             total_size += size
             files.append(
                 {
@@ -263,6 +307,12 @@ def discover_fastq_datasets() -> list[dict[str, Any]]:
                     "relative_path": path.relative_to(root).as_posix(),
                     "size": size,
                     "size_label": _format_size(size),
+                    "identity": {
+                        "size": size,
+                        "mtime_ns": stat.st_mtime_ns,
+                        "device": stat.st_dev,
+                        "inode": stat.st_ino,
+                    },
                 }
             )
         sample_code = _sample_code(pair_stems[key])
@@ -388,6 +438,68 @@ def _requirements(entry: dict[str, Any]) -> list[dict[str, Any]]:
     return results
 
 
+def _dataset_manifest(dataset: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "dataset_id": dataset["id"],
+        "files": [
+            {
+                "mate": item["mate"],
+                "relative_path": item["relative_path"],
+                "verification": "identity",
+                **item["identity"],
+            }
+            for item in dataset["files"]
+        ],
+    }
+
+
+def _catalog_resource_manifest(entry: dict[str, Any]) -> dict[str, Any]:
+    root = Path(settings.ANALYSIS_DATABASE_ROOT)
+    resources = []
+    for item in entry.get("required", []):
+        if not isinstance(item, dict):
+            continue
+        candidates = [
+            str(item.get("path") or ""),
+            *[str(path) for path in item.get("alternatives", []) if isinstance(path, str)],
+        ]
+        for relative_path in candidates:
+            try:
+                path = _safe_path(root, relative_path)
+                stat = path.stat()
+            except (AnalysisInputError, OSError):
+                continue
+            kind = str(item.get("kind") or "file")
+            resource = {
+                "relative_path": relative_path,
+                "kind": kind,
+                "verification": (
+                    "exists"
+                    if kind == "directory"
+                    else ("sha256" if item.get("sha256") else "identity")
+                ),
+            }
+            if kind != "directory":
+                resource.update(
+                    {
+                        "size": stat.st_size,
+                        "mtime_ns": stat.st_mtime_ns,
+                        "device": stat.st_dev,
+                        "inode": stat.st_ino,
+                    }
+                )
+            if item.get("sha256"):
+                resource["sha256"] = item["sha256"]
+            resources.append(resource)
+            break
+    return {
+        "schema_version": 1,
+        "resource_id": entry.get("id"),
+        "resources": resources,
+    }
+
+
 def _catalog_entry_payload(entry: dict[str, Any]) -> dict[str, Any]:
     requirements = _requirements(entry)
     return {
@@ -409,6 +521,9 @@ def _workflow_payload(slug: str, profile: dict[str, str]) -> dict[str, Any]:
     return {
         "slug": slug,
         **profile,
+        "source_type": "wdl_asset",
+        "requires_reference": True,
+        "requires_panel": True,
         "asset_name": asset.name if asset else "",
         "revision": revision.version if revision else None,
         "digest": revision.digest if revision else "",
@@ -420,6 +535,308 @@ def _workflow_payload(slug: str, profile: dict[str, str]) -> dict[str, Any]:
             else ([] if asset else ["历史 WDL 资产尚未导入。"])
         ),
     }
+
+
+def _workflow_interface(version: WorkflowVersion) -> list[dict[str, Any]]:
+    inputs = version.interface_contract.get("inputs")
+    if isinstance(inputs, list) and inputs:
+        return inputs
+    return [
+        {
+            **(node.get("port") or {}),
+            "name": node.get("id"),
+            "label": node.get("label") or node.get("id"),
+        }
+        for node in version.workflow_graph.get("nodes", [])
+        if node.get("type") == "workflow_input"
+    ]
+
+
+def _published_workflow_payload(
+    version: WorkflowVersion,
+    references: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    interface = _workflow_interface(version)
+    blockers = []
+    if not version.compiled_bundle or not version.compiled_digest:
+        blockers.append("该版本发布时尚未固化编译产物，请重新发布一个新版本。")
+    if any(
+        node.get("type") == "subworkflow"
+        for node in version.workflow_graph.get("nodes", [])
+    ):
+        blockers.append("当前运行入口暂不支持包含子流程的已发布版本。")
+    unsupported = [
+        item
+        for item in interface
+        if item.get("semantic_type") not in SUPPORTED_PUBLISHED_INPUTS
+        or (
+            item.get("semantic_type") in {"bio.fastq.gz.r1", "bio.fastq.gz.r2"}
+            and item.get("wdl_type") != "File"
+        )
+        or (
+            item.get("semantic_type") == "bio.annotation.database_dir"
+            and item.get("wdl_type") != "Directory"
+        )
+    ]
+    if unsupported:
+        blockers.append(
+            "运行页还不能自动构造输入："
+            + "、".join(str(item.get("label") or item.get("name")) for item in unsupported)
+        )
+    semantics = {item.get("semantic_type") for item in interface}
+    if not {"bio.fastq.gz.r1", "bio.fastq.gz.r2"}.issubset(semantics):
+        blockers.append("运行页要求已发布流程声明配对 FASTQ 输入语义。")
+    key = f"{PUBLISHED_WORKFLOW_PREFIX}{version.workflow.slug}:{version.version}"
+    reference_status = {}
+    if "bio.annotation.database_dir" in semantics and references is not None:
+        for reference in references:
+            reference_id = str(reference.get("id") or "")
+            try:
+                _validate_annotation_reference(version, reference)
+                reference_status[reference_id] = _catalog_entry_payload(
+                    _annotation_reference_entry(version, reference)
+                )
+            except AnalysisInputError as error:
+                missing = {
+                    "path": f"reference/{reference_id}",
+                    "label": str(error),
+                    "kind": "directory",
+                    "present": False,
+                }
+                reference_status[reference_id] = {
+                    "id": reference_id,
+                    "name": reference.get("name", reference_id),
+                    "ready": False,
+                    "requirements": [missing],
+                    "missing": [missing],
+                }
+    return {
+        "slug": key,
+        "source_type": "workflow_version",
+        "source_slug": version.workflow.slug,
+        "name": version.name,
+        "workflow_name": version.workflow_graph.get("id", version.workflow.slug),
+        "mode": "single",
+        "description": version.description,
+        "asset_name": "",
+        "revision": version.version,
+        "digest": version.semantic_digest,
+        "ready": not blockers,
+        "diagnostic_count": len(blockers),
+        "blockers": blockers,
+        "requires_reference": bool(
+            "bio.annotation.database_dir" in semantics
+        ),
+        "requires_panel": False,
+        "reference_status": reference_status,
+    }
+
+
+def _published_workflows(
+    references: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    latest_ids = []
+    for document in WorkflowDocument.objects.filter(
+        kind=WorkflowDocument.Kind.WORKFLOW
+    ).prefetch_related("versions"):
+        version = document.versions.order_by("-version").first()
+        if version is not None:
+            latest_ids.append(version.pk)
+    versions = WorkflowVersion.objects.select_related("workflow").filter(
+        pk__in=latest_ids
+    )
+    return [
+        _published_workflow_payload(version, references)
+        for version in sorted(versions, key=lambda item: item.workflow.slug)
+    ]
+
+
+def _parse_published_workflow(value: str) -> WorkflowVersion:
+    try:
+        slug, version_value = value.removeprefix(PUBLISHED_WORKFLOW_PREFIX).rsplit(":", 1)
+        version = int(version_value)
+    except (TypeError, ValueError):
+        raise AnalysisInputError(
+            "ANALYSIS_WORKFLOW_UNSUPPORTED",
+            "已发布 Workflow 标识无效。",
+        ) from None
+    item = WorkflowVersion.objects.select_related("workflow").filter(
+        workflow__slug=slug,
+        version=version,
+        kind=WorkflowDocument.Kind.WORKFLOW,
+    ).first()
+    if item is None:
+        raise AnalysisInputError(
+            "ANALYSIS_WORKFLOW_MISSING",
+            "所选已发布 Workflow 版本不存在。",
+        )
+    payload = _published_workflow_payload(item)
+    if not payload["ready"]:
+        raise AnalysisInputError(
+            "ANALYSIS_WORKFLOW_UNSUPPORTED",
+            payload["blockers"][0],
+            details={"blockers": payload["blockers"]},
+        )
+    return item
+
+
+def _compile_published_workflow(version: WorkflowVersion) -> tuple[dict[str, Any], str]:
+    bundle = version.compiled_bundle
+    if not isinstance(bundle, dict) or _canonical_digest(bundle) != version.compiled_digest:
+        raise AnalysisInputError(
+            "ANALYSIS_WORKFLOW_INVALID",
+            "已发布 Workflow 的固定编译产物校验失败。",
+        )
+    files = bundle.get("files")
+    if not isinstance(files, dict):
+        files = {}
+    if "workflow.wdl" not in files:
+        raise AnalysisInputError(
+            "ANALYSIS_WORKFLOW_INVALID",
+            "编译结果缺少 workflow.wdl。",
+        )
+    return bundle, version.compiled_digest
+
+
+def _published_inputs(
+    version: WorkflowVersion,
+    dataset: dict[str, Any],
+    reference: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    read1, read2 = _validate_dataset(dataset)
+    execution_paths = {
+        "bio.fastq.gz.r1": _execution_path(
+            read1,
+            Path(settings.ANALYSIS_RAWDATA_ROOT),
+            Path(settings.ANALYSIS_RAWDATA_EXECUTION_ROOT),
+        ),
+        "bio.fastq.gz.r2": _execution_path(
+            read2,
+            Path(settings.ANALYSIS_RAWDATA_ROOT),
+            Path(settings.ANALYSIS_RAWDATA_EXECUTION_ROOT),
+        ),
+    }
+    semantics = {item.get("semantic_type") for item in _workflow_interface(version)}
+    if "bio.annotation.database_dir" in semantics:
+        if reference is None:
+            raise AnalysisInputError(
+                "ANALYSIS_REFERENCE_REQUIRED",
+                "该流程包含注释数据库目录，请选择参考版本。",
+            )
+        directories = reference.get("directories")
+        if not isinstance(directories, dict) or not directories.get("humandb"):
+            raise AnalysisInputError(
+                "ANALYSIS_DATABASE_CATALOG_INVALID",
+                "参考版本缺少 ANNOVAR humandb 目录映射。",
+            )
+        database_path = _resource(
+            Path(settings.ANALYSIS_DATABASE_ROOT),
+            str(directories["humandb"]),
+            directory=True,
+            execution_root=Path(settings.ANALYSIS_DATABASE_EXECUTION_ROOT),
+        )
+        execution_paths["bio.annotation.database_dir"] = database_path
+    workflow_name = str(version.workflow_graph.get("id") or version.workflow.slug)
+    return {
+        f"{workflow_name}.{item['name']}": execution_paths[item["semantic_type"]]
+        for item in _workflow_interface(version)
+    }
+
+
+def _validate_annotation_reference(
+    version: WorkflowVersion,
+    reference: dict[str, Any],
+) -> None:
+    annotation_tool_ids = {
+        str(spec.get("id"))
+        for spec in version.tool_specs
+        if spec.get("task_kind") == "annotation"
+    }
+    selected_build = str(reference.get("ref_version") or reference.get("id") or "")
+    for node in version.workflow_graph.get("nodes", []):
+        tool_ref = node.get("tool_ref") or {}
+        if tool_ref.get("id") not in annotation_tool_ids:
+            continue
+        configured_build = str((node.get("parameter_values") or {}).get("ref_version") or "")
+        if configured_build != selected_build:
+            raise AnalysisInputError(
+                "ANALYSIS_REFERENCE_MISMATCH",
+                f"注释节点 {node.get('id')} 固定为 {configured_build or '未配置'}，"
+                f"与所选参考版本 {selected_build} 不一致。",
+            )
+
+
+def _annotation_reference_entry(
+    version: WorkflowVersion,
+    reference: dict[str, Any],
+) -> dict[str, Any]:
+    annotation_specs = {
+        str(spec.get("id")): spec
+        for spec in version.tool_specs
+        if spec.get("task_kind") == "annotation"
+    }
+    selected_items: set[str] = set()
+    for node in version.workflow_graph.get("nodes", []):
+        spec = annotation_specs.get(str((node.get("tool_ref") or {}).get("id")))
+        if spec is None:
+            continue
+        configured = (node.get("parameter_values") or {}).get("annotation_items")
+        if not isinstance(configured, list):
+            selector = next(
+                (
+                    item
+                    for item in spec.get("inputs", [])
+                    if item.get("name") == "annotation_items"
+                ),
+                {},
+            )
+            configured = selector.get("default", ANNOVAR_CANONICAL_IDS)
+        selected_items.update(str(item) for item in configured)
+
+    build = str(reference.get("ref_version") or reference.get("id") or "")
+    required = reference.get("required", [])
+    scoped_required = [
+        item
+        for item in required
+        if isinstance(item, dict)
+        and item.get("kind") == "directory"
+        and str(item.get("path") or "").rstrip("/").endswith("/humandb")
+    ]
+    for item_id in sorted(selected_items):
+        patterns = ANNOVAR_RESOURCE_PATTERNS.get(item_id, {}).get(build, [])
+        match = next(
+            (
+                item
+                for item in required
+                if isinstance(item, dict)
+                and any(
+                    pattern
+                    in " ".join(
+                        [
+                            str(item.get("path") or ""),
+                            *[
+                                str(path)
+                                for path in item.get("alternatives", [])
+                                if isinstance(path, str)
+                            ],
+                        ]
+                    )
+                    for pattern in patterns
+                )
+            ),
+            None,
+        )
+        if match is None:
+            scoped_required.append(
+                {
+                    "path": f"__catalog_missing__/{build}/{item_id}",
+                    "kind": "file",
+                    "label": f"{item_id}（catalog 未声明）",
+                }
+            )
+        elif match not in scoped_required:
+            scoped_required.append(match)
+    return {**reference, "required": scoped_required}
 
 
 def _find_by_id(entries: list[dict[str, Any]], entry_id: str, label: str) -> dict[str, Any]:
@@ -601,17 +1018,35 @@ def _flatten_outputs(value: Any, prefix: str = "") -> list[tuple[str, Any]]:
     return [(prefix, value)]
 
 
+def _accessible_run_path(path: Path) -> Path:
+    execution_root = Path(settings.ANALYSIS_RUN_EXECUTION_ROOT).resolve()
+    local_root = Path(settings.ANALYSIS_RUN_ROOT).resolve()
+    resolved = path.resolve()
+    try:
+        relative = resolved.relative_to(execution_root)
+    except ValueError:
+        # DIND-era runs already contain the container-local root. Preserve access
+        # after switching to the host/NAS execution root.
+        relative = resolved.relative_to(local_root)
+    mapped = (local_root / relative).resolve()
+    mapped.relative_to(local_root)
+    return mapped
+
+
 def _output_payload(run: AnalysisRun) -> list[dict[str, Any]]:
     if not run.outputs or not run.work_directory:
         return []
-    root = Path(run.work_directory).resolve()
+    try:
+        root = _accessible_run_path(Path(run.work_directory))
+    except (OSError, ValueError):
+        return []
     outputs = run.outputs.get("outputs", run.outputs)
     payload = []
     for key, value in _flatten_outputs(outputs):
         if isinstance(value, str):
             path = Path(value)
             try:
-                resolved = path.resolve()
+                resolved = _accessible_run_path(path)
                 resolved.relative_to(root)
             except (OSError, ValueError):
                 resolved = None
@@ -635,15 +1070,27 @@ def _output_payload(run: AnalysisRun) -> list[dict[str, Any]]:
 
 
 def analysis_run_payload(run: AnalysisRun, *, include_events: bool = False) -> dict[str, Any]:
-    payload = {
-        "id": str(run.id),
-        "workflow": {
+    if run.workflow_version_id:
+        workflow_payload = {
+            "slug": run.workflow_version.workflow.slug,
+            "name": run.workflow_version.name,
+            "workflow_name": run.workflow_name,
+            "revision": run.workflow_version.version,
+            "digest": run.source_digest,
+            "source_type": "workflow_version",
+        }
+    else:
+        workflow_payload = {
             "slug": run.asset.slug,
             "name": run.asset.name,
             "workflow_name": run.workflow_name,
             "revision": run.revision.version,
             "digest": run.revision.digest,
-        },
+            "source_type": "wdl_asset",
+        }
+    payload = {
+        "id": str(run.id),
+        "workflow": workflow_payload,
         "sample_id": run.sample_id,
         "sample_name": run.sample_name,
         "actor": run.actor,
@@ -677,22 +1124,24 @@ def analysis_run_payload(run: AnalysisRun, *, include_events: bool = False) -> d
 @api_view(["GET"])
 def analysis_catalog(request):
     datasets = discover_fastq_datasets()
-    workflows = [
-        _workflow_payload(slug, profile)
-        for slug, profile in WORKFLOW_PROFILES.items()
-    ]
     try:
         catalog = load_database_catalog()
+        reference_entries = catalog["references"]
         references = [
-            _catalog_entry_payload(item) for item in catalog["references"]
+            _catalog_entry_payload(item) for item in reference_entries
         ]
         panels = [_catalog_entry_payload(item) for item in catalog["panels"]]
         catalog_error = None
     except AnalysisInputError as error:
         references = []
+        reference_entries = []
         panels = []
         catalog_error = {"code": error.code, "message": str(error), "details": error.details}
         catalog = {"schema_version": 1}
+    workflows = [
+        _workflow_payload(slug, profile)
+        for slug, profile in WORKFLOW_PROFILES.items()
+    ] + _published_workflows(reference_entries)
     return Response(
         {
             "rawdata_directory": "workspace/rawdata",
@@ -712,11 +1161,94 @@ def analysis_catalog(request):
 @api_view(["GET", "POST"])
 def analysis_runs(request):
     if request.method == "GET":
-        runs = AnalysisRun.objects.select_related("asset", "revision")[:50]
+        runs = _visible_runs(request)[:50]
         return Response({"results": [analysis_run_payload(run) for run in runs]})
 
     try:
         workflow_slug = str(request.data.get("workflow") or "")
+        datasets = discover_fastq_datasets()
+        dataset = _find_by_id(
+            datasets,
+            str(request.data.get("dataset") or ""),
+            "原始数据",
+        )
+        sample_id = _validate_safe_value(
+            str(request.data.get("sample_id") or dataset["name"]),
+            "样本编号",
+            sample_id=True,
+        )
+        sample_name = _validate_safe_value(
+            str(request.data.get("sample_name") or sample_id),
+            "样本名称",
+        )
+        if workflow_slug.startswith(PUBLISHED_WORKFLOW_PREFIX):
+            workflow_version = _parse_published_workflow(workflow_slug)
+            source_bundle, source_digest = _compile_published_workflow(
+                workflow_version
+            )
+            interface_semantics = {
+                item.get("semantic_type") for item in _workflow_interface(workflow_version)
+            }
+            reference = None
+            if "bio.annotation.database_dir" in interface_semantics:
+                catalog = load_database_catalog()
+                reference = _find_by_id(
+                    catalog["references"],
+                    str(request.data.get("reference") or ""),
+                    "参考版本",
+                )
+                annotation_reference = _annotation_reference_entry(
+                    workflow_version, reference
+                )
+                requirements = _requirements(annotation_reference)
+                if any(not item["present"] for item in requirements):
+                    raise AnalysisInputError(
+                        "ANALYSIS_DATABASE_INCOMPLETE",
+                        "所选参考版本的数据库尚未就绪。",
+                        details={"missing": [item for item in requirements if not item["present"]]},
+                    )
+                _validate_annotation_reference(workflow_version, reference)
+            input_values = _published_inputs(workflow_version, dataset, reference)
+            input_manifest = _dataset_manifest(dataset)
+            database_manifest = (
+                _catalog_resource_manifest(annotation_reference)
+                if reference
+                else None
+            )
+            run = AnalysisRun.objects.create(
+                workflow_version=workflow_version,
+                workflow_name=str(
+                    workflow_version.workflow_graph.get("id")
+                    or workflow_version.workflow.slug
+                ),
+                sample_id=sample_id,
+                sample_name=sample_name,
+                actor=_actor(request),
+                submitted_by=_actor_user(request),
+                source_bundle=source_bundle,
+                source_digest=source_digest,
+                request_payload={
+                    "workflow": workflow_slug,
+                    "workflow_semantic_digest": workflow_version.semantic_digest,
+                    "compiled_source_digest": source_digest,
+                    "input_digest": _canonical_digest(input_manifest),
+                    "input_resource_manifest": input_manifest,
+                    "database_digest": (
+                        _canonical_digest(database_manifest) if database_manifest else None
+                    ),
+                    "database_resource_manifest": database_manifest,
+                    "dataset": dataset["id"],
+                    "dataset_name": dataset["name"],
+                    "reference": reference["id"] if reference else None,
+                },
+                input_values=input_values,
+            )
+            AnalysisRunEvent.objects.create(run=run, message="运行已进入队列。")
+            return Response(
+                analysis_run_payload(run, include_events=True),
+                status=status.HTTP_201_CREATED,
+            )
+
         profile = WORKFLOW_PROFILES.get(workflow_slug)
         if profile is None:
             raise AnalysisInputError(
@@ -742,12 +1274,6 @@ def analysis_runs(request):
                 details={"diagnostic_count": len(errors)},
             )
 
-        datasets = discover_fastq_datasets()
-        dataset = _find_by_id(
-            datasets,
-            str(request.data.get("dataset") or ""),
-            "原始数据",
-        )
         control = None
         if profile["mode"] == "paired":
             control = _find_by_id(
@@ -784,15 +1310,6 @@ def analysis_runs(request):
                 details={"missing": missing},
             )
 
-        sample_id = _validate_safe_value(
-            str(request.data.get("sample_id") or dataset["name"]),
-            "样本编号",
-            sample_id=True,
-        )
-        sample_name = _validate_safe_value(
-            str(request.data.get("sample_name") or sample_id),
-            "样本名称",
-        )
         sample_type = str(request.data.get("sample_type") or "tissue")
         if sample_type not in {"tissue", "blood", "plasma"}:
             raise AnalysisInputError("ANALYSIS_VALUE_INVALID", "样本类型不受支持。")
@@ -818,6 +1335,12 @@ def analysis_runs(request):
     except AnalysisInputError as error:
         return _error(error.code, str(error), status.HTTP_400_BAD_REQUEST, details=error.details)
 
+    input_manifest = {
+        "primary": _dataset_manifest(dataset),
+        "control": _dataset_manifest(control) if control else None,
+    }
+    reference_manifest = _catalog_resource_manifest(reference)
+    panel_manifest = _catalog_resource_manifest(panel)
     run = AnalysisRun.objects.create(
         asset=asset,
         revision=revision,
@@ -825,6 +1348,7 @@ def analysis_runs(request):
         sample_id=sample_id,
         sample_name=sample_name,
         actor=_actor(request),
+        submitted_by=_actor_user(request),
         request_payload={
             "workflow": workflow_slug,
             "dataset": dataset["id"],
@@ -837,6 +1361,13 @@ def analysis_runs(request):
             "panel_name": panel.get("name", panel["id"]),
             "sample_type": sample_type,
             "sample_gender": sample_gender,
+            "database_catalog_digest": _canonical_digest(catalog),
+            "reference_digest": _canonical_digest(reference_manifest),
+            "panel_digest": _canonical_digest(panel_manifest),
+            "input_digest": _canonical_digest(input_manifest),
+            "input_resource_manifest": input_manifest,
+            "reference_resource_manifest": reference_manifest,
+            "panel_resource_manifest": panel_manifest,
         },
         input_values=input_values,
     )
@@ -847,7 +1378,7 @@ def analysis_runs(request):
 @api_view(["GET"])
 def analysis_run_detail(request, run_id):
     run = get_object_or_404(
-        AnalysisRun.objects.select_related("asset", "revision").prefetch_related("events"),
+        _visible_runs(request).prefetch_related("events"),
         pk=run_id,
     )
     return Response(analysis_run_payload(run, include_events=True))
@@ -855,7 +1386,7 @@ def analysis_run_detail(request, run_id):
 
 @api_view(["GET"])
 def analysis_run_output(request, run_id):
-    run = get_object_or_404(AnalysisRun, pk=run_id)
+    run = get_object_or_404(_visible_runs(request), pk=run_id)
     key = str(request.query_params.get("key") or "")
     output = next(
         (
@@ -873,8 +1404,8 @@ def analysis_run_output(request, run_id):
         )
     values = dict(_flatten_outputs(run.outputs.get("outputs", run.outputs)))
     try:
-        root = Path(run.work_directory).resolve()
-        path = Path(values[key]).resolve()
+        root = _accessible_run_path(Path(run.work_directory))
+        path = _accessible_run_path(Path(values[key]))
         path.relative_to(root)
         if not path.is_file():
             raise ValueError

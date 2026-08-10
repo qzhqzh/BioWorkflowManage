@@ -26,6 +26,8 @@ const inspectorTab = ref<InspectorTab>('tasks')
 const feedback = ref('')
 const publishState = ref<'idle' | 'saving' | 'error'>('idle')
 const publishError = ref('')
+const extractState = ref<'idle' | 'saving' | 'error'>('idle')
+const extractResult = ref<{ taskCount: number; createdCount: number; reusedCount: number }>()
 const publishFile = ref<File>()
 const publishInput = ref<HTMLInputElement>()
 const codeEditor = ref<EditorHandle>()
@@ -145,6 +147,35 @@ async function exportPackage() {
   feedback.value = `已导出 ${anchor.download}`
 }
 
+async function extractTasks() {
+  if (!selectedVersion.value || extractState.value === 'saving') return
+  extractState.value = 'saving'
+  extractResult.value = undefined
+  feedback.value = ''
+  try {
+    const result = await $fetch<{
+      task_count: number
+      created_count: number
+      reused_count: number
+    }>(`/api/v1/wdl-packages/${encodeURIComponent(slug.value)}/tasks/extract`, {
+      method: 'POST',
+      body: {
+        version: selectedVersion.value.version,
+        note: `从工具包 ${slug.value}@${selectedVersion.value.version} 批量拆解 Task`,
+      },
+    })
+    extractResult.value = {
+      taskCount: result.task_count,
+      createdCount: result.created_count,
+      reusedCount: result.reused_count,
+    }
+    extractState.value = 'idle'
+  } catch (error: any) {
+    extractState.value = 'error'
+    feedback.value = error?.data?.error?.message ?? 'Task 拆解失败。'
+  }
+}
+
 async function toggleArchive() {
   if (!packageAsset.value) return
   const lifecycle = packageAsset.value.lifecycle === 'active' ? 'archived' : 'active'
@@ -172,6 +203,14 @@ onMounted(() => void loadPackage())
         </span>
       </template>
       <template #actions>
+        <button
+          class="button button--ghost"
+          type="button"
+          :disabled="extractState === 'saving'"
+          @click="extractTasks"
+        >
+          {{ extractState === 'saving' ? '正在拆解…' : '拆解为工具' }}
+        </button>
         <button
           class="button button--primary"
           type="button"
@@ -239,7 +278,11 @@ onMounted(() => void loadPackage())
           </div>
         </header>
         <div class="wdl-editor-status" role="status" aria-live="polite">
-          <div v-if="feedback" class="workbench-feedback">{{ feedback }}</div>
+          <div v-if="extractResult" class="workbench-feedback">
+            {{ extractResult.taskCount }} 个 Task 已拆解，新增 {{ extractResult.createdCount }} 个，复用 {{ extractResult.reusedCount }} 个。
+            <NuxtLink to="/?section=tools">打开工具库</NuxtLink>
+          </div>
+          <div v-else-if="feedback" class="workbench-feedback">{{ feedback }}</div>
           <div v-else class="editor-ready-notice">不可变版本 · 只读</div>
         </div>
         <ClientOnly>
@@ -316,7 +359,7 @@ onMounted(() => void loadPackage())
 
         <div v-else-if="inspectorTab === 'history'" class="wdl-history-list">
           <article v-for="event in packageAsset.audit_events" :key="event.id" class="wdl-package-history-item">
-            <strong>{{ event.action === 'publish_version' ? '发布版本' : event.action === 'create_package' ? '创建工具包' : '更新信息' }}</strong>
+            <strong>{{ event.action === 'publish_version' ? '发布版本' : event.action === 'create_package' ? '创建工具包' : event.action === 'extract_tools' ? '拆解工具' : '更新信息' }}</strong>
             <small>{{ event.actor }} · {{ new Date(event.created_at).toLocaleString('zh-CN') }}</small>
             <p v-if="event.note">{{ event.note }}</p>
           </article>

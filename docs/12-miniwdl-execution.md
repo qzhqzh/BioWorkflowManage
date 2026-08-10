@@ -139,6 +139,17 @@ data/miniwdl/work/cases/
 
 ## 隔离与持久化
 
+升级到包含 `0012_workflow_bundle_run_owner` 的版本前，先停止 analysis worker，
+再启动 backend 完成迁移。迁移会把无法确认租约的旧 `preparing/running` 任务标记为失败，
+避免升级后重复计算。旧 `WorkflowVersion` 没有发布时固化的编译产物，运行页会明确阻断；
+请在工作台重新发布一个新版本后再投递，历史版本与既有运行记录保持不变。
+
+```bash
+docker compose stop analysis-worker
+docker compose --profile wdl-host-runtime stop analysis-worker-host
+docker compose up -d backend
+```
+
 Compose profile 关系如下：
 
 ```text

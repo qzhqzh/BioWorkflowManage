@@ -78,8 +78,8 @@ async function submitRun(payload: {
   workflow: string
   dataset: string
   control_dataset?: string
-  reference: string
-  panel: string
+  reference?: string
+  panel?: string
   sample_id: string
   sample_name: string
   sample_type: string

@@ -72,6 +72,10 @@ urlpatterns = [
         "wdl-packages/<slug:slug>/export",
         wdl_tool_packages.export_wdl_tool_package,
     ),
+    path(
+        "wdl-packages/<slug:slug>/tasks/extract",
+        wdl_tool_packages.extract_wdl_tool_package_tasks,
+    ),
     path("wdl-packages/<slug:slug>", wdl_tool_packages.wdl_tool_package_detail),
     path("wdl-assets", wdl_assets.wdl_assets),
     path("wdl-assets/tags", wdl_assets.wdl_tags),

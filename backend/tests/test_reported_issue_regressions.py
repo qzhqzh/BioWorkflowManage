@@ -127,9 +127,14 @@ def test_container_and_entrypoint_regressions():
         encoding="utf-8"
     )
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    nginx = (ROOT / "docker" / "nginx.conf").read_text(encoding="utf-8")
 
-    assert frontend.startswith("FROM oven/bun:1.3.14 AS build")
+    assert "ARG BUN_BASE_IMAGE=" in frontend
+    assert "FROM ${BUN_BASE_IMAGE} AS build" in frontend
     assert "apt-get install -y --no-install-recommends musl" not in backend
     assert 'if [ "${DJANGO_SEED_DEMO:-0}" = "1" ]; then' in entrypoint
     assert 'DJANGO_ALLOWED_HOSTS: "*"' not in compose
     assert 'DJANGO_SEED_DEMO: "${DJANGO_SEED_DEMO:-0}"' in compose
+    assert "resolver 127.0.0.11" in nginx
+    assert "proxy_pass http://$backend_upstream" in nginx
+    assert "proxy_pass http://$frontend_upstream" in nginx

@@ -175,6 +175,19 @@ def lower_to_ir(
         )
         workflow_outputs.append({"name": node["id"], "type": _type(node["port"]), "expression": expression})
 
+    uses_directory = any(
+        port.get("wdl_type") == "Directory"
+        for tool in used_tools.values()
+        for port in [*tool.get("inputs", []), *tool.get("outputs", [])]
+    ) or any(
+        node.get("port", {}).get("wdl_type") == "Directory"
+        for node in nodes.values()
+        if node.get("type") in {"workflow_input", "workflow_output"}
+    )
+    target = dict(graph["target"])
+    if uses_directory:
+        target["version"] = "development"
+
     return {
         "ir_version": "1.0.0",
         "source": {
@@ -183,7 +196,7 @@ def lower_to_ir(
             "workflow_semantic_digest": semantic_digest(graph),
             "tool_digests": sorted(used_tools),
         },
-        "target": graph["target"],
+        "target": target,
         "imports": [
             {
                 "path": item["artifact_path"],
@@ -219,7 +232,7 @@ def _wdl_literal(value: Any) -> str:
 
 
 def render_wdl(ir: dict[str, Any]) -> str:
-    lines = ["version 1.0", ""]
+    lines = [f"version {ir['target']['version']}", ""]
     for item in ir.get("imports", []):
         lines.append(f'import "{item["path"]}" as {item["namespace"]}')
     if ir.get("imports"):

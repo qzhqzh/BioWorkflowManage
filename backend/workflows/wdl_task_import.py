@@ -10,12 +10,19 @@ import WDL
 
 from compiler_core import validate_tool_spec
 
-from .models import ToolDocument, WDLAsset, WDLSourceFile, WDLSourceRevision
+from .models import (
+    ToolDocument,
+    WDLAsset,
+    WDLSourceFile,
+    WDLSourceRevision,
+    WDLToolPackageVersion,
+)
 from .wdl_packages import digest
 
 
 SUPPORTED_TYPES = {
     "File",
+    "Directory",
     "String",
     "Int",
     "Float",
@@ -59,6 +66,17 @@ def recommended_tool_id(asset: WDLAsset, file_path: str, task_name: str) -> str:
     return _identifier(f"{_repository_name(asset)}_{source}_{task_name}".lower())
 
 
+def recommended_package_tool_id(
+    package_version: WDLToolPackageVersion,
+    file_path: str,
+    task_name: str,
+) -> str:
+    source = file_path.removesuffix(".wdl").replace("/", "_")
+    return _identifier(
+        f"{package_version.package.slug}_{source}_{task_name}".lower()
+    )
+
+
 def _literal_value(expression) -> Any:
     if expression is None:
         raise ValueError
@@ -77,6 +95,7 @@ def _semantic_type(wdl_type: str) -> str:
     normalized = wdl_type.removesuffix("?")
     return {
         "File": "core.file.any",
+        "Directory": "core.directory",
         "String": "core.string",
         "Int": "core.integer",
         "Float": "core.float",
@@ -184,6 +203,55 @@ def _runtime(task) -> dict:
     return result
 
 
+def _tool_spec_from_task(
+    *,
+    task,
+    tool_id: str,
+    description: str,
+    source_repository: str,
+    actor: str,
+    source_wdl: dict,
+    tags: list[str],
+) -> tuple[dict, list[str]]:
+    warnings: list[str] = []
+    image = _container_image(task, warnings)
+    unsupported_runtime = sorted(
+        set((task.runtime or {}).keys()) - {"docker", "cpu", "memory", "disk"}
+    )
+    if unsupported_runtime:
+        warnings.append(
+            "以下 runtime 配置已保留在来源信息中，发布前需要人工确认："
+            + ", ".join(unsupported_runtime)
+            + "。"
+        )
+    tool_spec = {
+        "schema_version": "1.0.0",
+        "id": tool_id,
+        "name": task.name,
+        "display_name": task.name,
+        "tool_version": _tool_version(image),
+        "description": description,
+        "category": "historical_wdl",
+        "container": {"engine": "docker", "image": image},
+        "inputs": [_input_port(item, warnings) for item in (task.inputs or [])],
+        "outputs": [_output_port(item, warnings) for item in (task.outputs or [])],
+        "command": {
+            "shell": "bash",
+            "strict_mode": False,
+            "template": _command_template(task),
+        },
+        "runtime": _runtime(task),
+        "metadata": {
+            "source_repository": source_repository,
+            "created_by": actor,
+            "tags": tags,
+            "source_wdl": source_wdl,
+            "migration_warnings": warnings,
+        },
+    }
+    return tool_spec, warnings
+
+
 def build_tool_draft(
     *,
     asset: WDLAsset,
@@ -207,51 +275,103 @@ def build_tool_draft(
             f"Task {task_name} was not found in {source_file.path}.",
         )
 
-    warnings: list[str] = []
-    image = _container_image(task, warnings)
-    unsupported_runtime = sorted(set((task.runtime or {}).keys()) - {"docker", "cpu", "memory", "disk"})
-    if unsupported_runtime:
-        warnings.append(
-            "以下 runtime 配置已保留在来源信息中，发布前需要人工确认："
-            + ", ".join(unsupported_runtime)
-            + "。"
-        )
     resolved_tool_id = _identifier(tool_id) if tool_id else recommended_tool_id(
         asset, source_file.path, task.name
     )
-    tool_spec = {
-        "schema_version": "1.0.0",
-        "id": resolved_tool_id,
-        "name": task.name,
-        "display_name": task.name,
-        "tool_version": _tool_version(image),
-        "description": f"从 {asset.name} 的 {source_file.path} / task {task.name} 导入。",
-        "category": "historical_wdl",
-        "container": {"engine": "docker", "image": image},
-        "inputs": [_input_port(item, warnings) for item in (task.inputs or [])],
-        "outputs": [_output_port(item, warnings) for item in (task.outputs or [])],
-        "command": {
-            "shell": "bash",
-            "strict_mode": False,
-            "template": _command_template(task),
+    return _tool_spec_from_task(
+        task=task,
+        tool_id=resolved_tool_id,
+        description=f"从 {asset.name} 的 {source_file.path} / task {task.name} 导入。",
+        source_repository=asset.source_repository,
+        actor=actor,
+        tags=["historical-wdl"],
+        source_wdl={
+            "asset_slug": asset.slug,
+            "revision": revision.version,
+            "file_path": source_file.path,
+            "task_name": task.name,
+            "source_digest": digest(source_file.content),
+            "repository_revision": asset.source_revision,
         },
-        "runtime": _runtime(task),
-        "metadata": {
-            "source_repository": asset.source_repository,
-            "created_by": actor,
-            "tags": ["historical-wdl"],
-            "source_wdl": {
-                "asset_slug": asset.slug,
-                "revision": revision.version,
-                "file_path": source_file.path,
-                "task_name": task.name,
-                "source_digest": digest(source_file.content),
-                "repository_revision": asset.source_revision,
-            },
-            "migration_warnings": warnings,
+    )
+
+
+def build_package_task_draft(
+    *,
+    package_version: WDLToolPackageVersion,
+    source_file,
+    task_name: str,
+    actor: str,
+) -> tuple[dict, list[str]]:
+    try:
+        document = WDL.parse_document(source_file.content, uri=source_file.path)
+    except Exception as error:
+        raise WDLTaskImportError(
+            "WDL_TASK_SOURCE_INVALID",
+            str(error).strip() or "The WDL task source cannot be parsed.",
+        ) from error
+    task = next((item for item in document.tasks if item.name == task_name), None)
+    if task is None:
+        raise WDLTaskImportError(
+            "WDL_TASK_NOT_FOUND",
+            f"Task {task_name} was not found in {source_file.path}.",
+        )
+    return _tool_spec_from_task(
+        task=task,
+        tool_id=recommended_package_tool_id(
+            package_version, source_file.path, task.name
+        ),
+        description=(
+            f"从工具包 {package_version.package.name}@{package_version.version} 的 "
+            f"{source_file.path} / task {task.name} 拆解。"
+        ),
+        source_repository=package_version.source_repository,
+        actor=actor,
+        tags=["wdl-package", package_version.package.slug],
+        source_wdl={
+            "package_slug": package_version.package.slug,
+            "package_version": package_version.version,
+            "file_path": source_file.path,
+            "task_name": task.name,
+            "source_digest": digest(source_file.content),
+            "repository_revision": package_version.source_revision,
         },
-    }
-    return tool_spec, warnings
+    )
+
+
+def import_package_task_as_tool_draft(
+    *,
+    package_version: WDLToolPackageVersion,
+    source_file,
+    task_name: str,
+    actor: str,
+    replace: bool = False,
+) -> tuple[ToolDocument, bool, list[str]]:
+    tool_spec, warnings = build_package_task_draft(
+        package_version=package_version,
+        source_file=source_file,
+        task_name=task_name,
+        actor=actor,
+    )
+    existing = ToolDocument.objects.filter(tool_id=tool_spec["id"]).first()
+    if existing is not None and not replace:
+        source = existing.draft_spec.get("metadata", {}).get("source_wdl", {})
+        incoming = tool_spec["metadata"]["source_wdl"]
+        if all(
+            source.get(key) == incoming.get(key)
+            for key in ("package_slug", "package_version", "file_path", "task_name", "source_digest")
+        ):
+            return existing, False, source.get("migration_warnings", [])
+        raise WDLTaskImportError(
+            "TOOL_DRAFT_EXISTS",
+            f"Tool draft {tool_spec['id']} already exists; review it before replacing the source.",
+        )
+    validation = validate_tool_spec(tool_spec)
+    document, created = ToolDocument.objects.update_or_create(
+        tool_id=tool_spec["id"],
+        defaults={"draft_spec": tool_spec, "validation": validation},
+    )
+    return document, created, warnings
 
 
 def import_task_as_tool_draft(

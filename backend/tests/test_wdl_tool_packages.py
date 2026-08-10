@@ -5,7 +5,7 @@ import pytest
 from django.core.files.uploadedfile import SimpleUploadedFile
 from rest_framework.test import APIClient
 
-from workflows.models import WDLToolPackage, WDLToolPackageAuditEvent
+from workflows.models import ToolDocument, WDLToolPackage, WDLToolPackageAuditEvent
 
 
 QC_WDL = """version 1.0
@@ -106,6 +106,65 @@ def test_wdl_tool_package_import_version_export_and_archive():
     assert rejected.status_code == 409
     assert rejected.json()["error"]["code"] == "WDL_TOOL_PACKAGE_ARCHIVED"
     assert WDLToolPackageAuditEvent.objects.filter(package__slug=slug).count() == 3
+
+
+@pytest.mark.django_db
+def test_wdl_tool_package_tasks_extract_to_idempotent_tool_drafts():
+    client = APIClient()
+    response = client.post(
+        "/api/v1/wdl-packages",
+        {
+            "archive": package_archive(
+                {"task/qc.wdl": QC_WDL, "task/align.wdl": ALIGN_WDL}
+            ),
+            "name": "Solid tumor tools",
+            "slug": "solid-tumor-tools",
+            "version": "1.0.0",
+            "tags": "[]",
+            "source_repository": "example/minwdl",
+            "source_revision": "abc123",
+        },
+        format="multipart",
+    )
+    assert response.status_code == 201
+
+    extracted = client.post(
+        "/api/v1/wdl-packages/solid-tumor-tools/tasks/extract",
+        {"version": "1.0.0"},
+        format="json",
+    )
+    assert extracted.status_code == 201
+    assert extracted.json()["task_count"] == 2
+    assert extracted.json()["created_count"] == 2
+    assert extracted.json()["reused_count"] == 0
+    assert ToolDocument.objects.count() == 2
+    qc = ToolDocument.objects.get(
+        tool_id="solid_tumor_tools_task_qc_qc"
+    )
+    source = qc.draft_spec["metadata"]["source_wdl"]
+    assert source["package_slug"] == "solid-tumor-tools"
+    assert source["package_version"] == "1.0.0"
+    assert source["file_path"] == "task/qc.wdl"
+    assert source["task_name"] == "QC"
+    assert source["source_digest"].startswith("sha256:")
+    assert source["repository_revision"] == "abc123"
+    assert qc.validation["status"] == "valid"
+    registry = client.get("/api/v1/tools").json()["results"]
+    qc_registry = next(
+        item for item in registry if item["tool_id"] == qc.tool_id
+    )
+    assert qc_registry["source_wdl"]["package_version"] == "1.0.0"
+    assert qc_registry["migration_warning_count"] == 1
+
+    repeated = client.post(
+        "/api/v1/wdl-packages/solid-tumor-tools/tasks/extract",
+        {"version": "1.0.0"},
+        format="json",
+    )
+    assert repeated.status_code == 200
+    assert repeated.json()["created_count"] == 0
+    assert repeated.json()["reused_count"] == 2
+    assert ToolDocument.objects.count() == 2
 
 
 @pytest.mark.django_db

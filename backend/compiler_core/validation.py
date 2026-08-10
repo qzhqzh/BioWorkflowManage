@@ -124,6 +124,99 @@ def schema_diagnostics(document: Any, schema_name: str) -> list[dict[str, Any]]:
 
 def validate_tool_spec(tool: dict[str, Any]) -> dict[str, Any]:
     diagnostics = schema_diagnostics(tool, "tool-spec.schema.json")
+    task_kind = tool.get("task_kind", "standard")
+    annotation = tool.get("annotation")
+    if task_kind == "annotation" and isinstance(annotation, dict):
+        selector_name = annotation.get("selector_input")
+        selector = next(
+            (
+                item
+                for item in tool.get("inputs", [])
+                if item.get("name") == selector_name
+            ),
+            None,
+        )
+        option_ids = [
+            item.get("id")
+            for item in annotation.get("options", [])
+            if isinstance(item, dict) and item.get("id")
+        ]
+        option_set = set(option_ids)
+        if selector is None:
+            diagnostics.append(
+                diagnostic(
+                    "TA001",
+                    "tool_spec",
+                    "Annotation selector_input must reference an input port.",
+                    path="/annotation/selector_input",
+                )
+            )
+        elif selector.get("wdl_type") != "Array[String]":
+            diagnostics.append(
+                diagnostic(
+                    "TA002",
+                    "tool_spec",
+                    "Annotation selector input must use WDL type Array[String].",
+                    path=f"/inputs/{tool.get('inputs', []).index(selector)}/wdl_type",
+                )
+            )
+        elif selector.get("default") != option_ids:
+            diagnostics.append(
+                diagnostic(
+                    "TA003",
+                    "tool_spec",
+                    "Annotation selector default must include every option in canonical order.",
+                    path=f"/inputs/{tool.get('inputs', []).index(selector)}/default",
+                )
+            )
+        if len(option_ids) != len(option_set):
+            diagnostics.append(
+                diagnostic(
+                    "TA004",
+                    "tool_spec",
+                    "Annotation option IDs must be unique.",
+                    path="/annotation/options",
+                )
+            )
+        for index, option in enumerate(annotation.get("options", [])):
+            for dependency in option.get("requires", []):
+                if dependency not in option_set or dependency == option.get("id"):
+                    diagnostics.append(
+                        diagnostic(
+                            "TA005",
+                            "tool_spec",
+                            "Annotation option dependencies must reference another option.",
+                            path=f"/annotation/options/{index}/requires",
+                        )
+                    )
+        for index, preset in enumerate(annotation.get("presets", [])):
+            if not set(preset.get("items", [])).issubset(option_set):
+                diagnostics.append(
+                    diagnostic(
+                        "TA006",
+                        "tool_spec",
+                        "Annotation preset contains an unknown option.",
+                        path=f"/annotation/presets/{index}/items",
+                    )
+                )
+    elif task_kind == "annotation":
+        diagnostics.append(
+            diagnostic(
+                "TA007",
+                "tool_spec",
+                "Annotation tasks must declare annotation options.",
+                path="/annotation",
+            )
+        )
+    elif annotation is not None:
+        diagnostics.append(
+            diagnostic(
+                "TA008",
+                "tool_spec",
+                "Only annotation tasks may declare annotation options.",
+                path="/annotation",
+            )
+        )
     image = tool.get("container", {}).get("image", "")
     if image and "@sha256:" not in image:
         diagnostics.append(
@@ -304,6 +397,72 @@ def validate_workflow_graph(
                         location={"node_id": node_id, "port": port["name"]},
                     )
                 )
+        annotation = tool.get("annotation") if tool.get("task_kind") == "annotation" else None
+        if isinstance(annotation, dict):
+            selector_name = annotation.get("selector_input")
+            if (node_id, selector_name) not in inbound:
+                selector_port = next(
+                    (
+                        port
+                        for port in tool.get("inputs", [])
+                        if port.get("name") == selector_name
+                    ),
+                    {},
+                )
+                selected = parameters.get(selector_name, selector_port.get("default"))
+                option_ids = [item.get("id") for item in annotation.get("options", [])]
+                if not isinstance(selected, list) or not selected:
+                    diagnostics.append(
+                        diagnostic(
+                            "WG025",
+                            "graph",
+                            "Annotation tasks require at least one selected annotation item.",
+                            location={"node_id": node_id, "port": selector_name},
+                        )
+                    )
+                elif (
+                    len(selected) != len(set(selected))
+                    or any(item not in option_ids for item in selected)
+                ):
+                    diagnostics.append(
+                        diagnostic(
+                            "WG026",
+                            "graph",
+                            "Annotation selection contains duplicate or unknown items.",
+                            location={"node_id": node_id, "port": selector_name},
+                        )
+                    )
+                else:
+                    canonical = [item for item in option_ids if item in selected]
+                    if selected != canonical:
+                        diagnostics.append(
+                            diagnostic(
+                                "WG027",
+                                "graph",
+                                "Annotation items must follow the tool's canonical order.",
+                                location={"node_id": node_id, "port": selector_name},
+                            )
+                        )
+                    selected_set = set(selected)
+                    missing_dependencies = sorted(
+                        {
+                            dependency
+                            for option in annotation.get("options", [])
+                            if option.get("id") in selected_set
+                            for dependency in option.get("requires", [])
+                            if dependency not in selected_set
+                        }
+                    )
+                    if missing_dependencies:
+                        diagnostics.append(
+                            diagnostic(
+                                "WG028",
+                                "graph",
+                                "Annotation selection is missing required items: "
+                                + ", ".join(missing_dependencies),
+                                location={"node_id": node_id, "port": selector_name},
+                            )
+                        )
 
     order, has_cycle = _topological_calls(graph)
     if has_cycle:

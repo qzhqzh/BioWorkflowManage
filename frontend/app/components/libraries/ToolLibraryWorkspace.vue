@@ -23,7 +23,7 @@ interface ToolOperationError {
   message: string
 }
 
-defineProps<{
+const props = defineProps<{
   tools: RegistryTool[]
   registryLoaded: boolean
   selectedToolId: string
@@ -38,6 +38,39 @@ const creatingTool = defineModel<boolean>('creatingTool', { required: true })
 const newToolId = defineModel<string>('newToolId', { required: true })
 const searchQuery = defineModel<string>('searchQuery', { required: true })
 const toolDraft = defineModel<Record<string, any> | undefined>('toolDraft')
+
+const viewMode = ref<'list' | 'cards'>('list')
+const currentPage = ref(1)
+const pageSize = 12
+const pageCount = computed(() => Math.max(1, Math.ceil(props.tools.length / pageSize)))
+const pagedTools = computed(() => {
+  const start = (currentPage.value - 1) * pageSize
+  return props.tools.slice(start, start + pageSize)
+})
+const paginationItems = computed<(number | 'ellipsis')[]>(() => {
+  if (pageCount.value <= 7) return Array.from({ length: pageCount.value }, (_, index) => index + 1)
+  const pages: (number | 'ellipsis')[] = [1]
+  const start = Math.max(2, currentPage.value - 1)
+  const end = Math.min(pageCount.value - 1, currentPage.value + 1)
+  if (start > 2) pages.push('ellipsis')
+  for (let page = start; page <= end; page += 1) pages.push(page)
+  if (end < pageCount.value - 1) pages.push('ellipsis')
+  pages.push(pageCount.value)
+  return pages
+})
+
+watch(searchQuery, () => {
+  currentPage.value = 1
+})
+
+watch(() => props.tools.length, () => {
+  currentPage.value = Math.min(currentPage.value, pageCount.value)
+})
+
+function setViewMode(mode: 'list' | 'cards') {
+  viewMode.value = mode
+  currentPage.value = 1
+}
 
 const emit = defineEmits<{
   create: []
@@ -89,11 +122,37 @@ const emit = defineEmits<{
       <span aria-hidden="true">⌕</span>
       <input v-model="searchQuery" type="search" placeholder="搜索工具名称或版本" />
     </label>
-    <span>{{ tools.length }} 个工具</span>
+    <div class="workspace-toolbar__summary">
+      <span>{{ tools.length }} 个工具</span>
+      <div class="view-switch" role="group" aria-label="工具展示方式">
+        <button
+          type="button"
+          :class="{ 'is-active': viewMode === 'list' }"
+          :aria-pressed="viewMode === 'list'"
+          @click="setViewMode('list')"
+        >
+          <span class="view-switch__list-icon" aria-hidden="true" />
+          列表
+        </button>
+        <button
+          type="button"
+          :class="{ 'is-active': viewMode === 'cards' }"
+          :aria-pressed="viewMode === 'cards'"
+          @click="setViewMode('cards')"
+        >
+          <span class="view-switch__card-icon" aria-hidden="true" />
+          卡片
+        </button>
+      </div>
+    </div>
   </div>
 
-  <div class="registry-list" role="list">
-    <article v-for="tool in tools" :key="tool.id" class="registry-row" role="listitem">
+  <div
+    class="registry-list"
+    :class="{ 'registry-list--cards': viewMode === 'cards' }"
+    role="list"
+  >
+    <article v-for="tool in pagedTools" :key="tool.id" class="registry-row" role="listitem">
       <span class="library-item__mark">{{ tool.name.slice(0, 2).toLowerCase() }}</span>
       <div>
         <strong>{{ tool.name }}</strong>
@@ -119,6 +178,38 @@ const emit = defineEmits<{
       </button>
     </div>
   </div>
+
+  <nav v-if="tools.length > pageSize" class="registry-pagination" aria-label="工具库分页">
+    <button
+      type="button"
+      :disabled="currentPage === 1"
+      aria-label="上一页"
+      @click="currentPage -= 1"
+    >
+      上一页
+    </button>
+    <template v-for="(item, index) in paginationItems" :key="`${item}-${index}`">
+      <span v-if="item === 'ellipsis'" aria-hidden="true">…</span>
+      <button
+        v-else
+        type="button"
+        :class="{ 'is-active': currentPage === item }"
+        :aria-current="currentPage === item ? 'page' : undefined"
+        :aria-label="`第 ${item} 页`"
+        @click="currentPage = item"
+      >
+        {{ item }}
+      </button>
+    </template>
+    <button
+      type="button"
+      :disabled="currentPage === pageCount"
+      aria-label="下一页"
+      @click="currentPage += 1"
+    >
+      下一页
+    </button>
+  </nav>
 
   <section v-if="selectedToolId" class="tool-version-panel">
     <header>
