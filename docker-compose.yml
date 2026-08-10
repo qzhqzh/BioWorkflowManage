@@ -1,6 +1,6 @@
 services:
   db:
-    image: postgres:17-alpine
+    image: m.daocloud.io/docker.io/library/postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-bioworkflow}
@@ -66,7 +66,7 @@ services:
       retries: 10
 
   gateway:
-    image: nginx:1.27-alpine
+    image: m.daocloud.io/docker.io/library/nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
     restart: unless-stopped
     ports:
       - "${APP_PORT:-8082}:80"
@@ -103,7 +103,7 @@ services:
 
   miniwdl-docker:
     profiles: ["wdl-runtime"]
-    image: docker:27.5.1-dind@sha256:aa3df78ecf320f5fafdce71c659f1629e96e9de0968305fe1de670e0ca9176ce
+    image: m.daocloud.io/docker.io/library/docker:27.5.1-dind@sha256:aa3df78ecf320f5fafdce71c659f1629e96e9de0968305fe1de670e0ca9176ce
     hostname: miniwdl-docker
     privileged: true
     environment:
