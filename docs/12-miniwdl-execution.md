@@ -56,6 +56,19 @@ docker compose --profile wdl-runtime up -d backend frontend gateway miniwdl-dock
 ./scripts/miniwdl.sh stop
 ```
 
+## 国内构建源
+
+构建源已内置，无需配置环境变量。Docker Hub 基础镜像与 uv 通过 DaoCloud 镜像代理拉取并固定 digest；
+Sprocket 上游只提供 GHCR 镜像，使用官方地址并固定 digest；
+后端使用固定版本的 `uv` 和 `uv.lock`，miniWDL requirements 同时固定版本与 hash；前端
+Bun 使用 npmmirror。
+
+`uv.lock` 中的清华 PyPI 地址是依赖锁的一部分。需要改为企业内网源时，应在受控环境
+重新生成并提交 `uv.lock`，不能只修改运行环境变量，否则无法保证同一提交生成相同镜像。
+
+这些默认值不会修复宿主 `dockerd` 中失效的全局 HTTP 代理。若日志仍出现
+`proxyconnect ... 127.0.0.1:7890`，需先移除该代理或启动对应代理服务。
+
 `miniwdl run_self_test` 会下载官方测试数据和镜像，因此只作为联网诊断命令：
 
 ```bash
