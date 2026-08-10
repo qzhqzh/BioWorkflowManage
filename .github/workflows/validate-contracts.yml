@@ -7,6 +7,11 @@ on:
 permissions:
   contents: read
 
+env:
+  POSTGRES_PASSWORD: "ci-only-password"
+  DJANGO_SECRET_KEY: "ci-only-secret-key"
+  MINIWDL_DOCKER_GID: "988"
+
 concurrency:
   group: validate-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -155,6 +160,7 @@ jobs:
         env:
           DJANGO_SEED_USERS: "1"
           DJANGO_SEED_DEMO: "1"
+          DJANGO_SEED_ALLOW_DEFAULT_PASSWORDS: "1"
         run: docker compose up -d --build --wait
 
       - name: Run browser smoke tests

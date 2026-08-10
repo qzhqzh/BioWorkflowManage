@@ -22,6 +22,14 @@ wdl_assets._with_request_id = with_request_id
 # runtime authentication permission.
 views.health.view_class.permission_classes = [AllowAny]
 
+for analysis_view in (
+    analysis_runs.analysis_catalog,
+    analysis_runs.analysis_runs,
+    analysis_runs.analysis_run_detail,
+    analysis_runs.analysis_run_output,
+):
+    analysis_view.view_class.analysis_operator_allowed = True
+
 
 urlpatterns = [
     path("health", views.health),

@@ -4133,6 +4133,136 @@ kbd {
   font-size: var(--text-secondary);
 }
 
+.analysis-timing-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 0;
+  border-bottom: 1px solid var(--color-border);
+  padding: var(--space-3) var(--space-4);
+}
+
+.analysis-timing-summary div {
+  min-width: 0;
+}
+
+.analysis-timing-summary dt {
+  color: var(--color-muted);
+  font-size: var(--text-caption);
+}
+
+.analysis-timing-summary dd {
+  margin: var(--space-1) 0 0;
+  color: var(--color-ink);
+  font-family: var(--font-mono);
+  font-size: var(--text-secondary);
+  font-weight: 650;
+}
+
+.analysis-timing-chart {
+  padding: var(--space-3) var(--space-4) var(--space-4);
+}
+
+.analysis-timing-scale {
+  display: flex;
+  justify-content: space-between;
+  margin-left: 11.5rem;
+  padding-left: var(--space-3);
+  color: var(--color-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-caption);
+}
+
+.analysis-timing-chart ol {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: var(--space-2) 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.analysis-timing-chart li {
+  display: grid;
+  grid-template-columns: 10.5rem minmax(8rem, 1fr) 5.5rem;
+  align-items: center;
+  gap: var(--space-3);
+  min-height: 2rem;
+}
+
+.analysis-timing-task {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+}
+
+.analysis-timing-task strong,
+.analysis-timing-task span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.analysis-timing-task strong {
+  color: var(--color-ink-soft);
+  font-size: var(--text-secondary);
+}
+
+.analysis-timing-task span {
+  color: var(--color-muted);
+  font-size: var(--text-caption);
+}
+
+.analysis-timing-track {
+  position: relative;
+  height: 0.65rem;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--color-surface-strong);
+}
+
+.analysis-timing-track i {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-radius: 999px;
+  background: var(--color-primary);
+}
+
+.analysis-timing-track i.is-cached {
+  background: var(--color-muted);
+}
+
+.analysis-timing-track i.is-running {
+  background: var(--color-warning);
+}
+
+.analysis-timing-track i.is-failed {
+  background: var(--color-error);
+}
+
+.analysis-timing-chart li > time {
+  color: var(--color-ink-soft);
+  font-family: var(--font-mono);
+  font-size: var(--text-caption);
+  text-align: right;
+}
+
+.analysis-timing-chart footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+  border-top: 1px solid var(--color-border);
+  padding-top: var(--space-3);
+  color: var(--color-muted);
+  font-size: var(--text-caption);
+}
+
+.analysis-timing-chart footer strong {
+  color: var(--color-ink-soft);
+  font-family: var(--font-mono);
+}
+
 .analysis-event-section {
   margin-bottom: var(--space-6);
 }
@@ -4337,8 +4467,26 @@ kbd {
   }
 
   .analysis-field-row,
-  .analysis-run-meta {
+  .analysis-run-meta,
+  .analysis-timing-summary {
     grid-template-columns: 1fr;
+  }
+
+  .analysis-timing-summary {
+    gap: var(--space-3);
+  }
+
+  .analysis-timing-scale {
+    display: none;
+  }
+
+  .analysis-timing-chart li {
+    grid-template-columns: minmax(0, 1fr) 4.5rem;
+  }
+
+  .analysis-timing-track {
+    grid-column: 1 / -1;
+    grid-row: 2;
   }
 
   .analysis-run-header,

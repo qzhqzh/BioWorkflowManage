@@ -78,6 +78,25 @@ export interface AnalysisRunEvent {
   created_at: string
 }
 
+export interface AnalysisTaskTiming {
+  id: string
+  name: string
+  call: string
+  status: 'running' | 'succeeded' | 'failed'
+  cached: boolean
+  offset_seconds: number
+  duration_seconds: number
+}
+
+export interface AnalysisRunTiming {
+  queue_seconds?: number
+  total_seconds?: number
+  execution_seconds?: number
+  task_seconds?: number
+  cached_tasks?: number
+  tasks: AnalysisTaskTiming[]
+}
+
 export type AnalysisRunStatus = 'queued' | 'preparing' | 'running' | 'succeeded' | 'failed'
 
 export interface AnalysisRun {
@@ -105,6 +124,7 @@ export interface AnalysisRun {
   }
   error: string
   outputs: AnalysisRunOutput[]
+  timing: AnalysisRunTiming
   events?: AnalysisRunEvent[]
   created_at: string
   started_at: string | null

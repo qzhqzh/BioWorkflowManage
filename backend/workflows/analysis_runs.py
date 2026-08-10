@@ -5,6 +5,7 @@ import hashlib
 import json
 import mimetypes
 import re
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -92,6 +93,121 @@ def _format_size(size: int) -> str:
             return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
         value /= 1024
     return f"{size} B"
+
+
+def _seconds(value: float) -> float:
+    return round(max(0.0, value), 3)
+
+
+@lru_cache(maxsize=256)
+def _parse_miniwdl_timing(
+    log_path_value: str,
+    modified_ns: int,
+    file_size: int,
+) -> dict[str, Any]:
+    del modified_ns, file_size
+    workflow_start: float | None = None
+    workflow_end: float | None = None
+    last_timestamp: float | None = None
+    tasks: dict[str, dict[str, Any]] = {}
+
+    with Path(log_path_value).open(encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            timestamp_value = event.get("timestamp") if isinstance(event, dict) else None
+            if not isinstance(timestamp_value, (int, float)):
+                continue
+            timestamp = float(timestamp_value)
+            last_timestamp = timestamp
+            message = str(event.get("message") or "").lower()
+            source = str(event.get("source") or "")
+
+            if message == "workflow start" and workflow_start is None:
+                workflow_start = timestamp
+            elif message == "done" and ".t:" not in source:
+                workflow_end = timestamp
+
+            if ".t:" not in source:
+                continue
+            call_name = source.rsplit(".t:", 1)[-1]
+            task = tasks.get(source)
+            if message == "task setup":
+                if task is None:
+                    tasks[source] = {
+                        "id": source,
+                        "name": str(event.get("name") or call_name.removeprefix("call-")),
+                        "call": call_name,
+                        "started_at": timestamp,
+                        "finished_at": None,
+                        "status": "running",
+                        "cached": False,
+                    }
+                continue
+            if task is None:
+                continue
+            if message.startswith("done"):
+                task["finished_at"] = timestamp
+                task["status"] = "succeeded"
+                task["cached"] = "cached" in message
+            elif message in {"failed", "interrupted"} or message.endswith(" failed"):
+                task["finished_at"] = timestamp
+                task["status"] = "failed"
+            elif message == "docker task exit" and event.get("exit_code") not in (None, 0):
+                task["finished_at"] = timestamp
+                task["status"] = "failed"
+
+    if workflow_start is None:
+        return {"tasks": []}
+    observed_end = workflow_end or last_timestamp or workflow_start
+    payload_tasks = []
+    for task in sorted(tasks.values(), key=lambda item: item["started_at"]):
+        end = task["finished_at"] or observed_end
+        payload_tasks.append(
+            {
+                "id": task["id"],
+                "name": task["name"],
+                "call": task["call"],
+                "status": task["status"],
+                "cached": task["cached"],
+                "offset_seconds": _seconds(task["started_at"] - workflow_start),
+                "duration_seconds": _seconds(end - task["started_at"]),
+            }
+        )
+    return {
+        "execution_seconds": _seconds(observed_end - workflow_start),
+        "task_seconds": _seconds(sum(item["duration_seconds"] for item in payload_tasks)),
+        "cached_tasks": sum(1 for item in payload_tasks if item["cached"]),
+        "tasks": payload_tasks,
+    }
+
+
+def _run_timing_payload(run: AnalysisRun) -> dict[str, Any]:
+    timing: dict[str, Any] = {"tasks": []}
+    if run.started_at:
+        timing["queue_seconds"] = _seconds(
+            (run.started_at - run.created_at).total_seconds()
+        )
+        end = run.finished_at or run.updated_at
+        timing["total_seconds"] = _seconds((end - run.started_at).total_seconds())
+    if not run.work_directory:
+        return timing
+    root = Path(settings.ANALYSIS_RUN_ROOT).resolve()
+    try:
+        run_directory = Path(run.work_directory).resolve()
+        run_directory.relative_to(root)
+    except (OSError, ValueError):
+        return timing
+    log_path = run_directory / "miniwdl.log"
+    try:
+        stat = log_path.stat()
+        parsed = _parse_miniwdl_timing(str(log_path), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return timing
+    timing.update(parsed)
+    return timing
 
 
 def _sample_code(pair_stem: str) -> str:
@@ -316,7 +432,13 @@ def _find_by_id(entries: list[dict[str, Any]], entry_id: str, label: str) -> dic
     return entry
 
 
-def _resource(root: Path, relative_path: str, *, directory: bool = False) -> str:
+def _resource(
+    root: Path,
+    relative_path: str,
+    *,
+    directory: bool = False,
+    execution_root: Path | None = None,
+) -> str:
     path = _safe_path(root, relative_path)
     present = path.is_dir() if directory else path.is_file()
     if not present:
@@ -325,7 +447,20 @@ def _resource(root: Path, relative_path: str, *, directory: bool = False) -> str
             f"数据库资源缺失：{relative_path}",
             details={"missing": [{"path": relative_path}]},
         )
-    return str(path)
+    if execution_root is None:
+        return str(path)
+    return str(_safe_path(execution_root, relative_path))
+
+
+def _execution_path(path: Path, source_root: Path, execution_root: Path) -> str:
+    try:
+        relative_path = path.resolve().relative_to(source_root.resolve()).as_posix()
+    except ValueError as error:
+        raise AnalysisInputError(
+            "ANALYSIS_PATH_INVALID",
+            f"资源路径越过受管目录：{path}",
+        ) from error
+    return str(_safe_path(execution_root, relative_path))
 
 
 def _validate_safe_value(value: str, label: str, *, sample_id: bool = False) -> str:
@@ -349,7 +484,10 @@ def _build_inputs(
 ) -> dict[str, Any]:
     raw1, raw2 = _validate_dataset(dataset)
     control_paths = _validate_dataset(control) if control is not None else None
+    rawdata_root = Path(settings.ANALYSIS_RAWDATA_ROOT)
+    rawdata_execution_root = Path(settings.ANALYSIS_RAWDATA_EXECUTION_ROOT)
     database_root = Path(settings.ANALYSIS_DATABASE_ROOT)
+    database_execution_root = Path(settings.ANALYSIS_DATABASE_EXECUTION_ROOT)
     directories = reference.get("directories")
     if not isinstance(directories, dict):
         raise AnalysisInputError(
@@ -357,14 +495,32 @@ def _build_inputs(
             "参考版本缺少 directories 映射。",
         )
     resolved_directories = {
-        name: _resource(database_root, str(path), directory=True)
+        name: _resource(
+            database_root,
+            str(path),
+            directory=True,
+            execution_root=database_execution_root,
+        )
         for name, path in directories.items()
     }
+    ref_version = str(reference["ref_version"])
+    reference_directory = str(directories["reference"]).rstrip("/")
+    reference_fasta = _resource(
+        database_root,
+        f"{reference_directory}/{ref_version}.simp.fa",
+        execution_root=database_execution_root,
+    )
+    reference_fai = _resource(
+        database_root,
+        f"{reference_directory}/{ref_version}.simp.fa.fai",
+        execution_root=database_execution_root,
+    )
     resolved_panel = {
         name: _resource(
             database_root,
             str(panel.get(name) or ""),
             directory=name == "cnvkit_db",
+            execution_root=database_execution_root,
         )
         for name in (
             "bed",
@@ -385,9 +541,13 @@ def _build_inputs(
         f"{workflow_name}.sample_name": values["sample_name"],
         f"{workflow_name}.sample_type": values["sample_type"],
         f"{workflow_name}.sample_gender": values["sample_gender"],
-        f"{workflow_name}.ref_version": str(reference["ref_version"]),
-        f"{workflow_name}.fastq1": str(raw1),
-        f"{workflow_name}.fastq2": str(raw2),
+        f"{workflow_name}.ref_version": ref_version,
+        f"{workflow_name}.fastq1": _execution_path(
+            raw1, rawdata_root, rawdata_execution_root
+        ),
+        f"{workflow_name}.fastq2": _execution_path(
+            raw2, rawdata_root, rawdata_execution_root
+        ),
         f"{workflow_name}.bed": resolved_panel["bed"],
         f"{workflow_name}.gene_list": resolved_panel["gene_list"],
         f"{workflow_name}.tert_bed": resolved_panel["tert_bed"],
@@ -400,6 +560,8 @@ def _build_inputs(
                 "AutoCNVKit_Panel.cnvdb": resolved_directories["cnvdb"],
                 "AutoCNVKit_Panel.cnvkit_db": resolved_panel["cnvkit_db"],
                 "Collect.database": resolved_directories["database"],
+                "Collect.fasta": reference_fasta,
+                "Collect.fasta_fai": reference_fai,
             }
         )
     else:
@@ -413,8 +575,12 @@ def _build_inputs(
                 f"{workflow_name}.database": resolved_directories["database"],
                 f"{workflow_name}.cnvdb": resolved_directories["cnvdb"],
                 f"{workflow_name}.cnvkit_db": resolved_panel["cnvkit_db"],
-                f"{workflow_name}.fastq3": str(control_paths[0]),
-                f"{workflow_name}.fastq4": str(control_paths[1]),
+                f"{workflow_name}.fastq3": _execution_path(
+                    control_paths[0], rawdata_root, rawdata_execution_root
+                ),
+                f"{workflow_name}.fastq4": _execution_path(
+                    control_paths[1], rawdata_root, rawdata_execution_root
+                ),
             }
         )
     return inputs
@@ -487,6 +653,7 @@ def analysis_run_payload(run: AnalysisRun, *, include_events: bool = False) -> d
         "request": run.request_payload,
         "error": run.error,
         "outputs": _output_payload(run),
+        "timing": _run_timing_payload(run),
         "created_at": run.created_at,
         "started_at": run.started_at,
         "finished_at": run.finished_at,

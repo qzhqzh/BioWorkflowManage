@@ -94,9 +94,97 @@ async function mockAuth(page: Page) {
   await page.route('**/api/v1/auth/me', route => route.fulfill({
     status: 200,
     contentType: 'application/json',
-    body: JSON.stringify({ user: { username: 'zhuqin' } }),
+    body: JSON.stringify({
+      user: {
+        username: 'zhuqin', is_admin: true, role: 'admin',
+        allowed_sections: ['edit', 'tools', 'packages', 'artifacts', 'runs', 'wdl', 'help'],
+      },
+    }),
   }))
 }
+
+async function mockOperatorAuth(page: Page) {
+  await page.route('**/api/v1/auth/me', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      user: {
+        username: 'chaohuaiyu', is_admin: false, role: 'analysis_operator',
+        allowed_sections: ['runs'],
+      },
+    }),
+  }))
+}
+
+test('运行操作员进入其他页面时回到运行分析且只显示该菜单', async ({ page }) => {
+  await mockOperatorAuth(page)
+  await page.route('**/api/v1/analysis/catalog', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(catalog()),
+  }))
+  await page.route('**/api/v1/analysis-runs', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ results: [] }),
+  }))
+
+  await page.goto('/wdl')
+
+  await expect(page).toHaveURL(/\/runs$/)
+  await expect(page.getByRole('button', { name: '运行分析' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'WDL 工作台' })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: '工具库' })).toHaveCount(0)
+})
+
+test('已完成运行展示总耗时和各 task 时间轴', async ({ page }) => {
+  await mockAuth(page)
+  const completedRun = {
+    ...run('succeeded'),
+    current_step: '分析完成',
+    progress: 100,
+    timing: {
+      queue_seconds: 3.2,
+      total_seconds: 117.4,
+      execution_seconds: 114.5,
+      task_seconds: 110.2,
+      cached_tasks: 1,
+      tasks: [
+        {
+          id: 'call-QC', name: 'QC', call: 'call-QC', status: 'succeeded', cached: true,
+          offset_seconds: 0.1, duration_seconds: 0.08,
+        },
+        {
+          id: 'call-Collect', name: 'Collect', call: 'call-Collect', status: 'succeeded', cached: false,
+          offset_seconds: 4.5, duration_seconds: 109.0,
+        },
+      ],
+    },
+  }
+  await page.route('**/api/v1/analysis/catalog', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(catalog()),
+  }))
+  await page.route('**/api/v1/analysis-runs', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ results: [completedRun] }),
+  }))
+  await page.route('**/api/v1/analysis-runs/*', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(completedRun),
+  }))
+
+  await page.goto('/runs')
+
+  await expect(page.getByRole('heading', { name: '耗时' })).toBeVisible()
+  await expect(page.getByText('1 分 57 秒')).toBeVisible()
+  await expect(page.getByText('QC', { exact: true })).toBeVisible()
+  await expect(page.getByText('完成 · 缓存')).toBeVisible()
+  await expect(page.getByLabel('Collect，1 分 49 秒')).toBeVisible()
+})
 
 test('运行页选择原始数据和流程后提交并展示排队状态', async ({ page }) => {
   await mockAuth(page)

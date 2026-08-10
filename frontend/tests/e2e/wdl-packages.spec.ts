@@ -82,7 +82,12 @@ async function mockPackageApi(page: Page) {
   await page.route('**/api/v1/auth/me', route => route.fulfill({
     status: 200,
     contentType: 'application/json',
-    body: JSON.stringify({ user: { username: 'zhuqin' } }),
+    body: JSON.stringify({
+      user: {
+        username: 'zhuqin', is_admin: true, role: 'admin',
+        allowed_sections: ['edit', 'tools', 'packages', 'artifacts', 'runs', 'wdl', 'help'],
+      },
+    }),
   }))
   await page.route('**/api/v1/wdl-packages/tags', route => route.fulfill({
     status: 200,

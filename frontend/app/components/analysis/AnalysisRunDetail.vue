@@ -15,6 +15,19 @@ const statusLabels: Record<string, string> = {
 }
 
 const events = computed(() => [...(props.run?.events ?? [])].reverse().slice(0, 30))
+const timing = computed(() => props.run?.timing)
+const taskTimings = computed(() => timing.value?.tasks ?? [])
+const timingScale = computed(() => Math.max(
+  timing.value?.execution_seconds ?? 0,
+  ...taskTimings.value.map(task => task.offset_seconds + task.duration_seconds),
+  1,
+))
+
+const taskStatusLabels = {
+  running: '运行中',
+  succeeded: '完成',
+  failed: '失败',
+} as const
 
 function formatTime(value: string | null) {
   if (!value) return '—'
@@ -31,6 +44,24 @@ function formatTime(value: string | null) {
 function displayValue(value: unknown) {
   if (typeof value === 'string') return value
   return JSON.stringify(value, null, 2)
+}
+
+function formatDuration(seconds?: number) {
+  if (seconds === undefined) return '—'
+  if (seconds < 1) return '<1 秒'
+  if (seconds < 60) return `${seconds < 10 ? seconds.toFixed(1) : Math.round(seconds)} 秒`
+  const minutes = Math.floor(seconds / 60)
+  const remainingSeconds = Math.round(seconds % 60)
+  if (minutes < 60) return `${minutes} 分 ${remainingSeconds} 秒`
+  const hours = Math.floor(minutes / 60)
+  return `${hours} 小时 ${minutes % 60} 分`
+}
+
+function taskBarStyle(offset: number, duration: number) {
+  const left = Math.min(100, (offset / timingScale.value) * 100)
+  const proportionalWidth = (duration / timingScale.value) * 100
+  const width = Math.min(100 - left, Math.max(0.7, proportionalWidth))
+  return { left: `${left}%`, width: `${width}%` }
 }
 </script>
 
@@ -75,6 +106,51 @@ function displayValue(value: unknown) {
         <strong>运行失败</strong>
         <pre>{{ run.error }}</pre>
       </div>
+
+      <section v-if="timing && (run.started_at || taskTimings.length)" class="analysis-result-section analysis-timing-section">
+        <header>
+          <h3>耗时</h3>
+          <span>{{ taskTimings.length }} 个 task</span>
+        </header>
+        <dl class="analysis-timing-summary">
+          <div><dt>流程总耗时</dt><dd>{{ formatDuration(timing.total_seconds) }}</dd></div>
+          <div><dt>miniwdl 执行</dt><dd>{{ formatDuration(timing.execution_seconds) }}</dd></div>
+          <div><dt>排队等待</dt><dd>{{ formatDuration(timing.queue_seconds) }}</dd></div>
+          <div><dt>缓存命中</dt><dd>{{ timing.cached_tasks ?? 0 }} / {{ taskTimings.length }}</dd></div>
+        </dl>
+        <div v-if="taskTimings.length" class="analysis-timing-chart">
+          <div class="analysis-timing-scale" aria-hidden="true">
+            <span>0</span>
+            <span>{{ formatDuration(timingScale / 2) }}</span>
+            <span>{{ formatDuration(timingScale) }}</span>
+          </div>
+          <ol>
+            <li v-for="task in taskTimings" :key="task.id">
+              <div class="analysis-timing-task">
+                <strong>{{ task.name }}</strong>
+                <span>
+                  {{ taskStatusLabels[task.status] }}<template v-if="task.cached"> · 缓存</template>
+                </span>
+              </div>
+              <div
+                class="analysis-timing-track"
+                :aria-label="`${task.name}，${formatDuration(task.duration_seconds)}`"
+              >
+                <i
+                  :class="[`is-${task.status}`, { 'is-cached': task.cached }]"
+                  :style="taskBarStyle(task.offset_seconds, task.duration_seconds)"
+                />
+              </div>
+              <time>{{ formatDuration(task.duration_seconds) }}</time>
+            </li>
+          </ol>
+          <footer>
+            <span>Task 累计</span>
+            <strong>{{ formatDuration(timing.task_seconds) }}</strong>
+          </footer>
+        </div>
+        <p v-else class="analysis-section-empty">任务启动后显示各步骤耗时。</p>
+      </section>
 
       <section class="analysis-result-section">
         <header>

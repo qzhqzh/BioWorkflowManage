@@ -13,6 +13,7 @@ from workflows.management.commands import seed_demo
 
 @pytest.mark.django_db
 def test_seed_test_data_is_idempotent(monkeypatch, capsys):
+    monkeypatch.setenv("DJANGO_SEED_ALLOW_DEFAULT_PASSWORDS", "1")
     def fake_compile_workflow(graph, tools):
         return (
             {

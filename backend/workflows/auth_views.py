@@ -8,6 +8,7 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 
+from .auth_roles import allowed_sections, user_role
 from .request_ids import request_id, with_request_id
 
 
@@ -27,9 +28,13 @@ def _error(request, code: str, message: str, http_status: int) -> Response:
 
 
 def _user_payload(user) -> dict:
+    role = user_role(user)
     return {
         "id": user.pk,
         "username": user.get_username(),
+        "is_admin": role == "admin",
+        "role": role,
+        "allowed_sections": list(allowed_sections(user)),
     }
 
 

@@ -22,7 +22,7 @@ COPY docker/sprocket-format.toml ./docker/sprocket-format.toml
 COPY docker/miniwdl.cfg /etc/miniwdl/miniwdl.cfg
 COPY docker/backend-entrypoint.sh /usr/local/bin/backend-entrypoint
 RUN chmod -R a+rX /app/backend /app/schemas /app/examples /app/docker \
-    && chmod +x /usr/local/bin/backend-entrypoint \
+    && chmod 0755 /usr/local/bin/backend-entrypoint \
     && sprocket --version
 
 EXPOSE 8000
