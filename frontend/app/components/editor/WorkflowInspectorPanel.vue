@@ -2,7 +2,7 @@
 type InspectorTab = 'properties' | 'diagnostics' | 'artifacts'
 
 const inspectorTab = defineModel<InspectorTab>('inspectorTab', { required: true })
-defineProps<{
+const props = defineProps<{
   selectedData?: Record<string, any>
   selectedNodeId?: string
   selectedToolSpec?: Record<string, any>
@@ -31,8 +31,65 @@ const emit = defineEmits<{
   selectSubworkflowUpgrade: [event: Event]
   upgradeSubworkflow: []
   updateToolParameter: [port: Record<string, any>, event: Event]
+  updateAnnotationSelection: [portName: string, values: string[]]
   openArtifact: [artifact: any]
 }>()
+
+const annotationConfig = computed(() =>
+  props.selectedToolSpec?.task_kind === 'annotation'
+    ? props.selectedToolSpec.annotation
+    : undefined,
+)
+
+const annotationSelector = computed(() =>
+  props.selectedToolSpec?.inputs?.find(
+    (port: Record<string, any>) => port.name === annotationConfig.value?.selector_input,
+  ),
+)
+
+const annotationSelection = computed<string[]>(() => {
+  const name = annotationConfig.value?.selector_input
+  const selected = name ? props.selectedData?.parameterValues?.[name] : undefined
+  if (Array.isArray(selected)) return selected
+  if (Array.isArray(annotationSelector.value?.default)) return annotationSelector.value.default
+  return annotationConfig.value?.options?.map((item: Record<string, any>) => item.id) ?? []
+})
+
+const annotationGroups = computed(() => {
+  const groups = new Map<string, Array<Record<string, any>>>()
+  for (const option of annotationConfig.value?.options ?? []) {
+    const name = option.group || '其他'
+    groups.set(name, [...(groups.get(name) ?? []), option])
+  }
+  return [...groups.entries()].map(([name, options]) => ({ name, options }))
+})
+
+const standardToolParameters = computed(() =>
+  props.selectedToolParameters.filter(
+    (port) => port.name !== annotationConfig.value?.selector_input,
+  ),
+)
+
+function setAnnotationSelection(values: string[]) {
+  const selector = annotationConfig.value?.selector_input
+  if (!selector) return
+  const selected = new Set(values)
+  const canonical = (annotationConfig.value?.options ?? [])
+    .map((item: Record<string, any>) => item.id)
+    .filter((item: string) => selected.has(item))
+  if (canonical.length) emit('updateAnnotationSelection', selector, canonical)
+}
+
+function toggleAnnotation(option: Record<string, any>, checked: boolean) {
+  const selected = new Set(annotationSelection.value)
+  if (checked) {
+    selected.add(option.id)
+    for (const dependency of option.requires ?? []) selected.add(dependency)
+  } else if (selected.size > 1) {
+    selected.delete(option.id)
+  }
+  setAnnotationSelection([...selected])
+}
 </script>
 
 <template>
@@ -125,7 +182,10 @@ const emit = defineEmits<{
       </section>
 
       <section v-if="selectedData.kind === 'tool'" class="inspector-section">
-        <h3>工具说明</h3>
+        <div class="tool-kind-heading">
+          <h3>工具说明</h3>
+          <span v-if="annotationConfig" class="tool-kind-badge">注释 task</span>
+        </div>
         <p class="inspector-description">
           {{ selectedToolSpec?.description ?? selectedData.description ?? '该工具暂未填写说明。' }}
         </p>
@@ -133,6 +193,46 @@ const emit = defineEmits<{
           <div><dt>工具版本</dt><dd><code>v{{ selectedData.version }}</code></dd></div>
           <div><dt>Docker</dt><dd><code>{{ selectedToolSpec?.container?.image ?? selectedData.dockerImage ?? '未定义' }}</code></dd></div>
         </dl>
+      </section>
+
+      <section v-if="selectedData.kind === 'tool' && annotationConfig" class="inspector-section annotation-selector">
+        <div class="section-heading">
+          <h3>注释项</h3>
+          <span>{{ annotationSelection.length }}/{{ annotationConfig.options.length }}</span>
+        </div>
+        <div
+          v-if="!isParameterConnected(annotationConfig.selector_input)"
+          class="annotation-presets"
+          aria-label="注释预设"
+        >
+          <button
+            v-for="preset in annotationConfig.presets ?? []"
+            :key="preset.id"
+            type="button"
+            @click="setAnnotationSelection(preset.items)"
+          >
+            {{ preset.label }}
+          </button>
+          <button type="button" @click="setAnnotationSelection(annotationConfig.options.map((item: Record<string, any>) => item.id))">
+            全选
+          </button>
+        </div>
+        <p v-else class="contract-help">注释项由上游参数提供，断开连线后才能在这里选择。</p>
+        <div v-for="group in annotationGroups" :key="group.name" class="annotation-group">
+          <strong>{{ group.name }}</strong>
+          <label v-for="option in group.options" :key="option.id" class="annotation-option">
+            <input
+              type="checkbox"
+              :checked="annotationSelection.includes(option.id)"
+              :disabled="isParameterConnected(annotationConfig.selector_input) || (annotationSelection.includes(option.id) && annotationSelection.length === 1)"
+              @change="toggleAnnotation(option, ($event.target as HTMLInputElement).checked)"
+            />
+            <span>
+              <b>{{ option.label }}</b>
+              <small v-if="option.description">{{ option.description }}</small>
+            </span>
+          </label>
+        </div>
       </section>
 
       <section v-if="selectedData.kind === 'subworkflow'" class="inspector-section">
@@ -280,13 +380,13 @@ const emit = defineEmits<{
       <section v-if="selectedData.kind === 'tool'" class="inspector-section">
         <div class="section-heading">
           <h3>参数</h3>
-          <span>{{ selectedToolParameters.length }}</span>
+          <span>{{ standardToolParameters.length }}</span>
         </div>
-        <p v-if="selectedToolParameters.length === 0" class="contract-help">
+        <p v-if="standardToolParameters.length === 0" class="contract-help">
           该工具没有可直接填写的标量参数；文件类输入请通过画布端口连接。
         </p>
         <label
-          v-for="port in selectedToolParameters"
+          v-for="port in standardToolParameters"
           :key="`parameter-${port.name}`"
           class="field parameter-field"
         >
@@ -303,6 +403,17 @@ const emit = defineEmits<{
             <option value="">使用工具默认值</option>
             <option value="true">true</option>
             <option value="false">false</option>
+          </select>
+          <select
+            v-else-if="port.constraints?.enum"
+            :value="String(parameterDisplayValue(port))"
+            :disabled="isParameterConnected(port.name)"
+            @change="emit('updateToolParameter', port, $event)"
+          >
+            <option v-if="port.default === undefined" value="">请选择</option>
+            <option v-for="value in port.constraints.enum" :key="String(value)" :value="String(value)">
+              {{ value }}
+            </option>
           </select>
           <input
             v-else

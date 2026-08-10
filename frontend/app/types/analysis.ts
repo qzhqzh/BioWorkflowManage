@@ -27,6 +27,10 @@ export interface AnalysisWorkflow {
   ready: boolean
   diagnostic_count: number
   blockers: string[]
+  source_type: 'wdl_asset' | 'workflow_version'
+  requires_reference: boolean
+  requires_panel: boolean
+  reference_status?: Record<string, AnalysisDatabaseOption>
 }
 
 export interface AnalysisRequirement {
@@ -107,6 +111,7 @@ export interface AnalysisRun {
     workflow_name: string
     revision: number
     digest: string
+    source_type: 'wdl_asset' | 'workflow_version'
   }
   sample_id: string
   sample_name: string

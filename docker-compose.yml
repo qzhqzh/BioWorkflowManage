@@ -38,6 +38,7 @@ services:
       ANALYSIS_DATABASE_CATALOG: /analysis/databases/catalog.json
       ANALYSIS_DATABASE_EXECUTION_ROOT: ${ANALYSIS_DATABASE_EXECUTION_ROOT:-/analysis/databases}
       ANALYSIS_RUN_ROOT: /analysis/runs
+      ANALYSIS_RUN_EXECUTION_ROOT: ${ANALYSIS_RUN_EXECUTION_ROOT:-/analysis/runs}
     volumes:
       - ${ANALYSIS_RAWDATA_HOST_PATH:-./workspace/rawdata}:/analysis/rawdata:ro
       - ${ANALYSIS_DATABASE_HOST_PATH:-./workspace/databases}:/analysis/databases:ro
@@ -186,6 +187,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      backend:
+        condition: service_healthy
       miniwdl-docker:
         condition: service_healthy
     volumes:
@@ -234,6 +237,8 @@ services:
       ANALYSIS_INFRASTRUCTURE_RETRY_DELAY_SECONDS: "${ANALYSIS_INFRASTRUCTURE_RETRY_DELAY_SECONDS:-15}"
     depends_on:
       db:
+        condition: service_healthy
+      backend:
         condition: service_healthy
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock

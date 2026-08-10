@@ -1,16 +1,21 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
+import threading
 import time
+import uuid
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
 from django.conf import settings
-from django.db import transaction
+from django.db import close_old_connections, transaction
 from django.utils import timezone
 
 from .models import AnalysisRun, AnalysisRunEvent
@@ -35,6 +40,29 @@ INFRASTRUCTURE_ERROR_PATTERNS = (
     "node is not a swarm manager",
     "rpc error",
 )
+
+
+class AnalysisRunLeaseLost(RuntimeError):
+    pass
+
+
+def _terminate_process_group(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait(timeout=5)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        return
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -62,9 +90,128 @@ def _event(
 
 
 def _update_run(run: AnalysisRun, **values) -> None:
+    lease_token = run.lease_token
+    values["updated_at"] = timezone.now()
+    queryset = AnalysisRun.objects.filter(pk=run.pk)
+    if lease_token is not None:
+        queryset = queryset.filter(lease_token=lease_token)
+    if queryset.update(**values) != 1:
+        raise AnalysisRunLeaseLost(f"analysis run {run.id} lease is no longer active")
     for name, value in values.items():
         setattr(run, name, value)
-    run.save(update_fields=[*values, "updated_at"])
+
+
+def _renew_lease(run: AnalysisRun) -> bool:
+    if run.lease_token is None:
+        return True
+    now = timezone.now()
+    updated = AnalysisRun.objects.filter(
+        pk=run.pk,
+        lease_token=run.lease_token,
+        status__in=[AnalysisRun.Status.PREPARING, AnalysisRun.Status.RUNNING],
+    ).update(
+        worker_heartbeat_at=now,
+        lease_expires_at=now + timedelta(seconds=settings.ANALYSIS_RUN_LEASE_SECONDS),
+        updated_at=now,
+    )
+    return updated == 1
+
+
+class _LeaseHeartbeat:
+    def __init__(self, run: AnalysisRun):
+        self.run = run
+        self.stop = threading.Event()
+        self.lease_lost = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.process: subprocess.Popen | None = None
+        self.process_lock = threading.Lock()
+
+    def __enter__(self):
+        if self.run.lease_token is None:
+            return self
+        if not _renew_lease(self.run):
+            raise AnalysisRunLeaseLost(
+                f"analysis run {self.run.id} lease is no longer active"
+            )
+        self.thread = threading.Thread(
+            target=self._heartbeat,
+            name=f"analysis-heartbeat-{self.run.id}",
+            daemon=True,
+        )
+        self.thread.start()
+        return self
+
+    def _heartbeat(self) -> None:
+        interval = settings.ANALYSIS_RUN_HEARTBEAT_SECONDS
+        while not self.stop.wait(interval):
+            close_old_connections()
+            try:
+                if not _renew_lease(self.run):
+                    self.lease_lost.set()
+                    self._terminate_process()
+                    return
+            except Exception:
+                continue
+            finally:
+                close_old_connections()
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.stop.set()
+        if self.thread is not None:
+            self.thread.join(timeout=settings.ANALYSIS_RUN_HEARTBEAT_SECONDS + 1)
+
+    def watch(self, process: subprocess.Popen) -> None:
+        with self.process_lock:
+            self.process = process
+            if self.lease_lost.is_set():
+                self._terminate_process_locked()
+
+    def unwatch(self, process: subprocess.Popen) -> None:
+        with self.process_lock:
+            if self.process is process:
+                self.process = None
+
+    def _terminate_process(self) -> None:
+        with self.process_lock:
+            self._terminate_process_locked()
+
+    def _terminate_process_locked(self) -> None:
+        process = self.process
+        if process is None:
+            return
+        _terminate_process_group(process)
+
+
+def _recover_stale_runs(now) -> None:
+    stale_runs = list(
+        AnalysisRun.objects.select_for_update(skip_locked=True)
+        .filter(
+            status__in=[AnalysisRun.Status.PREPARING, AnalysisRun.Status.RUNNING],
+            lease_expires_at__lt=now,
+        )
+        .order_by("lease_expires_at")[:20]
+    )
+    for run in stale_runs:
+        if run.status == AnalysisRun.Status.PREPARING and not run.work_directory:
+            run.status = AnalysisRun.Status.QUEUED
+            run.progress = 0
+            run.current_step = "worker 中断，已安全重新排队"
+            run.started_at = None
+            level = "warning"
+            message = "准备阶段 worker 租约过期，运行已重新排队。"
+        else:
+            run.status = AnalysisRun.Status.FAILED
+            run.progress = 100
+            run.current_step = "worker 连接中断，需手动重跑"
+            run.error = "worker 心跳超时；为避免重复执行，系统没有自动重跑。"
+            run.finished_at = now
+            level = "error"
+            message = "运行阶段 worker 租约过期，已停止自动恢复以避免重复任务。"
+        run.lease_token = None
+        run.worker_heartbeat_at = None
+        run.lease_expires_at = None
+        run.save()
+        _event(run, message, kind="lease", level=level)
 
 
 def _available_memory_bytes(path: Path = Path("/proc/meminfo")) -> int | None:
@@ -92,9 +239,10 @@ def _resource_wait_message() -> str | None:
 
 def claim_next_run() -> AnalysisRun | None:
     with transaction.atomic():
+        now = timezone.now()
+        _recover_stale_runs(now)
         run = (
             AnalysisRun.objects.select_for_update(skip_locked=True)
-            .select_related("asset", "revision")
             .filter(status=AnalysisRun.Status.QUEUED)
             .order_by("created_at")
             .first()
@@ -111,21 +259,51 @@ def claim_next_run() -> AnalysisRun | None:
         run.status = AnalysisRun.Status.PREPARING
         run.progress = 5
         run.current_step = "正在准备 WDL 与输入"
-        run.started_at = timezone.now()
+        run.started_at = now
+        run.attempt_count += 1
+        run.lease_token = uuid.uuid4()
+        run.worker_heartbeat_at = now
+        run.lease_expires_at = now + timedelta(
+            seconds=settings.ANALYSIS_RUN_LEASE_SECONDS
+        )
         run.save(
             update_fields=[
                 "status",
                 "progress",
                 "current_step",
                 "started_at",
+                "attempt_count",
+                "lease_token",
+                "worker_heartbeat_at",
+                "lease_expires_at",
                 "updated_at",
             ]
         )
         _event(run, "worker 已领取运行，开始准备输入。")
+        if run.asset_id:
+            run.asset
+        if run.revision_id:
+            run.revision
+        if run.workflow_version_id:
+            run.workflow_version
+            run.workflow_version.workflow
         return run
 
 
 def _revision_bundle(run: AnalysisRun) -> tuple[dict[str, str], str]:
+    if run.workflow_version_id:
+        if _canonical_bundle_digest(run.source_bundle) != run.source_digest:
+            raise RuntimeError("已发布 Workflow 的运行编译产物摘要不匹配。")
+        files = run.source_bundle.get("files")
+        entrypoint = run.source_bundle.get("entrypoint")
+        if not isinstance(files, dict) or not isinstance(entrypoint, str):
+            raise RuntimeError("已发布 Workflow 的固定编译产物不完整。")
+        return {
+            str(path): str(content)
+            for path, content in files.items()
+        }, normalize_package_path(entrypoint)
+    if run.revision is None or run.asset is None:
+        raise RuntimeError("运行没有固定的 WDL 来源。")
     revision = run.revision
     local_files = {item.path: item.content for item in revision.files.all()}
     if not local_files:
@@ -141,6 +319,83 @@ def _revision_bundle(run: AnalysisRun) -> tuple[dict[str, str], str]:
         reference_specs_for_revision(revision),
     )
     return files, normalize_package_path(entrypoint)
+
+
+def _canonical_bundle_digest(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def _verify_manifest_files(
+    manifest: dict[str, Any] | None,
+    root: Path,
+    *,
+    nested: bool = False,
+) -> None:
+    if not manifest:
+        return
+    if nested:
+        for key in ("primary", "control"):
+            value = manifest.get(key)
+            if isinstance(value, dict):
+                _verify_manifest_files(value, root)
+        return
+    items = manifest.get("files") or manifest.get("resources") or []
+    resolved_root = root.resolve()
+    for item in items:
+        relative = Path(str(item.get("relative_path") or ""))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise RuntimeError("受管资源 manifest 路径无效。")
+        path = (resolved_root / relative).resolve()
+        try:
+            path.relative_to(resolved_root)
+            stat = path.stat()
+        except (OSError, ValueError) as error:
+            raise RuntimeError(f"受管资源已不存在：{relative}") from error
+        if item.get("kind") == "directory":
+            if not path.is_dir():
+                raise RuntimeError(f"受管资源不再是目录：{relative}")
+            continue
+        expected = (
+            int(item.get("size", -1)),
+            int(item.get("mtime_ns", -1)),
+            int(item.get("device", -1)),
+            int(item.get("inode", -1)),
+        )
+        actual = (stat.st_size, stat.st_mtime_ns, stat.st_dev, stat.st_ino)
+        if actual != expected:
+            raise RuntimeError(f"受管资源在排队后发生变化：{relative}")
+        expected_sha256 = str(item.get("sha256") or "").removeprefix("sha256:")
+        if expected_sha256 and path.is_file():
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            if digest.hexdigest() != expected_sha256:
+                raise RuntimeError(f"受管资源校验和不匹配：{relative}")
+
+
+def _verify_run_resource_manifests(run: AnalysisRun) -> None:
+    payload = run.request_payload
+    _verify_manifest_files(
+        payload.get("input_resource_manifest"),
+        Path(settings.ANALYSIS_RAWDATA_ROOT),
+        nested="primary" in (payload.get("input_resource_manifest") or {}),
+    )
+    for key in (
+        "database_resource_manifest",
+        "reference_resource_manifest",
+        "panel_resource_manifest",
+    ):
+        _verify_manifest_files(
+            payload.get(key),
+            Path(settings.ANALYSIS_DATABASE_ROOT),
+        )
 
 
 def _materialize_source(run: AnalysisRun, run_directory: Path) -> Path:
@@ -233,13 +488,18 @@ def _attempt_paths(run_directory: Path, attempt: int) -> dict[str, Path]:
     }
 
 
-def execute_analysis_run(run: AnalysisRun) -> None:
+def execute_analysis_run(
+    run: AnalysisRun,
+    heartbeat: _LeaseHeartbeat | None = None,
+) -> None:
     executable = shutil.which("miniwdl")
     if executable is None:
         raise RuntimeError("analysis-worker 中没有 miniwdl 可执行文件。")
     root = Path(settings.ANALYSIS_RUN_ROOT).resolve()
     root.mkdir(parents=True, exist_ok=True)
+    _verify_run_resource_manifests(run)
     run_directory = root / str(run.id)
+    _update_run(run, work_directory=str(run_directory))
     run_directory.mkdir(parents=False, exist_ok=False)
     input_path = run_directory / "inputs.json"
     request_path = run_directory / "request.json"
@@ -252,9 +512,21 @@ def execute_analysis_run(run: AnalysisRun) -> None:
         request_path,
         {
             "run_id": str(run.id),
-            "asset": run.asset.slug,
-            "revision": run.revision.version,
-            "digest": run.revision.digest,
+            "source": (
+                {
+                    "kind": "workflow_version",
+                    "slug": run.workflow_version.workflow.slug,
+                    "version": run.workflow_version.version,
+                    "digest": run.source_digest,
+                }
+                if run.workflow_version_id
+                else {
+                    "kind": "wdl_asset",
+                    "slug": run.asset.slug,
+                    "revision": run.revision.version,
+                    "digest": run.revision.digest,
+                }
+            ),
             "workflow_name": run.workflow_name,
             "sample_id": run.sample_id,
             "created_at": run.created_at,
@@ -268,14 +540,21 @@ def execute_analysis_run(run: AnalysisRun) -> None:
         status=AnalysisRun.Status.RUNNING,
         progress=12,
         current_step="miniwdl 正在校验流程",
-        work_directory=str(run_directory),
     )
-    _event(run, f"已固定 {run.asset.name} v{run.revision.version}，启动 miniwdl。")
+    source_name = (
+        f"{run.workflow_version.name} v{run.workflow_version.version}"
+        if run.workflow_version_id
+        else f"{run.asset.name} v{run.revision.version}"
+    )
+    _event(run, f"已固定 {source_name}，启动 miniwdl。")
 
     total_calls = 1
-    workflows = run.revision.analysis.get("workflows", [])
-    if workflows:
-        total_calls = max(1, int(workflows[0].get("structure", {}).get("call_count", 1)))
+    if run.workflow_version_id:
+        total_calls = max(1, int(run.source_bundle.get("call_count", 1)))
+    else:
+        workflows = run.revision.analysis.get("workflows", [])
+        if workflows:
+            total_calls = max(1, int(workflows[0].get("structure", {}).get("call_count", 1)))
     retry_count = max(0, int(settings.ANALYSIS_INFRASTRUCTURE_RETRIES))
     result: dict[str, Any] | None = None
     failure_message = ""
@@ -312,46 +591,63 @@ def execute_analysis_run(run: AnalysisRun) -> None:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                start_new_session=True,
             )
-            assert process.stderr is not None
-            for line in process.stderr:
-                stderr_handle.write(line)
-                stderr_handle.flush()
-                current_stderr_handle.write(line)
-                current_stderr_handle.flush()
-                message, level, details = _log_message(line)
-                if not message:
-                    continue
-                lowered = message.lower()
-                call_name = str(
-                    details.get("call") or details.get("job") or details.get("task") or ""
+            if heartbeat is not None:
+                heartbeat.watch(process)
+            try:
+                assert process.stderr is not None
+                for line in process.stderr:
+                    stderr_handle.write(line)
+                    stderr_handle.flush()
+                    current_stderr_handle.write(line)
+                    current_stderr_handle.flush()
+                    message, level, details = _log_message(line)
+                    if not message:
+                        continue
+                    lowered = message.lower()
+                    call_name = str(
+                        details.get("call")
+                        or details.get("job")
+                        or details.get("task")
+                        or ""
+                    )
+                    if call_name and re.search(
+                        r"\b(done|complete|succeeded)\b", lowered
+                    ):
+                        completed_calls.add(call_name)
+                    progress = min(92, 15 + int(75 * len(completed_calls) / total_calls))
+                    significant = (
+                        level in {"warning", "error", "critical"}
+                        or call_name
+                        or any(
+                            word in lowered
+                            for word in ("workflow", "container", "task", "done", "fail")
+                        )
+                    )
+                    if significant and event_count < 500:
+                        event_count += 1
+                        _event(
+                            run,
+                            message,
+                            kind="miniwdl",
+                            level="error" if level in {"error", "critical"} else level,
+                            details={**details, "attempt": attempt},
+                        )
+                        _update_run(
+                            run,
+                            progress=progress,
+                            current_step=(call_name or message)[:256],
+                        )
+                exit_code = process.wait()
+            finally:
+                _terminate_process_group(process)
+                if heartbeat is not None:
+                    heartbeat.unwatch(process)
+            if heartbeat is not None and heartbeat.lease_lost.is_set():
+                raise AnalysisRunLeaseLost(
+                    f"analysis run {run.id} lease is no longer active"
                 )
-                if call_name and re.search(r"\b(done|complete|succeeded)\b", lowered):
-                    completed_calls.add(call_name)
-                progress = min(92, 15 + int(75 * len(completed_calls) / total_calls))
-                significant = (
-                    level in {"warning", "error", "critical"}
-                    or call_name
-                    or any(
-                        word in lowered
-                        for word in ("workflow", "container", "task", "done", "fail")
-                    )
-                )
-                if significant and event_count < 500:
-                    event_count += 1
-                    _event(
-                        run,
-                        message,
-                        kind="miniwdl",
-                        level="error" if level in {"error", "critical"} else level,
-                        details={**details, "attempt": attempt},
-                    )
-                    _update_run(
-                        run,
-                        progress=progress,
-                        current_step=(call_name or message)[:256],
-                    )
-            exit_code = process.wait()
         shutil.copyfile(paths["stdout"], current_stdout_path)
 
         if exit_code == 0:
@@ -395,6 +691,9 @@ def execute_analysis_run(run: AnalysisRun) -> None:
             current_step="运行失败",
             error=failure_message[:8000],
             finished_at=timezone.now(),
+            lease_token=None,
+            worker_heartbeat_at=None,
+            lease_expires_at=None,
         )
         _event(run, failure_message, level="error")
         return
@@ -406,20 +705,32 @@ def execute_analysis_run(run: AnalysisRun) -> None:
         outputs=result,
         error="",
         finished_at=timezone.now(),
+        lease_token=None,
+        worker_heartbeat_at=None,
+        lease_expires_at=None,
     )
     _event(run, "分析完成，结果文件已就绪。")
 
 
 def process_analysis_run(run: AnalysisRun) -> None:
     try:
-        execute_analysis_run(run)
+        with _LeaseHeartbeat(run) as heartbeat:
+            execute_analysis_run(run, heartbeat)
+    except AnalysisRunLeaseLost:
+        return
     except Exception as error:
-        _update_run(
-            run,
-            status=AnalysisRun.Status.FAILED,
-            progress=100,
-            current_step="运行失败",
-            error=str(error)[:8000],
-            finished_at=timezone.now(),
-        )
-        _event(run, str(error), level="error")
+        try:
+            _update_run(
+                run,
+                status=AnalysisRun.Status.FAILED,
+                progress=100,
+                current_step="运行失败",
+                error=str(error)[:8000],
+                finished_at=timezone.now(),
+                lease_token=None,
+                worker_heartbeat_at=None,
+                lease_expires_at=None,
+            )
+            _event(run, str(error), level="error")
+        except AnalysisRunLeaseLost:
+            return

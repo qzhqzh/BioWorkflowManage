@@ -18,8 +18,24 @@ const emit = defineEmits<{
 
 const draft = defineModel<Record<string, any>>('draft', { required: true })
 
+const annotationConfig = computed(() =>
+  draft.value.task_kind === 'annotation' && draft.value.annotation
+    ? draft.value.annotation
+    : undefined,
+)
+
+const annotationGroups = computed(() => {
+  const groups = new Map<string, Record<string, any>[]>()
+  for (const option of annotationConfig.value?.options ?? []) {
+    const group = option.group || '其他'
+    groups.set(group, [...(groups.get(group) ?? []), option])
+  }
+  return [...groups.entries()].map(([name, options]) => ({ name, options }))
+})
+
 const wdlTypes = [
   'File',
+  'Directory',
   'String',
   'Int',
   'Float',
@@ -56,6 +72,10 @@ function updateInputDefault(input: Record<string, any>, event: Event) {
   if (rawValue === '') delete input.default
   else input.default = coerceWdlValue(rawValue, input.wdl_type)
   emit('dirty')
+}
+
+function isAnnotationSelectorInput(input: Record<string, any>) {
+  return Boolean(annotationConfig.value?.selector_input === input.name)
 }
 
 function addOutput() {
@@ -186,7 +206,30 @@ function removeOutput(index: number) {
               <span>语义类型</span>
               <input v-model="input.semantic_type" aria-label="输入语义类型" />
             </label>
-            <label v-if="!String(input.wdl_type).includes('File')" class="field">
+            <div v-if="isAnnotationSelectorInput(input)" class="annotation-default-editor">
+              <div class="annotation-default-editor__heading">
+                <span>可用注释项</span>
+                <strong>{{ annotationConfig.options.length }} 项</strong>
+              </div>
+              <div class="annotation-default-editor__groups">
+                <fieldset v-for="group in annotationGroups" :key="group.name">
+                  <legend>{{ group.name }}</legend>
+                  <label v-for="option in group.options" :key="option.id">
+                    <input
+                      type="checkbox"
+                      checked
+                      disabled
+                    />
+                    <span>
+                      <strong>{{ option.label }}</strong>
+                      <small v-if="option.description">{{ option.description }}</small>
+                    </span>
+                  </label>
+                </fieldset>
+              </div>
+              <small>实际注释项在 Workflow 的注释节点中选择。</small>
+            </div>
+            <label v-else-if="!String(input.wdl_type).includes('File')" class="field">
               <span>默认值</span>
               <select
                 v-if="input.wdl_type === 'Boolean'"
@@ -427,6 +470,104 @@ function removeOutput(index: number) {
   padding: 0 var(--space-1);
   font-size: var(--text-secondary);
   font-weight: 650;
+}
+
+.runtime-editor .field {
+  margin-top: 0;
+}
+
+.annotation-default-editor {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: var(--space-2);
+  margin-top: var(--space-1);
+  border-top: 1px solid var(--color-border);
+  padding-top: var(--space-3);
+}
+
+.annotation-default-editor__heading {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.annotation-default-editor__heading {
+  justify-content: space-between;
+  color: var(--color-ink-soft);
+  font-size: var(--text-caption);
+  font-weight: 600;
+}
+
+.annotation-default-editor__heading strong {
+  color: var(--color-primary-hover);
+  font-size: var(--text-caption);
+}
+
+.annotation-default-editor__groups {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-2);
+}
+
+.annotation-default-editor__groups fieldset {
+  display: grid;
+  align-content: start;
+  gap: var(--space-1);
+  margin: 0;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: var(--space-2);
+}
+
+.annotation-default-editor__groups legend {
+  padding: 0 var(--space-1);
+  color: var(--color-muted);
+  font-size: var(--text-caption);
+  font-weight: 600;
+}
+
+.annotation-default-editor__groups label {
+  display: grid;
+  grid-template-columns: 1rem minmax(0, 1fr);
+  align-items: start;
+  gap: var(--space-2);
+  border-radius: var(--radius-sm);
+  padding: var(--space-1);
+  cursor: pointer;
+}
+
+.annotation-default-editor__groups label:hover {
+  background: var(--color-surface);
+}
+
+.annotation-default-editor__groups input {
+  width: 1rem;
+  height: 1rem;
+  margin: 0.1875rem 0 0;
+  accent-color: var(--color-primary);
+}
+
+.annotation-default-editor__groups label > span {
+  display: grid;
+  gap: 0.0625rem;
+}
+
+.annotation-default-editor__groups strong {
+  color: var(--color-ink);
+  font-size: var(--text-secondary);
+  font-weight: 600;
+}
+
+.annotation-default-editor__groups small {
+  color: var(--color-muted);
+  font-size: var(--text-caption);
+  line-height: 1.4;
+}
+
+@media (max-width: 900px) {
+  .annotation-default-editor__groups {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 64rem) {

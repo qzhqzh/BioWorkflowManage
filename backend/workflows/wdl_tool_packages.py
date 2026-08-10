@@ -30,6 +30,7 @@ from .wdl_packages import (
     read_wdl_library_archive,
 )
 from .wdl_source_references import current_source_references
+from .wdl_task_import import WDLTaskImportError, import_package_task_as_tool_draft
 
 
 VERSION_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}\Z")
@@ -500,6 +501,115 @@ def wdl_tool_package_version_detail(request, slug: str, version: str):
         )
     return with_request_id(
         Response(_version_payload(item, include_content=True)),
+        request_id(request),
+    )
+
+
+@api_view(["POST"])
+@transaction.atomic
+def extract_wdl_tool_package_tasks(request, slug: str):
+    package = WDLToolPackage.objects.filter(slug=slug).first()
+    if package is None:
+        return _error(
+            request,
+            "WDL_TOOL_PACKAGE_NOT_FOUND",
+            "WDL tool package not found.",
+            status.HTTP_404_NOT_FOUND,
+        )
+    requested_version = str(request.data.get("version") or "").strip()
+    package_version = (
+        package.versions.prefetch_related("files")
+        .filter(version=requested_version)
+        .first()
+        if requested_version
+        else package.versions.prefetch_related("files").first()
+    )
+    if package_version is None:
+        return _error(
+            request,
+            "WDL_TOOL_PACKAGE_VERSION_NOT_FOUND",
+            "WDL tool package version not found.",
+            status.HTTP_404_NOT_FOUND,
+        )
+
+    files = {item.path: item for item in package_version.files.all()}
+    tasks = package_version.analysis.get("tasks", [])
+    actor = _actor(request)
+    replace = bool(request.data.get("replace", False))
+    results = []
+    created_count = 0
+    warning_count = 0
+    for task in tasks:
+        file_path = str(task.get("file_path") or "")
+        task_name = str(task.get("name") or "")
+        source_file = files.get(file_path)
+        if source_file is None or not task_name:
+            transaction.set_rollback(True)
+            return _error(
+                request,
+                "WDL_TOOL_PACKAGE_TASK_SOURCE_MISSING",
+                f"Task source is missing: {file_path} / {task_name}.",
+                status.HTTP_409_CONFLICT,
+            )
+        try:
+            document, created, warnings = import_package_task_as_tool_draft(
+                package_version=package_version,
+                source_file=source_file,
+                task_name=task_name,
+                actor=actor,
+                replace=replace,
+            )
+        except WDLTaskImportError as error:
+            transaction.set_rollback(True)
+            return _error(
+                request,
+                error.code,
+                error.message,
+                status.HTTP_409_CONFLICT
+                if error.code == "TOOL_DRAFT_EXISTS"
+                else status.HTTP_400_BAD_REQUEST,
+            )
+        created_count += int(created)
+        warning_count += len(warnings)
+        results.append(
+            {
+                "tool_id": document.tool_id,
+                "task_name": task_name,
+                "file_path": file_path,
+                "created": created,
+                "validation_status": document.validation.get("status", "unknown"),
+                "warnings": warnings,
+            }
+        )
+
+    WDLToolPackageAuditEvent.objects.create(
+        package=package,
+        package_version=package_version,
+        action="extract_tools",
+        actor=actor,
+        note=str(request.data.get("note") or "").strip(),
+        changes={
+            "version": package_version.version,
+            "task_count": len(results),
+            "created_count": created_count,
+            "reused_count": len(results) - created_count,
+            "warning_count": warning_count,
+            "tool_ids": [item["tool_id"] for item in results],
+        },
+    )
+    return with_request_id(
+        Response(
+            {
+                "package_slug": package.slug,
+                "package_version": package_version.version,
+                "task_count": len(results),
+                "created_count": created_count,
+                "reused_count": len(results) - created_count,
+                "warning_count": warning_count,
+                "results": results,
+            },
+            status=status.HTTP_201_CREATED if created_count else status.HTTP_200_OK,
+        ),
         request_id(request),
     )
 

@@ -63,6 +63,15 @@ interface ToolRegistryEntry {
   version_count: number
   draft_status?: string | null
   draft_updated_at?: string | null
+  description?: string
+  source_wdl?: {
+    package_slug?: string
+    package_version?: string
+    file_path?: string
+    task_name?: string
+  } | null
+  migration_warning_count?: number
+  task_kind?: 'standard' | 'annotation'
 }
 
 interface ToolVersionEntry {
@@ -266,6 +275,7 @@ let workflowLoadSequence = 0
 
 const workflowInputs = [
   { id: 'file', name: 'File', description: '文件或对象存储路径' },
+  { id: 'directory', name: 'Directory', description: '数据库或资源目录' },
   { id: 'string', name: 'String', description: '文本参数' },
   { id: 'integer', name: 'Int', description: '整数参数' },
   { id: 'boolean', name: 'Boolean', description: '布尔开关' },
@@ -277,16 +287,18 @@ const workflowOutputs = [
   { id: 'integer', name: 'Int', description: '导出整数结果' },
   { id: 'boolean', name: 'Boolean', description: '导出布尔结果' },
 ]
-const workflowPortWdlTypes = ['File', 'String', 'Int', 'Float', 'Boolean']
+const workflowPortWdlTypes = ['File', 'Directory', 'String', 'Int', 'Float', 'Boolean']
 
 const visibleTools = computed(() => registryTools.value.map((tool) => ({
   id: tool.tool_id,
   name: tool.name || tool.tool_id,
-  description: `${tool.version_count} 个不可变版本`,
+  description: tool.source_wdl?.package_slug
+    ? `${tool.source_wdl.package_slug}@${tool.source_wdl.package_version} · ${tool.source_wdl.file_path}`
+    : tool.description || `${tool.version_count} 个不可变版本`,
   version: tool.latest_version ?? '草稿',
   digest: tool.latest_digest ?? undefined,
   status: tool.latest_version
-    ? '已发布'
+    ? tool.task_kind === 'annotation' ? '注释 task · 已发布' : '已发布'
     : tool.draft_status === 'valid'
       ? '有效草稿'
       : '草稿待修正',
@@ -614,7 +626,9 @@ const selectedToolInputs = computed<Record<string, any>[]>(() =>
   selectedToolSpecForNode.value?.inputs ?? [],
 )
 const selectedToolParameters = computed(() =>
-  selectedToolInputs.value.filter((port) => !String(port.wdl_type).includes('File')),
+  selectedToolInputs.value.filter((port) =>
+    !String(port.wdl_type).includes('File') && port.wdl_type !== 'Directory',
+  ),
 )
 
 const selectedGraphNodes = computed(() => {
@@ -1283,6 +1297,25 @@ function updateToolParameter(port: Record<string, any>, event: Event) {
     if (rawValue === '') delete parameterValues[port.name]
     else parameterValues[port.name] = coerceWdlValue(rawValue, port.wdl_type)
     return { ...node, data: { ...data, parameterValues } }
+  })
+  refreshSelectedNode([selectedNodeId.value])
+}
+
+function updateAnnotationSelection(portName: string, values: string[]) {
+  if (!selectedNode.value || selectedData.value?.kind !== 'tool' || isParameterConnected(portName)) return
+  nodes.value = nodes.value.map((node) => {
+    if (node.id !== selectedNodeId.value) return node
+    const data = node.data as WorkflowNodeData
+    return {
+      ...node,
+      data: {
+        ...data,
+        parameterValues: {
+          ...(data.parameterValues ?? {}),
+          [portName]: values,
+        },
+      },
+    }
   })
   refreshSelectedNode([selectedNodeId.value])
 }
@@ -2416,7 +2449,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="app-shell">
+  <div class="app-shell" :class="{ 'app-shell--workspace': activeRail !== 'edit' }">
     <a class="skip-link" href="#workflow-canvas">跳到工作流画布</a>
     <input ref="importInput" class="visually-hidden" type="file" accept="application/json,.json" @change="importToolSpec" />
 
@@ -2865,6 +2898,7 @@ onBeforeUnmount(() => {
       @select-subworkflow-upgrade="selectSubworkflowUpgrade"
       @upgrade-subworkflow="upgradeSelectedSubworkflow"
       @update-tool-parameter="updateToolParameter"
+      @update-annotation-selection="updateAnnotationSelection"
       @open-artifact="openArtifactPreview"
     />
 

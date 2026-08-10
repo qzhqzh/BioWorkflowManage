@@ -46,6 +46,14 @@
       "pattern": "^[a-z][a-z0-9_]*$",
       "maxLength": 64
     },
+    "task_kind": {
+      "type": "string",
+      "enum": ["standard", "annotation"],
+      "default": "standard"
+    },
+    "annotation": {
+      "$ref": "#/$defs/annotationTask"
+    },
     "container": {
       "$ref": "#/$defs/container"
     },
@@ -85,6 +93,7 @@
       "type": "string",
       "enum": [
         "File",
+        "Directory",
         "String",
         "Int",
         "Float",
@@ -161,6 +170,106 @@
           },
           "minItems": 1,
           "uniqueItems": true
+        }
+      }
+    },
+    "annotationOption": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "label", "group"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "maxLength": 64
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "group": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "supported_builds": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_.-]+$",
+            "maxLength": 64
+          },
+          "minItems": 1,
+          "uniqueItems": true,
+          "maxItems": 32
+        },
+        "requires": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]*$",
+            "maxLength": 64
+          },
+          "uniqueItems": true,
+          "maxItems": 32
+        }
+      }
+    },
+    "annotationPreset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "label", "items"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "maxLength": 64
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]*$",
+            "maxLength": 64
+          },
+          "minItems": 1,
+          "uniqueItems": true,
+          "maxItems": 128
+        }
+      }
+    },
+    "annotationTask": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["selector_input", "options"],
+      "properties": {
+        "selector_input": {
+          "$ref": "#/$defs/identifier"
+        },
+        "options": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/annotationOption"
+          },
+          "minItems": 1,
+          "maxItems": 128
+        },
+        "presets": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/annotationPreset"
+          },
+          "maxItems": 32
         }
       }
     },
@@ -353,10 +462,16 @@
         "source_wdl": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["asset_slug", "revision", "file_path", "task_name", "source_digest"],
+          "required": ["file_path", "task_name", "source_digest"],
+          "oneOf": [
+            { "required": ["asset_slug", "revision"] },
+            { "required": ["package_slug", "package_version"] }
+          ],
           "properties": {
             "asset_slug": { "type": "string", "maxLength": 128 },
             "revision": { "type": "integer", "minimum": 1 },
+            "package_slug": { "type": "string", "maxLength": 128 },
+            "package_version": { "type": "string", "minLength": 1, "maxLength": 64 },
             "file_path": { "type": "string", "maxLength": 512 },
             "task_name": { "$ref": "#/$defs/identifier" },
             "source_digest": { "type": "string", "pattern": "^sha256:[a-fA-F0-9]{64}$" },

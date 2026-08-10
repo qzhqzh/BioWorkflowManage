@@ -17,8 +17,8 @@ const emit = defineEmits<{
     workflow: string
     dataset: string
     control_dataset?: string
-    reference: string
-    panel: string
+    reference?: string
+    panel?: string
     sample_id: string
     sample_name: string
     sample_type: string
@@ -43,19 +43,27 @@ const panels = computed<AnalysisDatabaseOption[]>(() => (
   props.catalog?.database.panels.filter(item => !item.reference || item.reference === referenceId.value) ?? []
 ))
 const selectedWorkflow = computed(() => workflows.value.find(item => item.slug === workflowSlug.value))
+const requiresReference = computed(() => selectedWorkflow.value?.requires_reference !== false)
+const requiresPanel = computed(() => selectedWorkflow.value?.requires_panel !== false)
 const selectedDataset = computed(() => datasets.value.find(item => item.id === datasetId.value))
 const selectedReference = computed(() => references.value.find(item => item.id === referenceId.value))
+const referenceStatus = (reference: AnalysisDatabaseOption) => (
+  selectedWorkflow.value?.reference_status?.[reference.id] ?? reference
+)
+const selectedReferenceStatus = computed(() => (
+  selectedReference.value ? referenceStatus(selectedReference.value) : undefined
+))
 const selectedPanel = computed(() => panels.value.find(item => item.id === panelId.value))
 const missingResources = computed(() => [
-  ...(selectedReference.value?.missing ?? []),
+  ...(selectedReferenceStatus.value?.missing ?? []),
   ...(selectedPanel.value?.missing ?? []),
 ])
 const requiresControl = computed(() => selectedWorkflow.value?.mode === 'paired')
 const canSubmit = computed(() => Boolean(
   selectedWorkflow.value?.ready
   && selectedDataset.value
-  && selectedReference.value?.ready
-  && selectedPanel.value?.ready
+  && (!requiresReference.value || selectedReferenceStatus.value?.ready)
+  && (!requiresPanel.value || selectedPanel.value?.ready)
   && sampleId.value.trim()
   && sampleName.value.trim()
   && (!requiresControl.value || (controlDatasetId.value && controlDatasetId.value !== datasetId.value)),
@@ -105,8 +113,8 @@ function submit() {
     workflow: workflowSlug.value,
     dataset: datasetId.value,
     control_dataset: requiresControl.value ? controlDatasetId.value : undefined,
-    reference: referenceId.value,
-    panel: panelId.value,
+    reference: requiresReference.value ? referenceId.value : undefined,
+    panel: requiresPanel.value ? panelId.value : undefined,
     sample_id: sampleId.value.trim(),
     sample_name: sampleName.value.trim(),
     sample_type: sampleType.value,
@@ -182,7 +190,10 @@ function submit() {
             <input v-model="workflowSlug" type="radio" name="workflow" :value="workflow.slug" />
             <span>
               <strong>{{ workflow.name }}</strong>
-              <small>v{{ workflow.revision ?? '—' }} · {{ workflow.mode === 'paired' ? '肿瘤 + 对照' : '单样本' }}</small>
+              <small>
+                v{{ workflow.revision ?? '—' }} ·
+                {{ workflow.source_type === 'workflow_version' ? '流程库发布版' : workflow.mode === 'paired' ? '肿瘤 + 对照' : '历史 WDL' }}
+              </small>
             </span>
             <i :class="workflow.ready ? 'is-ready' : 'is-blocked'">{{ workflow.ready ? '就绪' : '阻塞' }}</i>
           </label>
@@ -192,21 +203,21 @@ function submit() {
         </p>
       </section>
 
-      <section class="analysis-setup-section">
+      <section v-if="requiresReference || requiresPanel" class="analysis-setup-section">
         <div class="analysis-step-heading">
           <span>3</span>
           <h3>数据库与 Panel</h3>
         </div>
         <div class="analysis-field-row">
-          <label class="field">
+          <label v-if="requiresReference" class="field">
             <span>参考版本</span>
             <select v-model="referenceId" aria-label="参考版本">
               <option v-for="reference in references" :key="reference.id" :value="reference.id">
-                {{ reference.name }}{{ reference.ready ? '' : ` · 缺 ${reference.missing.length} 项` }}
+                {{ reference.name }}{{ referenceStatus(reference).ready ? '' : ` · 缺 ${referenceStatus(reference).missing.length} 项` }}
               </option>
             </select>
           </label>
-          <label class="field">
+          <label v-if="requiresPanel" class="field">
             <span>Panel</span>
             <select v-model="panelId" aria-label="Panel">
               <option v-for="panel in panels" :key="panel.id" :value="panel.id">
@@ -223,14 +234,14 @@ function submit() {
             </li>
           </ul>
         </details>
-        <p v-else-if="selectedReference && selectedPanel" class="analysis-inline-note analysis-inline-note--ready">
+        <p v-else-if="selectedReferenceStatus?.ready && (!requiresPanel || selectedPanel?.ready)" class="analysis-inline-note analysis-inline-note--ready">
           数据库检查通过。
         </p>
       </section>
 
       <section class="analysis-setup-section">
         <div class="analysis-step-heading">
-          <span>4</span>
+          <span>{{ requiresReference || requiresPanel ? 4 : 3 }}</span>
           <h3>样本信息</h3>
         </div>
         <div class="analysis-field-row">
@@ -262,7 +273,11 @@ function submit() {
 
       <div class="analysis-submit-row">
         <p v-if="error" class="inline-error" role="alert">{{ error }}</p>
-        <span v-else-if="canSubmit">将固定当前 WDL revision 后进入队列。</span>
+        <span v-else-if="canSubmit">
+          {{ selectedWorkflow?.source_type === 'workflow_version'
+            ? '将固定当前发布版本与编译产物后进入队列。'
+            : '将固定当前 WDL revision 后进入队列。' }}
+        </span>
         <span v-else>补齐上方必需项后可运行。</span>
         <button class="button button--primary" type="submit" :disabled="busy || !canSubmit">
           {{ busy ? '正在提交…' : '开始分析' }}

@@ -33,6 +33,7 @@ def tools(request):
     for tool_id in tool_ids:
         latest = latest_map.get(tool_id)
         draft = draft_map.get(tool_id)
+        draft_spec = draft.draft_spec if draft else {}
         results.append(
             {
                 "tool_id": tool_id,
@@ -49,6 +50,13 @@ def tools(request):
                     draft.validation.get("status", "unknown") if draft else None
                 ),
                 "draft_updated_at": draft.updated_at.isoformat() if draft else None,
+                "description": draft_spec.get("description", ""),
+                "category": draft_spec.get("category"),
+                "task_kind": draft_spec.get("task_kind", "standard"),
+                "source_wdl": draft_spec.get("metadata", {}).get("source_wdl"),
+                "migration_warning_count": len(
+                    draft_spec.get("metadata", {}).get("migration_warnings", [])
+                ),
             }
         )
     return with_request_id(Response({"results": results}), value)

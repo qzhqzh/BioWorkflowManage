@@ -1,5 +1,6 @@
 import uuid
 
+from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
 
@@ -86,6 +87,9 @@ class WorkflowVersion(ImmutableSnapshot):
     workflow_graph = models.JSONField()
     editor_document = models.JSONField(default=dict)
     tool_specs = models.JSONField(default=list)
+    compiled_bundle = models.JSONField(default=dict)
+    compiled_digest = models.CharField(max_length=80, blank=True)
+    compiler_profile = models.CharField(max_length=64, blank=True)
     interface_contract = models.JSONField(default=dict)
     subworkflow_references = models.JSONField(default=list)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -414,16 +418,34 @@ class AnalysisRun(models.Model):
         WDLAsset,
         on_delete=models.PROTECT,
         related_name="analysis_runs",
+        null=True,
+        blank=True,
     )
     revision = models.ForeignKey(
         WDLSourceRevision,
         on_delete=models.PROTECT,
         related_name="analysis_runs",
+        null=True,
+        blank=True,
+    )
+    workflow_version = models.ForeignKey(
+        WorkflowVersion,
+        on_delete=models.PROTECT,
+        related_name="analysis_runs",
+        null=True,
+        blank=True,
     )
     workflow_name = models.CharField(max_length=256)
     sample_id = models.CharField(max_length=256)
     sample_name = models.CharField(max_length=256, blank=True)
     actor = models.CharField(max_length=256, default="local-user")
+    submitted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        related_name="submitted_analysis_runs",
+        null=True,
+        blank=True,
+    )
     status = models.CharField(
         max_length=16,
         choices=Status.choices,
@@ -434,16 +456,39 @@ class AnalysisRun(models.Model):
     current_step = models.CharField(max_length=256, default="等待执行")
     request_payload = models.JSONField(default=dict)
     input_values = models.JSONField(default=dict)
+    source_bundle = models.JSONField(default=dict)
+    source_digest = models.CharField(max_length=80, blank=True)
     outputs = models.JSONField(default=dict)
     error = models.TextField(blank=True)
     work_directory = models.CharField(max_length=1024, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     started_at = models.DateTimeField(null=True, blank=True)
     finished_at = models.DateTimeField(null=True, blank=True)
+    attempt_count = models.PositiveSmallIntegerField(default=0)
+    lease_token = models.UUIDField(null=True, blank=True, editable=False)
+    worker_heartbeat_at = models.DateTimeField(null=True, blank=True)
+    lease_expires_at = models.DateTimeField(null=True, blank=True, db_index=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         ordering = ["-created_at"]
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        asset__isnull=False,
+                        revision__isnull=False,
+                        workflow_version__isnull=True,
+                    )
+                    | models.Q(
+                        asset__isnull=True,
+                        revision__isnull=True,
+                        workflow_version__isnull=False,
+                    )
+                ),
+                name="analysis_run_has_one_source",
+            )
+        ]
 
 
 class AnalysisRunEvent(models.Model):

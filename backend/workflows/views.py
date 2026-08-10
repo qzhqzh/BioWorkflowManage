@@ -802,7 +802,7 @@ def workflow_versions(request, slug: str):
             document.workflow_graph, dependency_errors
         )
     else:
-        validation, _ = validate_workflow_graph(
+        validation, artifacts = compile_workflow(
             document.workflow_graph, document.tool_specs, subworkflows
         )
     if validation["status"] != "valid":
@@ -833,9 +833,43 @@ def workflow_versions(request, slug: str):
             request_id,
         )
     reuse_unchanged = request.data.get("reuse_unchanged") is True
+    files = {
+        item["name"]: item["content"]
+        for item in artifacts
+        if item.get("media_type") == "application/wdl"
+    }
+    compiled_bundle = {
+        "entrypoint": "workflow.wdl",
+        "files": files,
+        "call_count": sum(
+            1
+            for node in document.workflow_graph.get("nodes", [])
+            if node.get("type") in {"tool", "subworkflow"}
+        ),
+    }
+    compiled_digest = canonical_digest(compiled_bundle)
     reused = False
     with transaction.atomic():
         locked = WorkflowDocument.objects.select_for_update().get(pk=document.pk)
+        if (
+            locked.updated_at != document.updated_at
+            or locked.workflow_graph != document.workflow_graph
+            or locked.tool_specs != document.tool_specs
+            or locked.subworkflow_references != document.subworkflow_references
+        ):
+            return _with_request_id(
+                Response(
+                    {
+                        "error": {
+                            "code": "WORKFLOW_CHANGED_DURING_PUBLISH",
+                            "message": "Workflow 在发布编译期间发生变化，请重新发布。",
+                            "request_id": request_id,
+                        }
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                ),
+                request_id,
+            )
         latest = locked.versions.aggregate(value=Max("version"))["value"] or 0
         latest_item = locked.versions.filter(version=latest).first()
         current_digest = validation.get("source", {}).get("digest", "")
@@ -848,6 +882,7 @@ def workflow_versions(request, slug: str):
             and latest_item.kind == locked.kind
             and latest_item.subworkflow_references
             == locked.subworkflow_references
+            and latest_item.compiled_digest == compiled_digest
         ):
             item = latest_item
             reused = True
@@ -862,6 +897,9 @@ def workflow_versions(request, slug: str):
                 workflow_graph=locked.workflow_graph,
                 editor_document=locked.editor_document,
                 tool_specs=locked.tool_specs,
+                compiled_bundle=compiled_bundle,
+                compiled_digest=compiled_digest,
+                compiler_profile="compiler-core-v1",
                 interface_contract=_extract_interface_contract(
                     locked.workflow_graph
                 ),
