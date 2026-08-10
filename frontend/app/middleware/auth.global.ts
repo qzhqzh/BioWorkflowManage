@@ -13,8 +13,12 @@ export default defineNuxtRouteMiddleware(async (to) => {
     }
   }
   if (to.path === '/login') {
-    if (auth.user.value) return navigateTo('/wdl')
+    if (auth.user.value) return navigateTo(defaultRouteForUser(auth.user.value))
     return
   }
   if (!auth.user.value) return navigateTo('/login')
+  const section = routeSection(to.path, to.query.section)
+  if (!auth.user.value.allowed_sections.includes(section)) {
+    return navigateTo(defaultRouteForUser(auth.user.value))
+  }
 })

@@ -69,13 +69,14 @@ docker compose --profile wdl-runtime up -d backend frontend gateway miniwdl-dock
 新环境不需要复制本地 PostgreSQL 或大型参考数据库即可初始化可运行的测试流程：
 
 ```bash
-docker compose run --rm backend python backend/manage.py seed_test_data
+DJANGO_SEED_ALLOW_DEFAULT_PASSWORDS=1 docker compose run --rm \
+  backend python backend/manage.py seed_test_data
 ```
 
 该命令幂等地创建默认测试用户和 3 个 Phase 1 示例流程。若同时需要导入历史实体瘤/血液肿瘤 WDL，先把 WDL 源码目录挂载到新环境，再执行：
 
 ```bash
-docker compose run --rm \
+DJANGO_SEED_ALLOW_DEFAULT_PASSWORDS=1 docker compose run --rm \
   -v /path/to/tumor_wdl:/mnt/tumor_wdl:ro \
   backend python backend/manage.py seed_test_data \
   --wdl-source-dir /mnt/tumor_wdl \
@@ -156,6 +157,53 @@ miniwdl-runner / analysis-worker --mTLS 2376--> miniwdl-docker (隔离 DIND)
 `miniwdl-docker` 需要 `privileged` 才能运行嵌套 Docker。它适合受信任的本地开发和
 CI 验收，但不构成恶意 WDL 的安全沙箱。生产执行应迁到独立 worker/VM，并补齐认证、
 队列、资源限制、审计和网络策略。
+
+### 单机生产执行引擎
+
+在暂时没有独立 worker/VM 时，项目提供直接使用宿主 Docker 的执行模式。该模式不使用
+DIND，也不在同一网络命名空间内启动第二套 dockerd。切换前先确认宿主 Docker 已进入
+Swarm 模式：
+
+先复制宿主模式模板，填写强密码、随机密钥，并用命令输出填写
+`MINIWDL_DOCKER_GID`：
+
+```bash
+cp .env.host.example .env
+stat -c '%g' /var/run/docker.sock
+```
+
+`ANALYSIS_*_HOST_PATH` 与对应 `ANALYSIS_*_EXECUTION_ROOT` 必须保持相同的 NAS
+绝对路径。启动前还必须用 `mountpoint /mnt/nas`（或实际 NAS 根目录）确认网络存储已
+挂载，避免 NAS 掉线后 Docker 自动创建同名本地目录。模板中的 `MINIWDL_UID/GID` 还
+必须对 NAS 的 `analysis-runs` 和 `analysis-cache` 目录具有写权限；Docker socket GID
+未填写时宿主 worker 会拒绝启动，不会静默使用其他机器的组 ID。
+
+```bash
+docker swarm init --advertise-addr <宿主机地址>
+docker compose --profile wdl-runtime stop analysis-worker
+docker compose --profile wdl-host-runtime up -d analysis-worker-host
+```
+
+切换前必须确认没有 `queued`、`preparing` 或 `running` 状态的分析。镜像和容器层复用宿主
+Docker 的数据目录；原始数据、数据库、call cache、中间结果和最终结果仍使用 `.env` 中
+的 `/mnt/nas/workspace` 路径。worker 与宿主 Docker 看到的 NAS 路径必须完全一致。
+宿主模式还需将 `ANALYSIS_RAWDATA_EXECUTION_ROOT` 和
+`ANALYSIS_DATABASE_EXECUTION_ROOT` 分别设置为 NAS 原始数据与数据库的宿主绝对路径；
+backend 会在创建任务时把容器内校验路径转换为这两个执行路径。
+
+挂载 `/var/run/docker.sock` 等同于授予 analysis-worker 管理宿主 Docker 的高权限，只能
+运行受信任的 WDL。宿主模式会与其他容器共享 Docker 引擎、镜像缓存和计算资源；需要更强
+隔离时，应将 worker 部署到独立主机或 VM。不要在同一宿主网络命名空间内运行第二套
+dockerd，两套 daemon 会竞争全局 bridge/iptables 规则。DIND 服务在完成完整数据验证前
+保留，仅用于回退。
+
+worker 默认在宿主 `MemAvailable` 低于 40GB 时让任务保持排队，并显示“等待计算资源”；
+该阈值按当前最大 32GB task 加 8GB 宿主预留设置，可通过
+`ANALYSIS_MIN_AVAILABLE_MEMORY_GB` 调整。Docker/Swarm 连接中断默认不自动重试，避免
+控制面失联时遗留 task 与新 task 重复占用资源；管理员确认 Swarm 健康并清理旧 service
+后再人工重提。显式开启重试时，每次尝试保留独立日志，并复用 miniwdl call cache。正式 QC 从工具包
+`solid-tumor-tools@1.0.9` 起拆成 GeneFuse、Step1 和 UMI 三个可缓存步骤，默认使用
+8 CPU / 12G。
 
 开发环境不会自动清理 `data/miniwdl-engine`，避免误删镜像和运行上下文；长期使用时
 应监控该目录大小。当前 DIND 也继承宿主可见的整体 CPU/内存上限，单 task 仍按 WDL

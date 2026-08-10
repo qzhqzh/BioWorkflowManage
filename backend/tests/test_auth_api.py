@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import pytest
 from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Group
 from django.core.management import call_command
+from django.core.management.base import CommandError
 from rest_framework.test import APIClient
 
 
@@ -12,11 +14,13 @@ DEFAULT_USERNAMES = (
     "hejingjing",
     "zhuying",
     "hangzhili",
+    "chaohuaiyu",
 )
 
 
 @pytest.fixture
-def seeded_users(db):
+def seeded_users(db, monkeypatch):
+    monkeypatch.setenv("DJANGO_SEED_ALLOW_DEFAULT_PASSWORDS", "1")
     call_command("seed_users", verbosity=0)
     user_model = get_user_model()
     return user_model.objects.filter(
@@ -63,6 +67,8 @@ def test_protected_api_requires_login_and_login_me_logout_round_trip(
     )
     assert logged_in.status_code == 200
     assert logged_in.data["user"]["username"] == "zhuqin"
+    assert logged_in.data["user"]["role"] == "admin"
+    assert "wdl" in logged_in.data["user"]["allowed_sections"]
 
     current = client.get("/api/v1/auth/me")
     assert current.status_code == 200
@@ -72,6 +78,30 @@ def test_protected_api_requires_login_and_login_me_logout_round_trip(
     logged_out = client.post("/api/v1/auth/logout", {}, format="json")
     assert logged_out.status_code == 200
     assert client.get("/api/v1/auth/me").status_code == 401
+
+
+@pytest.mark.django_db
+def test_analysis_operator_can_only_access_analysis_api(settings, seeded_users):
+    settings.AUTH_REQUIRED = True
+    client = APIClient()
+
+    logged_in = client.post(
+        "/api/v1/auth/login",
+        {"username": "chaohuaiyu", "password": "chaohuaiyu"},
+        format="json",
+    )
+
+    assert logged_in.status_code == 200
+    assert logged_in.data["user"] == {
+        "id": seeded_users.get(username="chaohuaiyu").pk,
+        "username": "chaohuaiyu",
+        "is_admin": False,
+        "role": "analysis_operator",
+        "allowed_sections": ["runs"],
+    }
+    assert client.get("/api/v1/analysis/catalog").status_code == 200
+    assert client.get("/api/v1/analysis-runs").status_code == 200
+    assert client.get("/api/v1/wdl-assets").status_code == 403
 
 
 @pytest.mark.django_db
@@ -144,7 +174,8 @@ def test_authenticated_wdl_import_records_request_user(settings, seeded_users):
 
 
 @pytest.mark.django_db
-def test_seed_users_is_idempotent_and_derives_passwords_from_usernames():
+def test_seed_users_is_idempotent_and_derives_passwords_from_usernames(monkeypatch):
+    monkeypatch.setenv("DJANGO_SEED_ALLOW_DEFAULT_PASSWORDS", "1")
     call_command("seed_users", verbosity=0)
     call_command("seed_users", verbosity=0)
 
@@ -156,3 +187,56 @@ def test_seed_users_is_idempotent_and_derives_passwords_from_usernames():
         user = user_model.objects.get(username=username)
         assert user.is_active
         assert user.check_password(username)
+        if username == "zhuqin":
+            assert user.is_staff
+            assert user.is_superuser
+        elif username == "chaohuaiyu":
+            assert not user.is_staff
+            assert not user.is_superuser
+            assert user.groups.filter(name="analysis-operators").exists()
+        else:
+            assert not user.is_staff
+            assert not user.is_superuser
+            assert not user.groups.filter(name="analysis-operators").exists()
+    assert Group.objects.filter(name="analysis-operators").exists()
+
+
+@pytest.mark.django_db
+def test_seed_users_does_not_reactivate_disabled_user(monkeypatch):
+    monkeypatch.setenv("DJANGO_SEED_ALLOW_DEFAULT_PASSWORDS", "1")
+    user_model = get_user_model()
+    user = user_model.objects.create_user(
+        username="chaohuaiyu",
+        password="chaohuaiyu",
+        is_active=False,
+    )
+
+    call_command("seed_users", verbosity=0)
+
+    user.refresh_from_db()
+    assert not user.is_active
+
+
+@pytest.mark.django_db
+def test_seed_users_requires_explicit_password_configuration(monkeypatch):
+    monkeypatch.delenv("DJANGO_SEED_ALLOW_DEFAULT_PASSWORDS", raising=False)
+
+    with pytest.raises(CommandError, match="DJANGO_SEED_PASSWORD_ZHUQIN"):
+        call_command("seed_users", verbosity=0)
+
+
+@pytest.mark.django_db
+def test_seed_users_preserves_existing_non_target_user_permissions(monkeypatch):
+    monkeypatch.setenv("DJANGO_SEED_ALLOW_DEFAULT_PASSWORDS", "1")
+    user = get_user_model().objects.create_user(
+        username="zhangrusong",
+        password="existing-password",
+        is_staff=True,
+    )
+
+    call_command("seed_users", verbosity=0)
+
+    user.refresh_from_db()
+    assert user.is_staff
+    assert user.check_password("existing-password")
+    assert not user.groups.filter(name="analysis-operators").exists()

@@ -4,6 +4,8 @@ from django.conf import settings
 from rest_framework.authentication import SessionAuthentication
 from rest_framework.permissions import BasePermission
 
+from .auth_roles import is_admin, is_analysis_operator
+
 
 class SessionAuthenticationWithHeader(SessionAuthentication):
     """Session auth that lets DRF report unauthenticated API calls as 401."""
@@ -13,7 +15,7 @@ class SessionAuthenticationWithHeader(SessionAuthentication):
 
 
 class AuthenticationRequiredPermission(BasePermission):
-    """Gate API access behind the runtime ``AUTH_REQUIRED`` switch."""
+    """Require authentication and enforce the configured product role."""
 
     message = "Authentication credentials are required."
 
@@ -21,4 +23,15 @@ class AuthenticationRequiredPermission(BasePermission):
         if not settings.AUTH_REQUIRED:
             return True
         user = getattr(request, "user", None)
-        return bool(user is not None and user.is_authenticated)
+        if user is None or not user.is_authenticated:
+            self.message = "Authentication credentials are required."
+            return False
+        if is_admin(user):
+            return True
+        allowed = bool(
+            getattr(view, "analysis_operator_allowed", False)
+            and is_analysis_operator(user)
+        )
+        if not allowed:
+            self.message = "当前用户没有权限访问此功能。"
+        return allowed

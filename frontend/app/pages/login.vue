@@ -16,7 +16,7 @@ async function login() {
     )
     auth.user.value = response.user
     auth.ready.value = true
-    await navigateTo('/wdl')
+    await navigateTo(defaultRouteForUser(response.user))
   } catch {
     state.value = 'error'
   }

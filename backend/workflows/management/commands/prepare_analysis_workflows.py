@@ -30,7 +30,7 @@ from workflows.wdl_source_references import (
 
 PACKAGE_SLUG = "solid-tumor-tools"
 SOURCE_VERSION = "1.0.0"
-TARGET_VERSION = "1.0.1"
+TARGET_VERSION = "1.0.8"
 ASSET_SLUGS = ("solidtumorsingle", "solidtumorpair")
 
 INTEGRATE_XLS_DECLARATIONS = """        String fasta = "${reference}/${ref_version}.simp.fa"
@@ -49,22 +49,125 @@ INTEGRATE_XLS_DECLARATIONS = """        String fasta = "${reference}/${ref_versi
         String sv_rec2 = '{if($3!="-" && $6!="-")print}'
 """
 
+COLLECT_CLINVAR_COMPAT = """        python3 - ${anno_vcf} ${sample}.var.${ref_version}_multianno.vcf <<'PY'
+import sys
+
+required = ("ONCDN", "ONCDISDB", "ONCREVSTAT", "ONCSIG")
+present = set()
+with open(sys.argv[1], encoding="utf-8") as source, open(
+    sys.argv[2], "w", encoding="utf-8"
+) as target:
+    for line in source:
+        if line.startswith("##INFO=<ID="):
+            present.add(line.split("=", 2)[2].split(",", 1)[0])
+        if line.startswith("#CHROM"):
+            for key in required:
+                if key not in present:
+                    target.write(
+                        '##INFO=<ID=%s,Number=.,Type=String,Description="Unavailable in legacy ClinVar; compatibility placeholder">\\n'
+                        % key
+                    )
+        if line.startswith("#"):
+            target.write(line)
+            continue
+        columns = line.rstrip("\\n").split("\\t")
+        info = columns[7]
+        keys = set(item.split("=", 1)[0] for item in info.split(";"))
+        missing = [key for key in required if key not in keys]
+        if missing:
+            prefix = "" if info in ("", ".") else info + ";"
+            columns[7] = prefix + ";".join(key + "=." for key in missing)
+        target.write("\\t".join(columns) + "\\n")
+PY
+
+        cp /scripts/pre_select_v2.py pre_select_v2.compat.py && \\
+        python3 -c 'from pathlib import Path; p=Path("pre_select_v2.compat.py"); s=p.read_text(); old="            if val_tmp_transvar_input:\\n                try:\\n"; new="            if val_tmp_transvar_input:\\n                tsaa_list = None\\n                try:\\n"; assert s.count(old) == 1; p.write_text(s.replace(old, new, 1))' && \\
+
+        python3 - ${cnv_filter_genelist} cnv_filter.compat.xlsx <<'PY'
+import shutil
+import sys
+import zipfile
+
+import pandas as pd
+
+source, target = sys.argv[1:]
+if zipfile.is_zipfile(source):
+    shutil.copyfile(source, target)
+else:
+    with open(source, encoding="utf-8") as stream:
+        genes = [line.strip() for line in stream if line.strip()]
+    with pd.ExcelWriter(target) as writer:
+        pd.DataFrame(genes, columns=["cnv_gene"]).to_excel(
+            writer, sheet_name="cnvfilter_genelist", index=False
+        )
+        pd.DataFrame(columns=["cnv_keygene"]).to_excel(
+            writer, sheet_name="cnvfilter_keygenelist", index=False
+        )
+PY
+
+"""
+
 
 def corrected_rule_source(content: str) -> str:
     prefix, separator, integrate = content.partition("task IntegrateXls {")
     if not separator:
         raise CommandError("task/rule.wdl does not contain IntegrateXls.")
-    if "String key_site =" in integrate.split("command {", 1)[0]:
-        return content
-    marker = '    String modify_varanno = "${resource}/modify_VARAnnovar.xls"\n'
-    if marker not in integrate:
-        raise CommandError("IntegrateXls declaration anchor changed; refusing repair.")
-    integrate = integrate.replace(
-        marker,
-        marker + INTEGRATE_XLS_DECLARATIONS,
+    if "String key_site =" not in integrate.split("command {", 1)[0]:
+        marker = '    String modify_varanno = "${resource}/modify_VARAnnovar.xls"\n'
+        if marker not in integrate:
+            raise CommandError("IntegrateXls declaration anchor changed; refusing repair.")
+        integrate = integrate.replace(
+            marker,
+            marker + INTEGRATE_XLS_DECLARATIONS,
+            1,
+        )
+        content = prefix + separator + integrate
+
+    if "Unavailable in legacy ClinVar" not in content:
+        command_marker = "        python3 /scripts/pre_select_v2.py \\\n"
+        input_marker = "        -f ${anno_vcf} \\\n"
+        if command_marker not in content or input_marker not in content:
+            raise CommandError("Collect command anchor changed; refusing repair.")
+        content = content.replace(
+            command_marker,
+            COLLECT_CLINVAR_COMPAT + "        python3 pre_select_v2.compat.py \\\n",
+            1,
+        ).replace(
+            input_marker,
+            "        -f ${sample}.var.${ref_version}_multianno.vcf \\\n",
+            1,
+        )
+
+    collect, marker, remainder = content.partition("task IntegrateXls {")
+    fasta_marker = '        String fasta = "${reference}/${ref_version}.simp.fa"\n'
+    if "File fasta_fai" not in collect:
+        if fasta_marker not in collect:
+            raise CommandError("Collect FASTA declaration anchor changed; refusing repair.")
+        collect = collect.replace(
+            fasta_marker,
+            '        File fasta = "${reference}/${ref_version}.simp.fa"\n'
+            '        File fasta_fai = "${reference}/${ref_version}.simp.fa.fai"\n',
+            1,
+        )
+        config_marker = "        transvar config -k reference -v ${fasta} --refversion ${if (is_hg19) then \"hg19\" else \"hg38\"} && \\\n"
+        if config_marker not in collect:
+            raise CommandError("Collect transvar config anchor changed; refusing repair.")
+        collect = collect.replace(
+            config_marker,
+            "        test -r ${fasta} && test -r ${fasta_fai} && \\\n"
+            + config_marker,
+            1,
+        )
+    cnv_filter_marker = "            -cg ${cnv_filter_genelist} \\\n"
+    if cnv_filter_marker not in collect:
+        raise CommandError("Collect CNV filter argument anchor changed; refusing repair.")
+    collect = collect.replace(
+        cnv_filter_marker,
+        "            -cg ../cnv_filter.compat.xlsx \\\n",
         1,
     )
-    return prefix + separator + integrate
+    content = collect + marker + remainder
+    return content
 
 
 class Command(BaseCommand):
@@ -132,7 +235,7 @@ class Command(BaseCommand):
             digest=content_digest,
             source_repository=source.source_repository,
             source_revision=source.source_revision,
-            note="补齐 IntegrateXls 的资源声明，使工具包可被 miniwdl 静态加载。",
+            note="补齐旧版 ClinVar 字段，并兼容 transvar 回退与旧版 CNV 基因列表。",
             actor=actor,
             analysis=analysis,
         )
@@ -162,7 +265,7 @@ class Command(BaseCommand):
                 "digest": content_digest,
                 "file_count": len(files),
                 "task_count": analysis["summary"]["task_count"],
-                "reason": "analysis_runtime_preflight",
+                "reason": "legacy_clinvar_collect_compatibility",
             },
         )
         return version
@@ -184,7 +287,20 @@ class Command(BaseCommand):
         replaced = False
         specifications = []
         for specification in existing_specs:
-            if specification.package_version.id == source_version.id:
+            if (
+                specification.package_version.package_id == target_version.package_id
+                and specification.package_version.version
+                in {
+                    SOURCE_VERSION,
+                    "1.0.1",
+                    "1.0.2",
+                    "1.0.3",
+                    "1.0.4",
+                    "1.0.5",
+                    "1.0.6",
+                    "1.0.7",
+                }
+            ):
                 specifications.append(
                     PackageReferenceSpec(
                         package_version=target_version,
@@ -196,7 +312,9 @@ class Command(BaseCommand):
             else:
                 specifications.append(specification)
         if not replaced:
-            raise CommandError(f"{slug} does not reference {PACKAGE_SLUG}@{SOURCE_VERSION}.")
+            raise CommandError(
+                f"{slug} does not reference a migratable {PACKAGE_SLUG} version."
+            )
 
         local_files, entrypoint = _revision_files(latest)
         effective_files, _ = effective_package_files(local_files, specifications)
