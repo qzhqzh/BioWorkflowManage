@@ -79,6 +79,25 @@ GET    /api/v1/wdl-assets/{slug}/revisions/{version}
 POST   /api/v1/wdl-assets/{slug}/format
 ```
 
+修改资产信息时必须提交 GET 响应中的 `metadata_version` 作为
+`base_metadata_version`；保存源码新版本时必须提交当前 revision 的
+`version` 与 `digest` 作为 `base_version`、`base_digest`。缺少基线返回 428，基线过期
+返回 409，并附带最新资产或源码版本，客户端不得自动覆盖。
+
+### 并发写入契约升级
+
+迁移 `0013_wdl_asset_metadata_version` 启用后，上述基线字段由可选参数升级为必填参数。
+这是防止多用户互相覆盖的写入契约升级，后端与前端必须在同一发布窗口部署。升级前：
+
+1. 停止仍在调用 WDL 写接口的旧页面和脚本；
+2. 资产 PATCH 调用先 GET 资产并回传 `base_metadata_version`；
+3. revision POST 调用先 GET 当前版本并回传 `base_version`、`base_digest`；
+4. 客户端对 409 保留本地内容并要求合并，对 428 视为旧调用方尚未升级；
+5. 部署后分别执行一次元数据保存和源码保存冒烟测试，再恢复其他调用方。
+
+仓库内工作台已使用新契约。外部脚本不能跨过 428 自动重试，否则会重新引入
+last-write-wins；必须读取最新基线后由用户确认合并。
+
 API 继续支持关键字、标签和生命周期筛选，当前页面只保留关键字和标签。导入允许
 暂时无法解析的旧 WDL 入库，诊断会随导入版本一起保存；格式化和后续版本保存仍要求
 源码可解析。

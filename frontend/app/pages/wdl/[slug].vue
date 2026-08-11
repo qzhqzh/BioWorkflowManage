@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { createTwoFilesPatch } from 'diff'
+import { createTwoFilesPatch, diffArrays } from 'diff'
 import AppRail from '~/components/layout/AppRail.vue'
 import AppTopbar from '~/components/layout/AppTopbar.vue'
 import WdlCodeEditor from '~/components/wdl/WdlCodeEditor.vue'
@@ -27,6 +27,22 @@ type MetadataField = 'name' | 'description'
 type MetadataPatch = Partial<Pick<WdlAsset, 'name' | 'description' | 'tags'>> & {
   note: string
 }
+type RevisionConflict = {
+  currentRevision: WdlSourceRevision
+  actor?: string | null
+  note?: string
+  updatedAt?: string | null
+}
+type MetadataConflict = {
+  actor?: string | null
+  note?: string
+  updatedAt?: string | null
+}
+type LineChange = {
+  start: number
+  end: number
+  replacement: string[]
+}
 
 const route = useRoute()
 const slug = computed(() => String(route.params.slug))
@@ -51,10 +67,15 @@ const loadState = ref<'loading' | 'ready' | 'error'>('loading')
 const saveState = ref<'idle' | 'saving' | 'saved' | 'error'>('idle')
 const metadataState = ref<'idle' | 'saving' | 'saved' | 'error'>('idle')
 const feedback = ref('')
+const revisionConflict = ref<RevisionConflict>()
+const metadataConflict = ref<MetadataConflict>()
 const codeEditor = ref<WdlCodeEditorHandle>()
 const assetNameInput = ref<HTMLInputElement>()
 const assetDescriptionInput = ref<HTMLTextAreaElement>()
+const revisionNoteInput = ref<HTMLInputElement>()
 let metadataSaveQueue = Promise.resolve()
+let metadataQueueGeneration = 0
+const metadataQueueBlocked = ref(false)
 
 const activeSourceFile = computed(() =>
   sourceFiles.value.find(file => file.path === activeFilePath.value),
@@ -88,6 +109,10 @@ const referencesDirty = computed(() =>
   !== JSON.stringify(basePackageReferences.value.map(referenceKey).sort()),
 )
 const dirty = computed(() => dirtyPaths.value.length > 0 || referencesDirty.value)
+const mergeConflictPaths = computed(() => sourceFiles.value
+  .filter(file => !file.read_only)
+  .map(file => file.path)
+  .filter(path => (fileContents.value[path] ?? '').includes('<<<<<<< 本地草稿')))
 const isRawImportedRevision = computed(
   () => selectedRevision.value?.operation === 'import' && !dirty.value,
 )
@@ -149,6 +174,104 @@ function referenceLabel(reference: WdlSourcePackageReference) {
   return `${reference.package_slug}@${reference.version} → ${reference.mount_prefix || '.'}`
 }
 
+function sourceFileReferenceKey(file: WdlSourceFile) {
+  const reference = file.package_reference
+  if (!reference) return ''
+  return [
+    reference.package_slug,
+    reference.version,
+    reference.digest,
+    reference.mount_prefix,
+  ].join(':')
+}
+
+function formatConflictTimestamp(value?: string | null) {
+  if (!value) return ''
+  return new Date(value).toLocaleString('zh-CN', { hour12: false })
+}
+
+function lineChanges(base: string[], next: string[]): LineChange[] {
+  const changes: LineChange[] = []
+  const parts = diffArrays(base, next)
+  let baseIndex = 0
+  let partIndex = 0
+  while (partIndex < parts.length) {
+    const part = parts[partIndex]!
+    if (!part.added && !part.removed) {
+      baseIndex += part.value.length
+      partIndex += 1
+      continue
+    }
+    const start = baseIndex
+    const replacement: string[] = []
+    while (partIndex < parts.length) {
+      const changed = parts[partIndex]!
+      if (!changed.added && !changed.removed) break
+      if (changed.removed) baseIndex += changed.value.length
+      if (changed.added) replacement.push(...changed.value)
+      partIndex += 1
+    }
+    changes.push({ start, end: baseIndex, replacement })
+  }
+  return changes
+}
+
+function sameLineChange(left: LineChange, right: LineChange) {
+  return left.start === right.start
+    && left.end === right.end
+    && JSON.stringify(left.replacement) === JSON.stringify(right.replacement)
+}
+
+function lineChangesOverlap(left: LineChange, right: LineChange) {
+  if (left.start === left.end && right.start === right.end) {
+    return left.start === right.start
+  }
+  if (left.start === left.end) {
+    return left.start >= right.start && left.start < right.end
+  }
+  if (right.start === right.end) {
+    return right.start >= left.start && right.start < left.end
+  }
+  return Math.max(left.start, right.start) < Math.min(left.end, right.end)
+}
+
+function mergeWdlContent(base: string, local: string, latest: string) {
+  if (local === latest) return { content: local, conflicted: false }
+  if (local === base) return { content: latest, conflicted: false }
+  if (latest === base) return { content: local, conflicted: false }
+
+  const baseLines = base.split('\n')
+  const localChanges = lineChanges(baseLines, local.split('\n'))
+  const latestChanges = lineChanges(baseLines, latest.split('\n'))
+  const conflicted = localChanges.some(localChange => latestChanges.some(
+    latestChange => lineChangesOverlap(localChange, latestChange)
+      && !sameLineChange(localChange, latestChange),
+  ))
+  if (conflicted) {
+    return {
+      content: [
+        '<<<<<<< 本地草稿',
+        local,
+        '||||||| 原基线',
+        base,
+        '=======',
+        latest,
+        '>>>>>>> 最新版本',
+      ].join('\n'),
+      conflicted: true,
+    }
+  }
+
+  const merged = [...baseLines]
+  const changes = [...localChanges, ...latestChanges]
+    .filter((change, index, all) => all.findIndex(item => sameLineChange(item, change)) === index)
+    .sort((left, right) => right.start - left.start)
+  for (const change of changes) {
+    merged.splice(change.start, change.end - change.start, ...change.replacement)
+  }
+  return { content: merged.join('\n'), conflicted: false }
+}
+
 function referenceRequestPayload() {
   return packageReferences.value.map(reference => ({
     package_slug: reference.package_slug,
@@ -203,6 +326,7 @@ function applyRevision(revision: WdlSourceRevision) {
     || ''
   pendingOperation.value = 'edit'
   revisionNote.value = ''
+  revisionConflict.value = undefined
   feedback.value = ''
   if (inspectorTab.value === 'diff') inspectorTab.value = 'structure'
 }
@@ -279,6 +403,17 @@ async function formatSource() {
 
 async function saveRevision() {
   if (!dirty.value || isHistoricalRevision.value) return
+  if (mergeConflictPaths.value.length) {
+    saveState.value = 'error'
+    feedback.value = `请先处理冲突标记：${mergeConflictPaths.value.join('、')}`
+    return
+  }
+  if (!revisionNote.value.trim()) {
+    saveState.value = 'error'
+    feedback.value = '请先填写本次修改备注。'
+    void nextTick(() => revisionNoteInput.value?.focus())
+    return
+  }
   saveState.value = 'saving'
   feedback.value = ''
   try {
@@ -292,24 +427,199 @@ async function saveRevision() {
           entrypoint: selectedRevision.value?.entrypoint || asset.value?.source_filename,
           operation: pendingOperation.value,
           note: revisionNote.value.trim(),
+          base_version: selectedRevision.value?.version,
+          base_digest: selectedRevision.value?.digest,
         },
       },
     )
-    await loadAsset()
+    syncCurrentRevision(revision)
     applyRevision(revision)
+    let visibleRevision = revision
+    try {
+      const refreshed = await $fetch<WdlAsset>(
+        `/api/v1/wdl-assets/${encodeURIComponent(slug.value)}`,
+      )
+      asset.value = refreshed
+      selectedEvent.value = refreshed.audit_events?.[0]
+      if (
+        refreshed.current_revision
+        && refreshed.current_revision.version >= revision.version
+      ) {
+        visibleRevision = refreshed.current_revision
+        applyRevision(visibleRevision)
+      }
+    } catch {
+      // The immutable revision is already saved; keep it usable if refresh fails.
+    }
     saveState.value = 'saved'
-    feedback.value = `WDL v${revision.version} 已保存并写入操作历史。`
+    feedback.value = visibleRevision.version > revision.version
+      ? `WDL v${revision.version} 已保存；已载入最新版本 v${visibleRevision.version}。`
+      : `WDL v${revision.version} 已保存并写入操作历史。`
     window.setTimeout(() => {
       if (saveState.value === 'saved') saveState.value = 'idle'
     }, 2200)
   } catch (error: any) {
     saveState.value = 'error'
+    if (
+      error?.data?.error?.code === 'WDL_REVISION_CONFLICT'
+      && error.data.current_revision
+    ) {
+      revisionConflict.value = {
+        currentRevision: error.data.current_revision,
+        actor: error.data.error.details?.actor,
+        note: error.data.error.details?.note,
+        updatedAt: error.data.error.details?.updated_at,
+      }
+      inspectorTab.value = 'diff'
+      feedback.value = ''
+      return
+    }
     feedback.value = error?.data?.error?.message ?? 'WDL 版本保存失败。'
   }
 }
 
-function beginMetadataEdit(field: MetadataField) {
+function syncCurrentRevision(revision: WdlSourceRevision) {
   if (!asset.value) return
+  const revisions = [
+    revision,
+    ...(asset.value.revisions ?? []).filter(item => item.version !== revision.version),
+  ].sort((left, right) => right.version - left.version)
+  asset.value = {
+    ...asset.value,
+    current_revision: revision,
+    revision_count: Math.max(asset.value.revision_count, revision.version),
+    revisions,
+  }
+}
+
+async function refreshAssetAudit() {
+  if (!asset.value) return
+  try {
+    const refreshed = await $fetch<WdlAsset>(
+      `/api/v1/wdl-assets/${encodeURIComponent(slug.value)}`,
+    )
+    asset.value = {
+      ...asset.value,
+      audit_events: refreshed.audit_events,
+    }
+    selectedEvent.value = refreshed.audit_events?.[0]
+  } catch {
+    // Source state is already synchronized; history can refresh on the next load.
+  }
+}
+
+function loadConflictRevision() {
+  const latest = revisionConflict.value?.currentRevision
+  if (!latest) return
+  if (!window.confirm('载入最新版本会丢弃当前本地草稿，继续吗？')) return
+  syncCurrentRevision(latest)
+  applyRevision(latest)
+  saveState.value = 'idle'
+  feedback.value = `已载入最新版本 v${latest.version}。`
+  void refreshAssetAudit()
+}
+
+function rebaseConflictDraft() {
+  const latest = revisionConflict.value?.currentRevision
+  if (!latest) return
+  const draftFiles = sourceFiles.value.map(file => ({ ...file }))
+  const draftContents = { ...fileContents.value }
+  const draftBaseContents = { ...baseFileContents.value }
+  const draftDirtyPaths = [...dirtyPaths.value]
+  const draftReferences = packageReferences.value.map(reference => ({
+    ...reference,
+    files: reference.files.map(file => ({ ...file })),
+  }))
+  const draftBaseReferences = basePackageReferences.value.map(reference => ({
+    ...reference,
+    files: reference.files.map(file => ({ ...file })),
+  }))
+  const draftActivePath = activeFilePath.value
+  const draftReferencesDirty = referencesDirty.value
+  const draftOperation = pendingOperation.value
+  const draftNote = revisionNote.value
+
+  syncCurrentRevision(latest)
+  applyRevision(latest)
+  for (const path of draftDirtyPaths) {
+    const draftFile = draftFiles.find(file => file.path === path)
+    if (draftFile && !sourceFiles.value.some(file => file.path === path)) {
+      sourceFiles.value = [...sourceFiles.value, draftFile]
+    }
+    const merged = mergeWdlContent(
+      draftBaseContents[path] ?? '',
+      draftContents[path] ?? '',
+      fileContents.value[path] ?? '',
+    )
+    fileContents.value[path] = merged.content
+  }
+  if (draftReferencesDirty) {
+    const draftReferenceKeys = new Set(draftReferences.map(referenceKey))
+    const locallyRemovedKeys = new Set(
+      draftBaseReferences
+        .map(referenceKey)
+        .filter(key => !draftReferenceKeys.has(key)),
+    )
+    if (locallyRemovedKeys.size) {
+      packageReferences.value = packageReferences.value.filter(
+        reference => !locallyRemovedKeys.has(referenceKey(reference)),
+      )
+      sourceFiles.value = sourceFiles.value.filter(
+        file => !locallyRemovedKeys.has(sourceFileReferenceKey(file)),
+      )
+    }
+    const occupiedFiles = new Map(sourceFiles.value.map(file => [file.path, file.digest]))
+    const draftBaseReferenceKeys = new Set(draftBaseReferences.map(referenceKey))
+    for (const reference of draftReferences) {
+      if (draftBaseReferenceKeys.has(referenceKey(reference))) continue
+      if (packageReferences.value.some(item => referenceKey(item) === referenceKey(reference))) {
+        continue
+      }
+      const referenceFiles = draftFiles.filter(
+        file => file.package_reference
+          && file.package_reference.package_slug === reference.package_slug
+          && file.package_reference.version === reference.version
+          && file.package_reference.mount_prefix === reference.mount_prefix,
+      )
+      const pathConflict = referenceFiles.some(
+        file => occupiedFiles.has(file.path) && occupiedFiles.get(file.path) !== file.digest,
+      )
+      if (pathConflict) {
+        const entrypoint = selectedRevision.value?.entrypoint || activeFilePath.value
+        fileContents.value[entrypoint] = [
+          '<<<<<<< 本地草稿：工具包引用冲突',
+          fileContents.value[entrypoint] ?? '',
+          '=======',
+          '# 请调整工具包挂载目录后删除冲突标记',
+          '>>>>>>> 最新版本',
+        ].join('\n')
+        continue
+      }
+      const newReferenceFiles = referenceFiles.filter(file => !occupiedFiles.has(file.path))
+      packageReferences.value = [...packageReferences.value, reference]
+      sourceFiles.value = [...sourceFiles.value, ...newReferenceFiles]
+      for (const file of newReferenceFiles) {
+        fileContents.value[file.path] = file.content ?? ''
+        occupiedFiles.set(file.path, file.digest)
+      }
+    }
+  }
+  activeFilePath.value = sourceFiles.value.some(file => file.path === draftActivePath)
+    ? draftActivePath
+    : activeFilePath.value
+  pendingOperation.value = draftOperation
+  revisionNote.value = draftNote
+  revisionConflict.value = undefined
+  inspectorTab.value = 'diff'
+  saveState.value = 'idle'
+  feedback.value = mergeConflictPaths.value.length
+    ? `已合并 v${latest.version}；${mergeConflictPaths.value.join('、')} 需要手动处理冲突标记。`
+    : `已合并 v${latest.version} 的更新并保留本地修改。请检查差异后保存。`
+  void refreshAssetAudit()
+}
+
+function beginMetadataEdit(field: MetadataField) {
+  if (!asset.value || metadataQueueBlocked.value) return
   editingMetadataField.value = field
   if (field === 'name') {
     assetNameDraft.value = asset.value.name
@@ -336,13 +646,24 @@ async function refreshTagPool() {
   }
 }
 
-function queueMetadataPatch(body: MetadataPatch, successMessage: string) {
+function queueMetadataPatch(
+  buildBody: (current: WdlAsset) => MetadataPatch,
+  successMessage: string,
+) {
+  const generation = metadataQueueGeneration
   let resolveResult: (saved: boolean) => void = () => undefined
   const result = new Promise<boolean>((resolve) => {
     resolveResult = resolve
   })
   metadataSaveQueue = metadataSaveQueue.then(async () => {
-    const saved = await saveMetadataPatch(body, successMessage)
+    if (!asset.value || metadataQueueBlocked.value || generation !== metadataQueueGeneration) {
+      resolveResult(false)
+      return
+    }
+    const saved = await saveMetadataPatch(
+      buildBody(asset.value),
+      successMessage,
+    )
     resolveResult(saved)
   })
   return result
@@ -356,20 +677,46 @@ async function saveMetadataPatch(body: MetadataPatch, successMessage: string) {
       `/api/v1/wdl-assets/${encodeURIComponent(slug.value)}`,
       {
         method: 'PATCH',
-        body,
+        body: {
+          ...body,
+          base_metadata_version: asset.value.metadata_version,
+        },
       },
     )
     asset.value = updated
     selectedEvent.value = updated.audit_events?.[0]
+    metadataConflict.value = undefined
     metadataState.value = 'saved'
     feedback.value = successMessage
     if (body.tags) await refreshTagPool()
     return true
-  } catch {
+  } catch (error: any) {
     metadataState.value = 'error'
+    if (
+      error?.data?.error?.code === 'WDL_METADATA_CONFLICT'
+      && error.data.current_asset
+    ) {
+      asset.value = error.data.current_asset
+      selectedEvent.value = error.data.current_asset.audit_events?.[0]
+      metadataConflict.value = {
+        actor: error.data.error.details?.actor,
+        note: error.data.error.details?.note,
+        updatedAt: error.data.error.details?.updated_at,
+      }
+      metadataQueueBlocked.value = true
+      metadataQueueGeneration += 1
+      feedback.value = ''
+      return false
+    }
     feedback.value = 'WDL 信息自动保存失败，请重试。'
     return false
   }
+}
+
+function resumeMetadataEditing() {
+  metadataQueueBlocked.value = false
+  metadataConflict.value = undefined
+  metadataState.value = 'idle'
 }
 
 async function commitMetadataEdit(field: MetadataField) {
@@ -385,13 +732,11 @@ async function commitMetadataEdit(field: MetadataField) {
   }
   if (value === original) return
 
-  asset.value = { ...asset.value, [field]: value }
   const fieldLabel = field === 'name' ? '标题' : '说明'
-  const saved = await queueMetadataPatch(
-    { [field]: value, note: `自动更新${fieldLabel}` },
+  await queueMetadataPatch(
+    () => ({ [field]: value, note: `自动更新${fieldLabel}` }),
     `${fieldLabel}已自动保存。`,
   )
-  if (!saved && asset.value) asset.value = { ...asset.value, [field]: original }
 }
 
 function isTagSelected(name: string) {
@@ -399,21 +744,22 @@ function isTagSelected(name: string) {
 }
 
 async function addTag(name: string) {
-  if (!asset.value) return
+  if (!asset.value || metadataQueueBlocked.value) return
   const trimmed = name.trim()
   tagDraft.value = ''
   if (!trimmed || isTagSelected(trimmed)) return
   const canonical = availableTags.value.find(
     tag => tag.name.toLocaleLowerCase() === trimmed.toLocaleLowerCase(),
   )?.name ?? trimmed
-  const previousTags = [...asset.value.tags]
-  const tags = [...previousTags, canonical]
-  asset.value = { ...asset.value, tags }
-  const saved = await queueMetadataPatch(
-    { tags, note: `添加标签 ${canonical}` },
+  await queueMetadataPatch(
+    current => ({
+      tags: current.tags.some(
+        tag => tag.toLocaleLowerCase() === canonical.toLocaleLowerCase(),
+      ) ? current.tags : [...current.tags, canonical],
+      note: `添加标签 ${canonical}`,
+    }),
     `标签“${canonical}”已自动保存。`,
   )
-  if (!saved && asset.value) asset.value = { ...asset.value, tags: previousTags }
 }
 
 function commitTagDraft() {
@@ -429,14 +775,13 @@ function blurCurrentTarget(event: Event) {
 
 async function removeTag(name: string) {
   if (!asset.value) return
-  const previousTags = [...asset.value.tags]
-  const tags = previousTags.filter(tag => tag !== name)
-  asset.value = { ...asset.value, tags }
-  const saved = await queueMetadataPatch(
-    { tags, note: `移除标签 ${name}` },
+  await queueMetadataPatch(
+    current => ({
+      tags: current.tags.filter(tag => tag !== name),
+      note: `移除标签 ${name}`,
+    }),
     `标签“${name}”已移除。`,
   )
-  if (!saved && asset.value) asset.value = { ...asset.value, tags: previousTags }
 }
 
 function exportTimestamp(date = new Date()) {
@@ -778,6 +1123,23 @@ onBeforeRouteLeave(() => {
           />
         </div>
 
+        <div
+          v-if="metadataConflict"
+          class="wdl-metadata-conflict"
+          role="alert"
+        >
+          <strong>信息已更新</strong>
+          <p>
+            {{ metadataConflict.actor || '其他用户' }}
+            <template v-if="metadataConflict.updatedAt">
+              · {{ formatConflictTimestamp(metadataConflict.updatedAt) }}
+            </template>
+            已保存新内容；当前页面已载入最新版，本次修改未保存。
+          </p>
+          <small v-if="metadataConflict.note">备注：{{ metadataConflict.note }}</small>
+          <button type="button" @click="resumeMetadataEditing">继续编辑</button>
+        </div>
+
         <section class="wdl-sidebar-section">
           <h2>标签</h2>
           <div class="field wdl-tag-field">
@@ -788,7 +1150,7 @@ onBeforeRouteLeave(() => {
                   <button
                     type="button"
                     :aria-label="`移除标签 ${tag}`"
-                    :disabled="metadataState === 'saving'"
+                    :disabled="metadataState === 'saving' || metadataQueueBlocked"
                     @click="removeTag(tag)"
                   >
                     ×
@@ -800,6 +1162,7 @@ onBeforeRouteLeave(() => {
                 aria-label="添加标签"
                 maxlength="64"
                 placeholder="输入一个标签"
+                :disabled="metadataQueueBlocked"
                 @blur="commitTagDraft"
                 @keydown.enter.prevent="blurCurrentTarget"
                 @keydown.esc.prevent="tagDraft = ''"
@@ -812,7 +1175,7 @@ onBeforeRouteLeave(() => {
               v-for="tag in popularTags"
               :key="tag.name"
               type="button"
-              :disabled="isTagSelected(tag.name) || metadataState === 'saving'"
+              :disabled="isTagSelected(tag.name) || metadataState === 'saving' || metadataQueueBlocked"
               @click="addTag(tag.name)"
             >
               {{ isTagSelected(tag.name) ? '✓' : '+' }} {{ tag.name }}
@@ -911,6 +1274,33 @@ onBeforeRouteLeave(() => {
           </div>
         </div>
 
+        <section
+          v-if="revisionConflict"
+          class="wdl-revision-conflict"
+          role="alert"
+          aria-live="assertive"
+        >
+          <div>
+            <strong>已有更新版本 v{{ revisionConflict.currentRevision.version }}</strong>
+            <p>
+              {{ revisionConflict.actor || revisionConflict.currentRevision.actor || '其他用户' }}
+              <template v-if="revisionConflict.updatedAt">
+                · {{ formatConflictTimestamp(revisionConflict.updatedAt) }}
+              </template>
+              已保存新版本。本地草稿仍在编辑器中，没有被覆盖。
+            </p>
+            <small v-if="revisionConflict.note">备注：{{ revisionConflict.note }}</small>
+          </div>
+          <div class="wdl-revision-conflict__actions">
+            <button class="button button--ghost" type="button" @click="loadConflictRevision">
+              载入最新版本
+            </button>
+            <button class="button button--primary" type="button" @click="rebaseConflictDraft">
+              保留草稿并对比
+            </button>
+          </div>
+        </section>
+
         <ClientOnly>
           <WdlCodeEditor
             ref="codeEditor"
@@ -930,9 +1320,14 @@ onBeforeRouteLeave(() => {
           <label class="field">
             <span>本次修改备注</span>
             <input
+              ref="revisionNoteInput"
               v-model="revisionNote"
+              :aria-invalid="dirty && !revisionNote.trim()"
               placeholder="说明改了什么、为什么改；保存后进入操作历史"
             />
+            <small v-if="dirty && !revisionNote.trim()" class="field-error">
+              保存新版本前需要填写备注。
+            </small>
           </label>
         </div>
       </section>

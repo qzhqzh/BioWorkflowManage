@@ -84,7 +84,10 @@ function analysis(version = '1.0') {
   }
 }
 
-async function mockWdlApi(page: Page) {
+async function mockWdlApi(page: Page, options: {
+  conflictOnFirstRevisionSave?: boolean
+  conflictOnFirstMetadataSave?: boolean
+} = {}) {
   await page.route('**/api/v1/auth/me', route => route.fulfill({
     status: 200,
     contentType: 'application/json',
@@ -97,10 +100,23 @@ async function mockWdlApi(page: Page) {
   }))
   let revisionVersion = 1
   let revisionContent = source
+  let revisionExtraFiles: Array<{
+    path: string
+    digest: string
+    is_entry: boolean
+    content: string
+  }> = []
   let assetName = '实体瘤 WES hg38'
   let assetDescription = '生产环境使用的实体瘤分析流程'
   let lifecycle = 'active'
   let tags = ['实体瘤', 'hg38']
+  let metadataVersion = 1
+  let revisionActor = 'local-user'
+  let revisionNote = '从生产目录导入'
+  let revisionOperation = 'import'
+  let revisionCreatedAt = '2026-07-29T10:00:00Z'
+  let conflictOnNextRevisionSave = options.conflictOnFirstRevisionSave ?? false
+  let conflictOnNextMetadataSave = options.conflictOnFirstMetadataSave ?? false
   const tagPool = [
     { id: 1, name: '实体瘤', asset_count: 1 },
     { id: 2, name: 'hg38', asset_count: 1 },
@@ -108,6 +124,7 @@ async function mockWdlApi(page: Page) {
     { id: 4, name: 'wes', asset_count: 0 },
   ]
   const metadataRequests: Record<string, unknown>[] = []
+  const revisionRequests: Record<string, any>[] = []
   const tagRequests: Array<{ method: string; id: number; name?: string }> = []
   let events = [{
     id: 1,
@@ -122,13 +139,13 @@ async function mockWdlApi(page: Page) {
 
   const currentRevision = () => ({
     version: revisionVersion,
-    operation: revisionVersion === 1 ? 'import' : 'format',
+    operation: revisionOperation,
     digest: `sha256:${'a'.repeat(54)}${revisionVersion.toString().padStart(10, '0')}`,
     diff: revisionVersion === 1 ? '' : '@@ -4,3 +4,3 @@',
-    note: revisionVersion === 1 ? '从生产目录导入' : '统一格式',
-    actor: 'local-user',
+    note: revisionNote,
+    actor: revisionActor,
     analysis: analysis(),
-    created_at: revisionVersion === 1 ? '2026-07-29T10:00:00Z' : '2026-07-29T11:00:00Z',
+    created_at: revisionCreatedAt,
     content: revisionContent,
     entrypoint: 'solid-tumor.wdl',
     files: [{
@@ -136,7 +153,7 @@ async function mockWdlApi(page: Page) {
       digest: `sha256:${'a'.repeat(54)}${revisionVersion.toString().padStart(10, '0')}`,
       is_entry: true,
       content: revisionContent,
-    }],
+    }, ...revisionExtraFiles],
   })
 
   const asset = () => ({
@@ -147,6 +164,7 @@ async function mockWdlApi(page: Page) {
     source_repository: '',
     source_revision: '',
     lifecycle,
+    metadata_version: metadataVersion,
     tags,
     created_by: 'local-user',
     created_at: '2026-07-29T10:00:00Z',
@@ -253,17 +271,67 @@ async function mockWdlApi(page: Page) {
 
   await page.route('**/api/v1/wdl-assets/solid-tumor-hg38/revisions', async (route) => {
     if (route.request().method() !== 'POST') return route.fallback()
-    revisionVersion = 2
-    revisionContent = formattedSource
+    const body = route.request().postDataJSON() as Record<string, any>
+    revisionRequests.push(body)
+    if (conflictOnNextRevisionSave) {
+      conflictOnNextRevisionSave = false
+      revisionVersion = 2
+      revisionContent = source
+        .replace(`${sourcePadding}\n\n`, `${sourcePadding}\n\nimport "shared-task.wdl" as shared\n\n`)
+        .replace('name = "world"', 'name = "shared-world"')
+      revisionExtraFiles = [{
+        path: 'shared-task.wdl',
+        digest: `sha256:${'e'.repeat(64)}`,
+        is_entry: false,
+        content: 'version 1.0\n\ntask shared_task {\n  command <<< echo shared >>>\n}\n',
+      }]
+      revisionActor = 'chaohuaiyu'
+      revisionNote = '调整共享流程默认输入'
+      revisionOperation = 'edit'
+      revisionCreatedAt = '2026-07-29T10:30:00Z'
+      events = [{
+        id: 2,
+        action: 'edit',
+        actor: revisionActor,
+        note: revisionNote,
+        changes: {},
+        diff: '@@ -4,3 +4,3 @@',
+        revision: revisionVersion,
+        created_at: revisionCreatedAt,
+      }, ...events]
+      await route.fulfill({
+        status: 409,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          error: {
+            code: 'WDL_REVISION_CONFLICT',
+            message: 'WDL 源码已产生新版本，本地草稿未被覆盖。',
+            details: {
+              actor: revisionActor,
+              note: revisionNote,
+              updated_at: revisionCreatedAt,
+            },
+          },
+          current_revision: currentRevision(),
+        }),
+      })
+      return
+    }
+    revisionVersion += 1
+    revisionContent = body.files?.[0]?.content ?? body.content ?? formattedSource
+    revisionActor = 'zhuqin'
+    revisionNote = String(body.note ?? '')
+    revisionOperation = body.operation ?? 'edit'
+    revisionCreatedAt = '2026-07-29T11:00:00Z'
     events = [{
       id: 2,
-      action: 'format',
-      actor: 'local-user',
-      note: '统一格式',
-      changes: { revision: { before: 1, after: 2 } },
+      action: revisionOperation,
+      actor: revisionActor,
+      note: revisionNote,
+      changes: { revision: { before: revisionVersion - 1, after: revisionVersion } },
       diff: '@@ -4,8 +4,8 @@\n-input {\n+  input {\n',
-      revision: 2,
-      created_at: '2026-07-29T11:00:00Z',
+      revision: revisionVersion,
+      created_at: revisionCreatedAt,
     }, ...events]
     await route.fulfill({
       status: 201,
@@ -276,6 +344,39 @@ async function mockWdlApi(page: Page) {
     if (route.request().method() === 'PATCH') {
       const body = route.request().postDataJSON() as Record<string, unknown>
       metadataRequests.push(body)
+      if (conflictOnNextMetadataSave) {
+        conflictOnNextMetadataSave = false
+        await new Promise(resolve => setTimeout(resolve, 200))
+        assetName = '实体瘤 WES hg38 共享版'
+        metadataVersion += 1
+        events = [{
+          id: events[0].id + 1,
+          action: 'metadata_update',
+          actor: 'chaohuaiyu',
+          note: '统一流程命名',
+          changes: { name: { before: '实体瘤 WES hg38', after: assetName } },
+          diff: '',
+          revision: null,
+          created_at: '2026-07-29T11:30:00Z',
+        }, ...events]
+        await route.fulfill({
+          status: 409,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            error: {
+              code: 'WDL_METADATA_CONFLICT',
+              message: 'WDL 信息已被其他用户更新，请查看最新内容后重试。',
+              details: {
+                actor: 'chaohuaiyu',
+                note: '统一流程命名',
+                updated_at: '2026-07-29T11:30:00Z',
+              },
+            },
+            current_asset: asset(),
+          }),
+        })
+        return
+      }
       const changes: Record<string, { before: unknown; after: unknown }> = {}
       if (typeof body.name === 'string') {
         changes.name = { before: assetName, after: body.name }
@@ -306,6 +407,7 @@ async function mockWdlApi(page: Page) {
         changes.tags = { before: tags, after: canonicalTags }
         tags = canonicalTags
       }
+      if (Object.keys(changes).length) metadataVersion += 1
       events = [{
         id: events[0].id + 1,
         action: 'metadata_update',
@@ -332,7 +434,7 @@ async function mockWdlApi(page: Page) {
     })
   })
 
-  return { metadataRequests, tagRequests }
+  return { metadataRequests, revisionRequests, tagRequests }
 }
 
 test('references a fixed tool-package version without copying package files into the revision', async ({ page }) => {
@@ -601,6 +703,48 @@ test('shows manual edits in the change panel before save', async ({ page }) => {
   await expect(page.locator('.diff-line--add').filter({ hasText: '# manual change' })).toBeVisible()
 })
 
+test('keeps a local draft when another user saves first and rebases it explicitly', async ({ page }) => {
+  const api = await mockWdlApi(page, { conflictOnFirstRevisionSave: true })
+  await page.goto('/wdl/solid-tumor-hg38')
+  await expect(page.locator('.monaco-editor')).toBeVisible({ timeout: 15_000 })
+
+  const editorInput = page.locator('.monaco-editor textarea.inputarea')
+  await editorInput.focus()
+  await page.keyboard.press('Control+End')
+  await page.keyboard.press('Enter')
+  await page.keyboard.insertText('# local collaboration draft')
+
+  await page.keyboard.press('Control+S')
+  await expect(page.getByText('请先填写本次修改备注。')).toBeVisible()
+  await page.getByLabel('本次修改备注').fill('补充协作说明')
+  await page.keyboard.press('Control+S')
+
+  const conflict = page.locator('.wdl-revision-conflict')
+  await expect(conflict).toContainText('已有更新版本 v2')
+  await expect(conflict).toContainText('chaohuaiyu')
+  await expect(conflict).toContainText('调整共享流程默认输入')
+  await expect(conflict).toContainText('本地草稿仍在编辑器中')
+  await expect(page.locator('.diff-line--add').filter({ hasText: '# local collaboration draft' })).toBeVisible()
+
+  await page.getByRole('button', { name: '保留草稿并对比' }).click()
+  await expect(conflict).toBeHidden()
+  await expect(page.getByText('已合并 v2 的更新并保留本地修改。请检查差异后保存。')).toBeVisible()
+  await expect(page.locator('.diff-line--add').filter({ hasText: '# local collaboration draft' })).toBeVisible()
+
+  await page.getByRole('tab', { name: '历史' }).click()
+  await expect(page.getByText('调整共享流程默认输入')).toBeVisible()
+  await page.getByRole('tab', { name: '变更' }).click()
+
+  await page.keyboard.press('Control+S')
+  await expect(page.getByText('WDL v3 已保存并写入操作历史。')).toBeVisible()
+  expect(api.revisionRequests).toHaveLength(2)
+  expect(api.revisionRequests[1]!.files[0].content).toContain('name = "shared-world"')
+  expect(api.revisionRequests[1]!.files[0].content).toContain('# local collaboration draft')
+  expect(api.revisionRequests[1]!.files).toEqual(expect.arrayContaining([
+    expect.objectContaining({ path: 'shared-task.wdl' }),
+  ]))
+})
+
 test('exports WDL with asset name, version, timestamp, and shortcut', async ({ page }) => {
   await mockWdlApi(page)
   await page.goto('/wdl/solid-tumor-hg38')
@@ -629,6 +773,7 @@ test('edits WDL title and description inline and saves each field on blur', asyn
   await expect.poll(
     () => api.metadataRequests.filter(request => 'name' in request).length,
   ).toBe(1)
+  expect(api.metadataRequests[0].base_metadata_version).toBe(1)
 
   const description = page.locator('.inline-metadata-value--description')
   await description.dblclick()
@@ -638,12 +783,42 @@ test('edits WDL title and description inline and saves each field on blur', asyn
   await expect.poll(
     () => api.metadataRequests.filter(request => 'description' in request).length,
   ).toBe(1)
+  expect(api.metadataRequests[1].base_metadata_version).toBe(2)
 
   await page.reload()
   await expect(page.locator('.wdl-asset-heading h1')).toHaveText(/实体瘤 WES hg38 v2/)
   await expect(page.locator('.inline-metadata-value--description')).toHaveText(
     /升级后的生产分析流程/,
   )
+})
+
+test('loads the latest metadata when another user updates it first', async ({ page }) => {
+  const api = await mockWdlApi(page, { conflictOnFirstMetadataSave: true })
+  await page.goto('/wdl/solid-tumor-hg38')
+  await expect(page.locator('.wdl-asset-heading h1')).toHaveText('实体瘤 WES hg38')
+
+  await page.locator('.wdl-asset-heading h1').dblclick()
+  await page.getByLabel('WDL 标题').fill('本地过期标题')
+  const tagInput = page.getByLabel('添加标签')
+  await tagInput.evaluate((element) => {
+    const input = element as HTMLInputElement
+    input.focus()
+    input.value = 'WES'
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+    input.blur()
+  })
+
+  const conflict = page.locator('.wdl-metadata-conflict')
+  await expect(conflict).toContainText('信息已更新')
+  await expect(conflict).toContainText('chaohuaiyu')
+  await expect(conflict).toContainText('统一流程命名')
+  await expect(conflict).toContainText('本次修改未保存')
+  await expect(page.locator('.wdl-asset-heading h1')).toHaveText('实体瘤 WES hg38 共享版')
+  await expect.poll(() => api.metadataRequests.length).toBe(1)
+  await expect(page.locator('.wdl-tag-editor__chip').filter({ hasText: 'wes' })).toHaveCount(0)
+  await expect(page.getByLabel('添加标签')).toBeDisabled()
+  await page.getByRole('button', { name: '继续编辑' }).click()
+  await expect(page.getByLabel('添加标签')).toBeEnabled()
 })
 
 test('adds one tag on blur, reuses the tag pool, and shows three quick choices', async ({ page }) => {

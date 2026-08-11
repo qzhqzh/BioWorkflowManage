@@ -82,6 +82,8 @@ def test_multifile_asset_revision_export_and_task_import():
             ],
             "operation": "edit",
             "note": "update command",
+            "base_version": payload["current_revision"]["version"],
+            "base_digest": payload["current_revision"]["digest"],
         },
         format="json",
     )

@@ -3,6 +3,7 @@ import uuid
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
+from django.db.models.functions import Lower
 
 
 class ImmutableSnapshot(models.Model):
@@ -170,6 +171,12 @@ class WDLTag(models.Model):
 
     class Meta:
         ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                Lower("name"),
+                name="unique_wdl_tag_name_ci",
+            )
+        ]
 
 
 class WDLToolPackageTag(models.Model):
@@ -293,6 +300,7 @@ class WDLAsset(models.Model):
         choices=Lifecycle.choices,
         default=Lifecycle.ACTIVE,
     )
+    metadata_version = models.PositiveIntegerField(default=1)
     tags = models.ManyToManyField(WDLTag, related_name="wdl_assets", blank=True)
     created_by = models.CharField(max_length=256, default="local-user")
     created_at = models.DateTimeField(auto_now_add=True)

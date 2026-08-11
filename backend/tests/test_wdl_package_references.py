@@ -172,6 +172,9 @@ def test_revision_inherits_reference_and_rejects_digest_or_mount_collision():
         package_version="1.0.0",
         apply=True,
     )
+    current_revision = WDLSourceRevision.objects.filter(
+        asset__slug=asset["slug"]
+    ).first()
 
     updated_main = MAIN_WDL.replace("workflow Greeting", "workflow GreetingUpdated")
     saved = client.post(
@@ -180,6 +183,8 @@ def test_revision_inherits_reference_and_rejects_digest_or_mount_collision():
             "entrypoint": "main.wdl",
             "files": [{"path": "main.wdl", "content": updated_main}],
             "operation": "edit",
+            "base_version": current_revision.version,
+            "base_digest": current_revision.digest,
         },
         format="json",
     )
@@ -189,6 +194,7 @@ def test_revision_inherits_reference_and_rejects_digest_or_mount_collision():
     revision = WDLSourceRevision.objects.get(asset__slug=asset["slug"], version=3)
     assert list(revision.files.values_list("path", flat=True)) == ["main.wdl"]
     assert revision.package_references.count() == 1
+    current_revision = revision
 
     digest_mismatch = client.post(
         f"/api/v1/wdl-assets/{asset['slug']}/revisions",
@@ -203,6 +209,8 @@ def test_revision_inherits_reference_and_rejects_digest_or_mount_collision():
                     "mount_prefix": "packages/greeting-tools/1.0.0",
                 }
             ],
+            "base_version": current_revision.version,
+            "base_digest": current_revision.digest,
         },
         format="json",
     )
@@ -225,6 +233,8 @@ def test_revision_inherits_reference_and_rejects_digest_or_mount_collision():
                     "mount_prefix": "",
                 }
             ],
+            "base_version": current_revision.version,
+            "base_digest": current_revision.digest,
         },
         format="json",
     )
