@@ -2,7 +2,9 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
+from django.db import IntegrityError, transaction
 from rest_framework.test import APIClient
 
 from workflows import wdl_assets
@@ -282,6 +284,8 @@ def test_format_preview_and_saved_revision_record_diff_note_and_actor():
             "content": preview.data["content"],
             "operation": "format",
             "note": "统一两空格缩进",
+            "base_version": imported.data["current_revision"]["version"],
+            "base_digest": imported.data["current_revision"]["digest"],
         },
         format="json",
     )
@@ -295,6 +299,64 @@ def test_format_preview_and_saved_revision_record_diff_note_and_actor():
     event = WDLAuditEvent.objects.get(action="format")
     assert event.revision.version == 2
     assert event.diff == saved.data["diff"]
+
+
+@pytest.mark.django_db
+def test_stale_wdl_revision_is_rejected_without_overwriting_latest_source():
+    user_model = get_user_model()
+    editor = user_model.objects.create_user(username="editor")
+    reviewer = user_model.objects.create_user(username="reviewer")
+    client = APIClient()
+    imported = client.post(
+        "/api/v1/wdl-assets",
+        {
+            "name": "Collaborative workflow",
+            "filename": "collaborative.wdl",
+            "content": WDL_SOURCE,
+        },
+        format="json",
+    )
+    slug = imported.data["slug"]
+    base_revision = imported.data["current_revision"]
+
+    client.force_authenticate(editor)
+    latest_source = WDL_SOURCE.replace("echo \"~{name}\"", "echo \"editor: ~{name}\"")
+    saved = client.post(
+        f"/api/v1/wdl-assets/{slug}/revisions",
+        {
+            "content": latest_source,
+            "operation": "edit",
+            "note": "补充输出前缀",
+            "base_version": base_revision["version"],
+            "base_digest": base_revision["digest"],
+        },
+        format="json",
+    )
+    assert saved.status_code == 201
+    assert saved.data["version"] == 2
+
+    client.force_authenticate(reviewer)
+    stale_source = WDL_SOURCE.replace("greeting.txt", "reviewer.txt")
+    conflict = client.post(
+        f"/api/v1/wdl-assets/{slug}/revisions",
+        {
+            "content": stale_source,
+            "operation": "edit",
+            "note": "修改输出文件",
+            "base_version": base_revision["version"],
+            "base_digest": base_revision["digest"],
+        },
+        format="json",
+    )
+
+    assert conflict.status_code == 409
+    assert conflict.data["error"]["code"] == "WDL_REVISION_CONFLICT"
+    assert conflict.data["error"]["details"]["actor"] == "editor"
+    assert conflict.data["error"]["details"]["note"] == "补充输出前缀"
+    assert conflict.data["current_revision"]["version"] == 2
+    assert conflict.data["current_revision"]["content"] == latest_source
+    assert WDLSourceRevision.objects.filter(asset__slug=slug).count() == 2
+    assert not WDLSourceRevision.objects.filter(content=stale_source).exists()
 
 
 @pytest.mark.django_db
@@ -465,11 +527,13 @@ def test_metadata_and_tag_changes_are_audited_without_rewriting_source():
             "lifecycle": "migrating",
             "tags": ["血液肿瘤", "hg38"],
             "note": "参考基因组升级",
+            "base_metadata_version": imported.data["metadata_version"],
         },
         format="json",
     )
 
     assert updated.status_code == 200
+    assert updated.data["metadata_version"] == 2
     assert updated.data["name"] == "Blood workflow hg38"
     assert updated.data["description"] == "升级后的血液肿瘤流程"
     assert updated.data["lifecycle"] == "migrating"
@@ -485,6 +549,92 @@ def test_metadata_and_tag_changes_are_audited_without_rewriting_source():
         "before": ["hg19", "血液肿瘤"],
         "after": ["血液肿瘤", "hg38"],
     }
+
+
+@pytest.mark.django_db
+def test_stale_wdl_metadata_is_rejected_and_returns_latest_asset():
+    user_model = get_user_model()
+    editor = user_model.objects.create_user(username="metadata-editor")
+    reviewer = user_model.objects.create_user(username="metadata-reviewer")
+    client = APIClient()
+    imported = client.post(
+        "/api/v1/wdl-assets",
+        {
+            "name": "Shared workflow",
+            "filename": "shared.wdl",
+            "content": WDL_SOURCE,
+            "tags": ["hg19"],
+        },
+        format="json",
+    )
+    slug = imported.data["slug"]
+    assert imported.data["metadata_version"] == 1
+
+    client.force_authenticate(editor)
+    updated = client.patch(
+        f"/api/v1/wdl-assets/{slug}",
+        {
+            "name": "Shared workflow hg38",
+            "base_metadata_version": 1,
+            "note": "升级流程标题",
+        },
+        format="json",
+    )
+    assert updated.status_code == 200
+    assert updated.data["metadata_version"] == 2
+
+    client.force_authenticate(reviewer)
+    conflict = client.patch(
+        f"/api/v1/wdl-assets/{slug}",
+        {
+            "description": "过期页面上的说明",
+            "base_metadata_version": 1,
+            "note": "补充说明",
+        },
+        format="json",
+    )
+
+    assert conflict.status_code == 409
+    assert conflict.data["error"]["code"] == "WDL_METADATA_CONFLICT"
+    assert conflict.data["error"]["details"]["actor"] == "metadata-editor"
+    assert conflict.data["current_asset"]["metadata_version"] == 2
+    assert conflict.data["current_asset"]["name"] == "Shared workflow hg38"
+    assert conflict.data["current_asset"]["description"] == ""
+    asset = WDLAsset.objects.get(slug=slug)
+    assert asset.description == ""
+    assert asset.audit_events.filter(action="metadata_update").count() == 1
+
+
+@pytest.mark.django_db
+def test_wdl_writes_require_concurrency_preconditions():
+    client = APIClient()
+    imported = client.post(
+        "/api/v1/wdl-assets",
+        {
+            "name": "Protected workflow",
+            "filename": "protected.wdl",
+            "content": WDL_SOURCE,
+        },
+        format="json",
+    )
+    slug = imported.data["slug"]
+
+    revision = client.post(
+        f"/api/v1/wdl-assets/{slug}/revisions",
+        {"content": WDL_SOURCE.replace("greeting.txt", "protected.txt")},
+        format="json",
+    )
+    metadata = client.patch(
+        f"/api/v1/wdl-assets/{slug}",
+        {"description": "missing precondition"},
+        format="json",
+    )
+
+    assert revision.status_code == 428
+    assert revision.data["error"]["code"] == "WDL_PRECONDITION_REQUIRED"
+    assert metadata.status_code == 428
+    assert metadata.data["error"]["code"] == "WDL_PRECONDITION_REQUIRED"
+    assert WDLSourceRevision.objects.filter(asset__slug=slug).count() == 1
 
 
 @pytest.mark.django_db
@@ -532,6 +682,37 @@ def test_tag_pool_reuses_names_case_insensitively_and_orders_by_usage():
     assert reused.data["asset_count"] == 2
     assert isinstance(reused.data["id"], int)
     assert WDLTag.objects.filter(name__iexact="hg38").count() == 1
+    with pytest.raises(IntegrityError), transaction.atomic():
+        WDLTag.objects.create(name="HG38")
+
+
+@pytest.mark.django_db
+def test_tag_pool_create_recovers_from_a_concurrent_unique_conflict(monkeypatch):
+    client = APIClient()
+    canonical = WDLTag.objects.create(name="hg38")
+
+    class MissingTag:
+        @staticmethod
+        def first():
+            return None
+
+    monkeypatch.setattr(WDLTag.objects, "filter", lambda **kwargs: MissingTag())
+    monkeypatch.setattr(
+        WDLTag.objects,
+        "create",
+        lambda **kwargs: (_ for _ in ()).throw(IntegrityError("concurrent tag")),
+    )
+    monkeypatch.setattr(WDLTag.objects, "get", lambda **kwargs: canonical)
+
+    response = client.post(
+        "/api/v1/wdl-assets/tags",
+        {"name": "HG38"},
+        format="json",
+    )
+
+    assert response.status_code == 200
+    assert response.data["id"] == canonical.id
+    assert response.data["name"] == "hg38"
 
 
 @pytest.mark.django_db
@@ -566,6 +747,7 @@ def test_used_tag_can_be_renamed_and_updates_assets_with_audit_history():
     assert WDLTag.objects.filter(name="GRCh38").exists()
     for asset in WDLAsset.objects.prefetch_related("tags"):
         assert [item.name for item in asset.tags.all()] == ["GRCh38"]
+        assert asset.metadata_version == 2
         event = asset.audit_events.first()
         assert event.note == "重命名标签 hg38 → GRCh38"
         assert event.changes["tags"] == {
@@ -605,6 +787,30 @@ def test_tag_rename_rejects_existing_name_and_used_tag_cannot_be_deleted():
     assert blocked.data["error"]["code"] == "WDL_TAG_IN_USE"
     assert blocked.data["asset_count"] == 1
     assert WDLTag.objects.filter(id=used.id).exists()
+
+
+@pytest.mark.django_db
+def test_tag_rename_maps_a_concurrent_unique_conflict_to_409(monkeypatch):
+    client = APIClient()
+    tag = WDLTag.objects.create(name="hg19")
+    original_save = WDLTag.save
+
+    def conflicting_save(instance, *args, **kwargs):
+        if instance.id == tag.id and instance.name == "GRCh37":
+            raise IntegrityError("concurrent rename")
+        return original_save(instance, *args, **kwargs)
+
+    monkeypatch.setattr(WDLTag, "save", conflicting_save)
+    response = client.patch(
+        f"/api/v1/wdl-assets/tags/{tag.id}",
+        {"name": "GRCh37"},
+        format="json",
+    )
+
+    assert response.status_code == 409
+    assert response.data["error"]["code"] == "WDL_TAG_CONFLICT"
+    tag.refresh_from_db()
+    assert tag.name == "hg19"
 
 
 @pytest.mark.django_db

@@ -151,6 +151,7 @@ export interface WdlAsset {
   source_repository: string
   source_revision: string
   lifecycle: 'active' | 'frozen' | 'migrating' | 'retired'
+  metadata_version: number
   tags: string[]
   created_by: string
   created_at: string

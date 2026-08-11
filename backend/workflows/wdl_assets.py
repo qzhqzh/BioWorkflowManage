@@ -11,7 +11,7 @@ from pathlib import Path
 
 import WDL
 from django.conf import settings
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import Count, Q
 from django.http import HttpResponse
 from django.utils.text import slugify
@@ -521,14 +521,19 @@ def _tag_names(value) -> list[str] | None:
     return names
 
 
+def _resolve_tag(name: str) -> tuple[WDLTag, bool]:
+    tag = WDLTag.objects.filter(name__iexact=name).first()
+    if tag is not None:
+        return tag, False
+    try:
+        with transaction.atomic():
+            return WDLTag.objects.create(name=name), True
+    except IntegrityError:
+        return WDLTag.objects.get(name__iexact=name), False
+
+
 def _resolve_tags(names: list[str]) -> list[WDLTag]:
-    tags = []
-    for name in names:
-        tag = WDLTag.objects.filter(name__iexact=name).first()
-        if tag is None:
-            tag = WDLTag.objects.create(name=name)
-        tags.append(tag)
-    return tags
+    return [_resolve_tag(name)[0] for name in names]
 
 
 def _set_tags(asset: WDLAsset, names: list[str]) -> list[str]:
@@ -659,6 +664,7 @@ def _asset_payload(asset: WDLAsset, *, include_detail: bool = False) -> dict:
         "source_repository": asset.source_repository,
         "source_revision": asset.source_revision,
         "lifecycle": asset.lifecycle,
+        "metadata_version": asset.metadata_version,
         "tags": [tag.name for tag in asset.tags.all()],
         "created_by": asset.created_by,
         "created_at": asset.created_at.isoformat(),
@@ -819,81 +825,167 @@ def wdl_asset_detail(request, slug: str):
             Response(_asset_payload(asset, include_detail=True)), request_id
         )
 
-    changes = {}
-    for field, max_length in (
-        ("name", 256),
-        ("description", None),
-        ("source_filename", 512),
-    ):
-        if field not in request.data:
-            continue
-        value = str(request.data[field] or "").strip()
-        if field != "description" and (not value or len(value) > max_length):
+    base_metadata_version = request.data.get("base_metadata_version")
+    if base_metadata_version is None:
+        return _with_request_id(
+            Response(
+                {
+                    "error": {
+                        "code": "WDL_PRECONDITION_REQUIRED",
+                        "message": "base_metadata_version is required.",
+                    }
+                },
+                status=status.HTTP_428_PRECONDITION_REQUIRED,
+            ),
+            request_id,
+        )
+    try:
+        base_metadata_version = int(base_metadata_version)
+    except (TypeError, ValueError):
+        return _with_request_id(
+            Response(
+                {
+                    "error": {
+                        "code": "WDL_ASSET_METADATA_INVALID",
+                        "message": "base_metadata_version must be an integer.",
+                    }
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            ),
+            request_id,
+        )
+
+    with transaction.atomic():
+        asset = (
+            WDLAsset.objects.select_for_update()
+            .prefetch_related("tags", *ASSET_REVISION_PREFETCHES)
+            .get(pk=asset.pk)
+        )
+        if base_metadata_version != asset.metadata_version:
+            latest_event = asset.audit_events.filter(
+                action="metadata_update"
+            ).first()
             return _with_request_id(
                 Response(
                     {
                         "error": {
-                            "code": "WDL_ASSET_METADATA_INVALID",
-                            "message": f"{field} is invalid.",
-                        }
+                            "code": "WDL_METADATA_CONFLICT",
+                            "message": "WDL 信息已被其他用户更新，请查看最新内容后重试。",
+                            "request_id": request_id,
+                            "details": {
+                                "base_metadata_version": base_metadata_version,
+                                "current_metadata_version": asset.metadata_version,
+                                "actor": latest_event.actor if latest_event else None,
+                                "note": latest_event.note if latest_event else "",
+                                "updated_at": (
+                                    latest_event.created_at.isoformat()
+                                    if latest_event
+                                    else asset.updated_at.isoformat()
+                                ),
+                            },
+                        },
+                        "current_asset": _asset_payload(
+                            asset, include_detail=True
+                        ),
                     },
-                    status=status.HTTP_400_BAD_REQUEST,
+                    status=status.HTTP_409_CONFLICT,
                 ),
                 request_id,
             )
-        if value != getattr(asset, field):
-            changes[field] = {"before": getattr(asset, field), "after": value}
-            setattr(asset, field, value)
 
-    if "lifecycle" in request.data:
-        lifecycle = request.data["lifecycle"]
-        if lifecycle not in WDLAsset.Lifecycle.values:
-            return _with_request_id(
-                Response(
-                    {
-                        "error": {
-                            "code": "WDL_ASSET_METADATA_INVALID",
-                            "message": "lifecycle is invalid.",
-                        }
-                    },
-                    status=status.HTTP_400_BAD_REQUEST,
-                ),
-                request_id,
+        changes = {}
+        for field, max_length in (
+            ("name", 256),
+            ("description", None),
+            ("source_filename", 512),
+        ):
+            if field not in request.data:
+                continue
+            value = str(request.data[field] or "").strip()
+            if field != "description" and (
+                not value or len(value) > max_length
+            ):
+                return _with_request_id(
+                    Response(
+                        {
+                            "error": {
+                                "code": "WDL_ASSET_METADATA_INVALID",
+                                "message": f"{field} is invalid.",
+                            }
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    ),
+                    request_id,
+                )
+            if value != getattr(asset, field):
+                changes[field] = {
+                    "before": getattr(asset, field),
+                    "after": value,
+                }
+                setattr(asset, field, value)
+
+        if "lifecycle" in request.data:
+            lifecycle = request.data["lifecycle"]
+            if lifecycle not in WDLAsset.Lifecycle.values:
+                return _with_request_id(
+                    Response(
+                        {
+                            "error": {
+                                "code": "WDL_ASSET_METADATA_INVALID",
+                                "message": "lifecycle is invalid.",
+                            }
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    ),
+                    request_id,
+                )
+            if lifecycle != asset.lifecycle:
+                changes["lifecycle"] = {
+                    "before": asset.lifecycle,
+                    "after": lifecycle,
+                }
+                asset.lifecycle = lifecycle
+
+        if "tags" in request.data:
+            tags = _tag_names(request.data["tags"])
+            if tags is None:
+                return _with_request_id(
+                    Response(
+                        {
+                            "error": {
+                                "code": "WDL_ASSET_METADATA_INVALID",
+                                "message": "tags must be an array of names.",
+                            }
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    ),
+                    request_id,
+                )
+            current_tags = [tag.name for tag in asset.tags.all()]
+            if {tag.casefold() for tag in current_tags} != {
+                tag.casefold() for tag in tags
+            }:
+                canonical_tags = _set_tags(asset, tags)
+                changes["tags"] = {
+                    "before": current_tags,
+                    "after": canonical_tags,
+                }
+
+        if changes:
+            asset.metadata_version += 1
+            asset.save()
+            WDLAuditEvent.objects.create(
+                asset=asset,
+                action="metadata_update",
+                actor=_actor(request),
+                note=str(request.data.get("note") or "").strip(),
+                changes=changes,
             )
-        if lifecycle != asset.lifecycle:
-            changes["lifecycle"] = {"before": asset.lifecycle, "after": lifecycle}
-            asset.lifecycle = lifecycle
-
-    if "tags" in request.data:
-        tags = _tag_names(request.data["tags"])
-        if tags is None:
-            return _with_request_id(
-                Response(
-                    {
-                        "error": {
-                            "code": "WDL_ASSET_METADATA_INVALID",
-                            "message": "tags must be an array of names.",
-                        }
-                    },
-                    status=status.HTTP_400_BAD_REQUEST,
-                ),
-                request_id,
+        asset = (
+            WDLAsset.objects.prefetch_related(
+                "tags", *ASSET_REVISION_PREFETCHES
             )
-        current_tags = [tag.name for tag in asset.tags.all()]
-        if {tag.casefold() for tag in current_tags} != {
-            tag.casefold() for tag in tags
-        }:
-            canonical_tags = _set_tags(asset, tags)
-            changes["tags"] = {"before": current_tags, "after": canonical_tags}
-
-    if changes:
-        asset.save()
-        WDLAuditEvent.objects.create(
-            asset=asset,
-            action="metadata_update",
-            actor=_actor(request),
-            note=str(request.data.get("note") or "").strip(),
-            changes=changes,
+            .get(pk=asset.pk)
         )
     return _with_request_id(
         Response(_asset_payload(asset, include_detail=True)), request_id
@@ -946,6 +1038,36 @@ def wdl_asset_revisions(request, slug: str):
             ),
             request_id,
         )
+    base_version = request.data.get("base_version")
+    base_digest = request.data.get("base_digest")
+    if base_version is None or base_digest is None:
+        return _with_request_id(
+            Response(
+                {
+                    "error": {
+                        "code": "WDL_PRECONDITION_REQUIRED",
+                        "message": "base_version and base_digest are required.",
+                    }
+                },
+                status=status.HTTP_428_PRECONDITION_REQUIRED,
+            ),
+            request_id,
+        )
+    try:
+        base_version = int(base_version)
+    except (TypeError, ValueError):
+        return _with_request_id(
+            Response(
+                {
+                    "error": {
+                        "code": "WDL_REVISION_BASE_INVALID",
+                        "message": "base_version must be an integer.",
+                    }
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            ),
+            request_id,
+        )
     latest_snapshot = asset.source_revisions.first()
     try:
         files, entrypoint = _request_bundle(request, fallback_revision=latest_snapshot)
@@ -963,6 +1085,46 @@ def wdl_asset_revisions(request, slug: str):
         latest = locked.source_revisions.prefetch_related(
             "files", *REVISION_REFERENCE_PREFETCHES
         ).first()
+        if (
+            latest is None
+            or latest.version != base_version
+            or latest.digest != base_digest
+        ):
+            return _with_request_id(
+                Response(
+                    {
+                        "error": {
+                            "code": "WDL_REVISION_CONFLICT",
+                            "message": "WDL 源码已产生新版本，本地草稿未被覆盖。",
+                            "request_id": request_id,
+                            "details": {
+                                "base_version": base_version,
+                                "base_digest": base_digest,
+                                "current_version": (
+                                    latest.version if latest else None
+                                ),
+                                "current_digest": (
+                                    latest.digest if latest else None
+                                ),
+                                "actor": latest.actor if latest else None,
+                                "note": latest.note if latest else "",
+                                "updated_at": (
+                                    latest.created_at.isoformat()
+                                    if latest
+                                    else None
+                                ),
+                            },
+                        },
+                        "current_revision": (
+                            _revision_payload(latest, include_content=True)
+                            if latest
+                            else None
+                        ),
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                ),
+                request_id,
+            )
         before_files, _ = _revision_files(latest)
         before_reference_specs = reference_specs_for_revision(latest)
         before_reference_keys = {
@@ -1317,10 +1479,7 @@ def wdl_tags(request):
             ),
             request_id,
         )
-    tag = WDLTag.objects.filter(name__iexact=name).first()
-    created = tag is None
-    if tag is None:
-        tag = WDLTag.objects.create(name=name)
+    tag, created = _resolve_tag(name)
     return _with_request_id(
         Response(
             _tag_payload(tag),
@@ -1405,18 +1564,40 @@ def wdl_tag_detail(request, tag_id: int):
     if name == tag.name:
         return _with_request_id(Response(_tag_payload(tag)), request_id)
 
-    assets = list(tag.wdl_assets.prefetch_related("tags"))
+    asset_ids = list(tag.wdl_assets.values_list("id", flat=True))
+    assets = list(
+        WDLAsset.objects.select_for_update()
+        .filter(id__in=asset_ids)
+        .order_by("id")
+        .prefetch_related("tags")
+    )
     previous_name = tag.name
     previous_tags = {
         asset.id: [item.name for item in asset.tags.all()]
         for asset in assets
     }
-    tag.name = name
-    tag.save(update_fields=["name"])
+    try:
+        with transaction.atomic():
+            tag.name = name
+            tag.save(update_fields=["name"])
+    except IntegrityError:
+        return _with_request_id(
+            Response(
+                {
+                    "error": {
+                        "code": "WDL_TAG_CONFLICT",
+                        "message": "A WDL tag with this name already exists.",
+                    }
+                },
+                status=status.HTTP_409_CONFLICT,
+            ),
+            request_id,
+        )
     for asset in assets:
         before = previous_tags[asset.id]
         after = [name if item == previous_name else item for item in before]
-        asset.save(update_fields=["updated_at"])
+        asset.metadata_version += 1
+        asset.save(update_fields=["metadata_version", "updated_at"])
         WDLAuditEvent.objects.create(
             asset=asset,
             action="metadata_update",

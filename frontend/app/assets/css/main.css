@@ -3129,6 +3129,36 @@ kbd {
   margin: var(--space-2) 0 0;
 }
 
+.wdl-metadata-conflict {
+  border-bottom: 1px solid var(--color-warning);
+  background: var(--color-warning-soft);
+  padding: var(--space-3) var(--space-4);
+  color: var(--color-ink-soft);
+  font-size: var(--text-caption);
+}
+
+.wdl-metadata-conflict p {
+  margin: var(--space-1) 0 0;
+  line-height: 1.5;
+}
+
+.wdl-metadata-conflict small {
+  display: block;
+  margin-top: var(--space-1);
+  color: var(--color-muted);
+}
+
+.wdl-metadata-conflict button {
+  margin-top: var(--space-2);
+  border: 0;
+  background: transparent;
+  padding: 0;
+  color: var(--color-primary);
+  cursor: pointer;
+  font: inherit;
+  font-weight: 650;
+}
+
 .wdl-sidebar-section {
   border-bottom: 1px solid var(--color-border);
   padding: var(--space-4);
@@ -3375,6 +3405,36 @@ kbd {
   color: var(--color-muted);
 }
 
+.wdl-revision-conflict {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  border-bottom: 1px solid var(--color-warning);
+  background: var(--color-warning-soft);
+  padding: var(--space-3) var(--space-4);
+  color: var(--color-ink-soft);
+}
+
+.wdl-revision-conflict p {
+  margin: var(--space-1) 0 0;
+  font-size: var(--text-secondary);
+  line-height: 1.45;
+}
+
+.wdl-revision-conflict small {
+  display: block;
+  margin-top: var(--space-1);
+  color: var(--color-muted);
+  font-size: var(--text-caption);
+}
+
+.wdl-revision-conflict__actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: var(--space-2);
+}
+
 .status-dot--warning {
   background: var(--color-warning);
 }
@@ -3406,6 +3466,11 @@ kbd {
 
 .wdl-revision-note .field {
   flex: 1;
+}
+
+.wdl-revision-note .field-error {
+  color: var(--color-error);
+  font-size: var(--text-caption);
 }
 
 .wdl-format-diff-panel {
@@ -4869,6 +4934,15 @@ kbd {
   .wdl-revision-note {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .wdl-revision-conflict {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .wdl-revision-conflict__actions {
+    flex-wrap: wrap;
   }
 
   .topbar {
