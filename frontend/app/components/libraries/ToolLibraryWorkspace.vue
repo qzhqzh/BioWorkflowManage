@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import ToolDraftEditor from '~/components/tools/ToolDraftEditor.vue'
+import SoftwareLibraryPanel from '~/components/tools/SoftwareLibraryPanel.vue'
+import ToolTestPanel from '~/components/tools/ToolTestPanel.vue'
 
 interface RegistryTool {
   id: string
@@ -31,6 +33,13 @@ const props = defineProps<{
   selectedToolVersions: ToolVersion[]
   selectedToolVersion: string
   selectedToolSpec?: Record<string, any>
+  selectedToolSoftwareLinks?: Array<{
+    id: number
+    role: string
+    note: string
+    software: { slug: string; name: string }
+    release?: { id: number; version: string }
+  }>
   toolDraftState: 'idle' | 'saving' | 'saved' | 'publishing' | 'published' | 'error'
   toolDraftValidationStatus?: string
   toolOperationError?: ToolOperationError
@@ -44,7 +53,9 @@ const searchQuery = defineModel<string>('searchQuery', { required: true })
 const toolDraft = defineModel<Record<string, any> | undefined>('toolDraft')
 
 const viewMode = ref<'list' | 'cards'>('list')
+const libraryMode = ref<'tools' | 'software'>('tools')
 const inspectorView = ref<'version' | 'draft'>(props.initialInspectorView)
+const versionDetailMode = ref<'details' | 'test'>('details')
 const currentPage = ref(1)
 const pageSize = 12
 const pageCount = computed(() => Math.max(1, Math.ceil(props.tools.length / pageSize)))
@@ -102,6 +113,11 @@ function setViewMode(mode: 'list' | 'cards') {
   currentPage.value = 1
 }
 
+function setLibraryMode(mode: 'tools' | 'software') {
+  libraryMode.value = mode
+  if (mode === 'software' && props.selectedToolId) emit('closeInspector')
+}
+
 function openToolInspector(event: MouseEvent, toolId: string) {
   lastToolTrigger.value = event.currentTarget as HTMLElement
   emit('selectTool', toolId)
@@ -115,6 +131,7 @@ function closeToolInspector() {
 watch(() => props.selectedToolId, (toolId) => {
   if (!toolId) return
   inspectorView.value = props.initialInspectorView
+  versionDetailMode.value = 'details'
   void nextTick(() => inspectorPanel.value?.focus({ preventScroll: true }))
 })
 
@@ -133,6 +150,7 @@ function selectDraft() {
 
 function selectPublishedVersion(toolId: string, version: string) {
   inspectorView.value = 'version'
+  versionDetailMode.value = 'details'
   emit('selectVersion', toolId, version)
 }
 
@@ -154,9 +172,9 @@ const emit = defineEmits<{
   <header class="workspace-header">
     <div>
       <h1>工具库</h1>
-      <p>管理可复用的 ToolSpec。每个版本固定工具接口、容器与命令模板。</p>
+      <p>{{ libraryMode === 'tools' ? '管理可复用的 Task，并对固定版本进行独立测试。' : '记录软件版本、使用注意事项和相关工具。' }}</p>
     </div>
-    <div class="workspace-header__actions">
+    <div v-if="libraryMode === 'tools'" class="workspace-header__actions">
       <button class="button button--ghost" type="button" @click="creatingTool = !creatingTool">
         {{ creatingTool ? '取消新建' : '新建工具' }}
       </button>
@@ -164,7 +182,12 @@ const emit = defineEmits<{
     </div>
   </header>
 
-  <form v-if="creatingTool" class="tool-create-panel" @submit.prevent="emit('create')">
+  <nav class="library-scope-tabs" aria-label="工具库范围">
+    <button type="button" :class="{ 'is-active': libraryMode === 'tools' }" @click="setLibraryMode('tools')">工具</button>
+    <button type="button" :class="{ 'is-active': libraryMode === 'software' }" @click="setLibraryMode('software')">软件知识库</button>
+  </nav>
+
+  <form v-if="libraryMode === 'tools' && creatingTool" class="tool-create-panel" @submit.prevent="emit('create')">
     <div>
       <strong>创建工具草稿</strong>
       <p>先建立可编辑草稿，校验通过后再发布不可变版本。</p>
@@ -184,7 +207,7 @@ const emit = defineEmits<{
     </button>
   </form>
 
-  <div class="tool-library-browser" :class="{ 'tool-library-browser--selected': selectedToolId }">
+  <div v-if="libraryMode === 'tools'" class="tool-library-browser" :class="{ 'tool-library-browser--selected': selectedToolId }">
     <section class="tool-library-catalog">
       <div class="workspace-toolbar">
     <label class="search-field workspace-search">
@@ -380,6 +403,17 @@ const emit = defineEmits<{
               </div>
               <button class="button button--ghost" type="button" @click="emit('useVersionAsDraft')">基于此版本修改</button>
             </header>
+            <nav class="tool-version-tabs" aria-label="版本内容">
+              <button type="button" :class="{ 'is-active': versionDetailMode === 'details' }" @click="versionDetailMode = 'details'">版本内容</button>
+              <button type="button" :class="{ 'is-active': versionDetailMode === 'test' }" @click="versionDetailMode = 'test'">独立测试</button>
+            </nav>
+            <ToolTestPanel
+              v-if="versionDetailMode === 'test'"
+              :tool-id="selectedToolId"
+              :version="selectedToolVersion"
+              :tool-spec="selectedToolSpec"
+            />
+            <template v-else>
             <dl>
               <div><dt>容器</dt><dd><code>{{ selectedToolSpec.container?.image }}</code></dd></div>
               <div><dt>运行资源</dt><dd>{{ selectedToolSpec.runtime?.cpu ?? '—' }} CPU · {{ selectedToolSpec.runtime?.memory_gb ?? '—' }} GB 内存</dd></div>
@@ -393,6 +427,16 @@ const emit = defineEmits<{
                 </dd>
               </div>
             </dl>
+
+            <section v-if="selectedToolSoftwareLinks?.length" class="tool-software-links">
+              <header><strong>关联软件</strong></header>
+              <ul>
+                <li v-for="link in selectedToolSoftwareLinks" :key="link.id">
+                  <span><strong>{{ link.software.name }}</strong><small>{{ link.role }}</small></span>
+                  <code>{{ link.release ? `v${link.release.version}` : '未指定版本' }}</code>
+                </li>
+              </ul>
+            </section>
 
             <div class="tool-version-interface">
               <section>
@@ -421,6 +465,7 @@ const emit = defineEmits<{
               <header><strong>命令模板</strong></header>
               <pre>{{ selectedToolSpec.command.template }}</pre>
             </section>
+            </template>
           </section>
           <p v-else-if="inspectorView === 'version' && selectedToolVersions.length" class="empty-state tool-version-detail__empty">正在读取版本内容…</p>
           <p v-else class="empty-state tool-version-detail__empty">这个工具还没有可查看的草稿或已发布版本。</p>
@@ -428,4 +473,5 @@ const emit = defineEmits<{
       </div>
     </aside>
   </div>
+  <SoftwareLibraryPanel v-if="libraryMode === 'software'" />
 </template>

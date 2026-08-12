@@ -78,6 +78,164 @@ class ToolDocument(models.Model):
         ordering = ["tool_id"]
 
 
+class SoftwareAsset(models.Model):
+    """Flexible knowledge record for software used by one or more tools."""
+
+    class Lifecycle(models.TextChoices):
+        ACTIVE = "active", "Active"
+        ARCHIVED = "archived", "Archived"
+
+    slug = models.SlugField(max_length=128, unique=True)
+    name = models.CharField(max_length=256)
+    summary = models.CharField(max_length=512, blank=True)
+    description = models.TextField(blank=True)
+    homepage = models.URLField(max_length=2048, blank=True)
+    source_repository = models.CharField(max_length=512, blank=True)
+    license = models.CharField(max_length=128, blank=True)
+    notes = models.TextField(blank=True)
+    tags = models.JSONField(default=list)
+    metadata = models.JSONField(default=dict)
+    lifecycle = models.CharField(
+        max_length=16,
+        choices=Lifecycle.choices,
+        default=Lifecycle.ACTIVE,
+    )
+    metadata_version = models.PositiveIntegerField(default=1)
+    created_by = models.CharField(max_length=256, default="local-user")
+    updated_by = models.CharField(max_length=256, default="local-user")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["name", "slug"]
+
+
+class SoftwareRelease(models.Model):
+    software = models.ForeignKey(
+        SoftwareAsset,
+        on_delete=models.PROTECT,
+        related_name="releases",
+    )
+    version = models.CharField(max_length=128)
+    description = models.TextField(blank=True)
+    container_images = models.JSONField(default=list)
+    metadata = models.JSONField(default=dict)
+    metadata_version = models.PositiveIntegerField(default=1)
+    created_by = models.CharField(max_length=256, default="local-user")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["software", "version"],
+                name="unique_software_release",
+            )
+        ]
+
+
+class ToolSoftwareLink(models.Model):
+    class Role(models.TextChoices):
+        PRIMARY = "primary", "Primary"
+        DEPENDENCY = "dependency", "Dependency"
+        RUNTIME = "runtime", "Runtime"
+
+    tool_version = models.ForeignKey(
+        ToolVersion,
+        on_delete=models.PROTECT,
+        related_name="software_links",
+    )
+    software = models.ForeignKey(
+        SoftwareAsset,
+        on_delete=models.PROTECT,
+        related_name="tool_links",
+    )
+    release = models.ForeignKey(
+        SoftwareRelease,
+        on_delete=models.PROTECT,
+        related_name="tool_links",
+        null=True,
+        blank=True,
+    )
+    role = models.CharField(
+        max_length=16,
+        choices=Role.choices,
+        default=Role.PRIMARY,
+    )
+    note = models.TextField(blank=True)
+    created_by = models.CharField(max_length=256, default="local-user")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["role", "software__name", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["tool_version", "software", "role"],
+                name="unique_tool_software_role",
+            )
+        ]
+
+
+class SoftwareAuditEvent(ImmutableSnapshot):
+    software = models.ForeignKey(
+        SoftwareAsset,
+        on_delete=models.PROTECT,
+        related_name="audit_events",
+    )
+    release = models.ForeignKey(
+        SoftwareRelease,
+        on_delete=models.PROTECT,
+        related_name="audit_events",
+        null=True,
+        blank=True,
+    )
+    action = models.CharField(max_length=32)
+    actor = models.CharField(max_length=256, default="local-user")
+    changes = models.JSONField(default=dict)
+    note = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+
+
+class ServiceAccount(models.Model):
+    """Machine identity used by external analysis clients and MCP agents."""
+
+    client_id = models.SlugField(max_length=128, unique=True)
+    name = models.CharField(max_length=256)
+    scopes = models.JSONField(default=list)
+    is_active = models.BooleanField(default=True)
+    created_by = models.CharField(max_length=256, default="local-user")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["client_id"]
+
+
+class ServiceToken(models.Model):
+    """Revocable bearer credential; only its SHA-256 digest is persisted."""
+
+    service_account = models.ForeignKey(
+        ServiceAccount,
+        on_delete=models.PROTECT,
+        related_name="tokens",
+    )
+    name = models.CharField(max_length=128)
+    prefix = models.CharField(max_length=16, unique=True)
+    token_hash = models.CharField(max_length=64, unique=True)
+    created_by = models.CharField(max_length=256, default="local-user")
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+    last_used_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+
+
 class WorkflowVersion(ImmutableSnapshot):
     workflow = models.ForeignKey(
         WorkflowDocument,
@@ -473,14 +631,32 @@ class WDLAuditEvent(ImmutableSnapshot):
 
 
 class AnalysisRun(models.Model):
+    class Kind(models.TextChoices):
+        WORKFLOW = "workflow", "Workflow analysis"
+        TOOL_TEST = "tool_test", "Tool test"
+
     class Status(models.TextChoices):
         QUEUED = "queued", "Queued"
         PREPARING = "preparing", "Preparing"
         RUNNING = "running", "Running"
+        CANCEL_REQUESTED = "cancel_requested", "Cancel requested"
         SUCCEEDED = "succeeded", "Succeeded"
         FAILED = "failed", "Failed"
+        CANCELED = "canceled", "Canceled"
+
+    class OutputStatus(models.TextChoices):
+        PENDING = "pending", "Pending"
+        COMPLETE = "complete", "Complete"
+        INCOMPLETE = "incomplete", "Incomplete"
+        UNAVAILABLE = "unavailable", "Unavailable"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    run_kind = models.CharField(
+        max_length=16,
+        choices=Kind.choices,
+        default=Kind.WORKFLOW,
+        db_index=True,
+    )
     asset = models.ForeignKey(
         WDLAsset,
         on_delete=models.PROTECT,
@@ -502,6 +678,13 @@ class AnalysisRun(models.Model):
         null=True,
         blank=True,
     )
+    tool_version = models.ForeignKey(
+        ToolVersion,
+        on_delete=models.PROTECT,
+        related_name="test_runs",
+        null=True,
+        blank=True,
+    )
     workflow_name = models.CharField(max_length=256)
     sample_id = models.CharField(max_length=256)
     sample_name = models.CharField(max_length=256, blank=True)
@@ -513,12 +696,35 @@ class AnalysisRun(models.Model):
         null=True,
         blank=True,
     )
+    service_account = models.ForeignKey(
+        ServiceAccount,
+        on_delete=models.PROTECT,
+        related_name="analysis_runs",
+        null=True,
+        blank=True,
+    )
+    external_run_id = models.CharField(max_length=128, blank=True, db_index=True)
+    external_analysis_id = models.CharField(
+        max_length=128,
+        blank=True,
+        db_index=True,
+    )
+    idempotency_key = models.CharField(max_length=128, blank=True)
+    request_digest = models.CharField(max_length=80, blank=True)
+    retry_of = models.ForeignKey(
+        "self",
+        on_delete=models.PROTECT,
+        related_name="retries",
+        null=True,
+        blank=True,
+    )
     status = models.CharField(
         max_length=16,
         choices=Status.choices,
         default=Status.QUEUED,
         db_index=True,
     )
+    status_version = models.PositiveIntegerField(default=1)
     progress = models.PositiveSmallIntegerField(default=0)
     current_step = models.CharField(max_length=256, default="等待执行")
     request_payload = models.JSONField(default=dict)
@@ -526,7 +732,17 @@ class AnalysisRun(models.Model):
     source_bundle = models.JSONField(default=dict)
     source_digest = models.CharField(max_length=80, blank=True)
     outputs = models.JSONField(default=dict)
+    output_status = models.CharField(
+        max_length=16,
+        choices=OutputStatus.choices,
+        default=OutputStatus.PENDING,
+    )
+    output_manifest = models.JSONField(default=dict)
     error = models.TextField(blank=True)
+    error_code = models.CharField(max_length=64, blank=True)
+    error_category = models.CharField(max_length=32, blank=True)
+    error_retryable = models.BooleanField(default=False)
+    error_details = models.JSONField(default=dict)
     work_directory = models.CharField(max_length=1024, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     started_at = models.DateTimeField(null=True, blank=True)
@@ -542,19 +758,47 @@ class AnalysisRun(models.Model):
         constraints = [
             models.CheckConstraint(
                 condition=(
-                    models.Q(
-                        asset__isnull=False,
-                        revision__isnull=False,
-                        workflow_version__isnull=True,
+                    (
+                        models.Q(run_kind="workflow", tool_version__isnull=True)
+                        & (
+                            models.Q(
+                                asset__isnull=False,
+                                revision__isnull=False,
+                                workflow_version__isnull=True,
+                            )
+                            | models.Q(
+                                asset__isnull=True,
+                                revision__isnull=True,
+                                workflow_version__isnull=False,
+                            )
+                        )
                     )
                     | models.Q(
+                        run_kind="tool_test",
                         asset__isnull=True,
                         revision__isnull=True,
-                        workflow_version__isnull=False,
+                        workflow_version__isnull=True,
+                        tool_version__isnull=False,
                     )
                 ),
                 name="analysis_run_has_one_source",
-            )
+            ),
+            models.UniqueConstraint(
+                fields=["service_account", "external_run_id"],
+                condition=(
+                    models.Q(service_account__isnull=False)
+                    & ~models.Q(external_run_id="")
+                ),
+                name="unique_service_external_run",
+            ),
+            models.UniqueConstraint(
+                fields=["service_account", "idempotency_key"],
+                condition=(
+                    models.Q(service_account__isnull=False)
+                    & ~models.Q(idempotency_key="")
+                ),
+                name="unique_service_idempotency_key",
+            ),
         ]
 
 

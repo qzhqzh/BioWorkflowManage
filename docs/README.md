@@ -17,6 +17,7 @@
 11. [测试与 CI](11-testing-and-ci.md)
 12. [miniwdl 校验与隔离执行框架](12-miniwdl-execution.md)
 13. [历史 WDL 资产与工作台](13-historical-wdl-workbench.md)
+14. [第三方分析投递 API 与 MCP](14-integration-api-and-mcp.md)
 
 ## Architecture Decision Records
 
@@ -32,6 +33,7 @@
 - [`schemas/compiler-ir.schema.json`](../schemas/compiler-ir.schema.json)
 - [`schemas/validation-report.schema.json`](../schemas/validation-report.schema.json)
 - [`schemas/error-catalog.json`](../schemas/error-catalog.json)
+- [`schemas/integration-openapi-v1.json`](../schemas/integration-openapi-v1.json)
 
 这些文件是前端表单、后端 Pydantic 模型、编译器校验和 CI 的共同契约。
 
@@ -87,4 +89,5 @@ GitHub Actions 配置：`.github/workflows/validate-contracts.yml`。
 - miniwdl 静态检查、隔离容器 smoke 和真实数据案例框架；
 - 四项关键架构决策。
 
-下一步可以进入编译器代码骨架和 negative fixtures。用户权限、AI、执行调度和 Benchmark 相关文档暂不进入第一阶段主线。
+在 Phase 1 编译规范之外，项目已补充认证、执行调度、历史 WDL、第三方 Integration API
+与受限 AI Agent MCP；对应运行边界分别以第 12 至 14 章为准。

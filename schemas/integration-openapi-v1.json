@@ -1,0 +1,286 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "BioWorkflowManage Integration API",
+    "version": "1.0.0",
+    "description": "第三方报告系统与 AI Agent 使用的固定版本分析、Task 测试及资产查询接口。所有写操作均受 Service Token scope、受管路径、幂等键和审计约束。"
+  },
+  "servers": [{"url": "/api/v1/integration"}],
+  "security": [{"serviceToken": []}],
+  "paths": {
+    "/openapi": {
+      "get": {
+        "operationId": "getIntegrationOpenAPI",
+        "summary": "读取 Integration API OpenAPI 3.1 契约",
+        "security": [],
+        "responses": {"200": {"description": "OpenAPI 3.1 document"}}
+      }
+    },
+    "/workflow-versions": {
+      "get": {
+        "operationId": "listWorkflowVersions",
+        "summary": "列出固定 WorkflowVersion",
+        "x-required-scope": "workflow:read",
+        "responses": {"200": {"description": "WorkflowVersion 列表"}, "401": {"$ref": "#/components/responses/Error"}, "403": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/workflow-versions/{version_id}": {
+      "get": {
+        "operationId": "getWorkflowVersion",
+        "summary": "读取固定 WorkflowVersion 契约",
+        "x-required-scope": "workflow:read",
+        "parameters": [{"name": "version_id", "in": "path", "required": true, "schema": {"type": "integer", "minimum": 1}}],
+        "responses": {"200": {"description": "WorkflowVersion"}, "404": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/analysis-runs/preflight": {
+      "post": {
+        "operationId": "preflightAnalysisRun",
+        "summary": "预检固定 WorkflowVersion 和受管输入，不创建运行",
+        "x-required-scope": "analysis:submit",
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AnalysisPreflight"}}}},
+        "responses": {"200": {"description": "预检通过"}, "400": {"$ref": "#/components/responses/Error"}, "409": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/analysis-runs": {
+      "get": {
+        "operationId": "listAnalysisRuns",
+        "summary": "列出当前 Service Account 的运行",
+        "x-required-scope": "analysis:read",
+        "parameters": [{"name": "active", "in": "query", "schema": {"type": "string", "enum": ["0", "1"]}}],
+        "responses": {"200": {"description": "运行列表"}}
+      },
+      "post": {
+        "operationId": "submitAnalysisRun",
+        "summary": "幂等投递固定 WorkflowVersion",
+        "x-required-scope": "analysis:submit",
+        "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}, {"$ref": "#/components/parameters/RequestId"}],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AnalysisSubmission"}}}},
+        "responses": {"201": {"description": "创建运行", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AnalysisRun"}}}}, "200": {"description": "幂等重放"}, "409": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/analysis-runs/by-external-ref": {
+      "get": {
+        "operationId": "findAnalysisRunByExternalRef",
+        "summary": "响应丢失后按 external_run_id 找回运行",
+        "x-required-scope": "analysis:read",
+        "parameters": [{"name": "external_run_id", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 128}}],
+        "responses": {"200": {"description": "运行"}, "404": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/analysis-runs/batch-status": {
+      "post": {
+        "operationId": "batchAnalysisStatus",
+        "summary": "批量读取最多 200 个运行状态",
+        "x-required-scope": "analysis:read",
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["run_ids"], "properties": {"run_ids": {"type": "array", "maxItems": 200, "items": {"type": "string", "format": "uuid"}}}}}}},
+        "responses": {"200": {"description": "批量状态"}}
+      }
+    },
+    "/analysis-runs/{run_id}": {
+      "get": {
+        "operationId": "getAnalysisRun",
+        "summary": "读取运行详情",
+        "x-required-scope": "analysis:read",
+        "parameters": [{"$ref": "#/components/parameters/RunId"}],
+        "responses": {"200": {"description": "运行", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AnalysisRun"}}}}, "404": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/analysis-runs/{run_id}/events": {
+      "get": {
+        "operationId": "listAnalysisRunEvents",
+        "summary": "按 ID 增量获取事件",
+        "x-required-scope": "analysis:read",
+        "parameters": [{"$ref": "#/components/parameters/RunId"}, {"name": "after_id", "in": "query", "schema": {"type": "integer", "minimum": 0, "default": 0}}],
+        "responses": {"200": {"description": "事件列表"}}
+      }
+    },
+    "/analysis-runs/{run_id}/cancel": {
+      "post": {
+        "operationId": "cancelAnalysisRun",
+        "summary": "安全取消运行；重复调用幂等",
+        "x-required-scope": "analysis:cancel",
+        "parameters": [{"$ref": "#/components/parameters/RunId"}],
+        "responses": {"200": {"description": "取消后的运行状态"}}
+      }
+    },
+    "/analysis-runs/{run_id}/retry": {
+      "post": {
+        "operationId": "retryAnalysisRun",
+        "summary": "基于原固定快照创建新的重跑记录",
+        "x-required-scope": "analysis:retry",
+        "parameters": [{"$ref": "#/components/parameters/RunId"}, {"$ref": "#/components/parameters/IdempotencyKey"}],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["external_ref"], "properties": {"external_ref": {"$ref": "#/components/schemas/ExternalRef"}, "metadata": {"type": "object"}}}}}},
+        "responses": {"201": {"description": "新的重跑记录"}, "409": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/analysis-runs/{run_id}/outputs": {
+      "get": {
+        "operationId": "listAnalysisOutputs",
+        "summary": "读取语义化输出清单",
+        "x-required-scope": "analysis:read",
+        "parameters": [{"$ref": "#/components/parameters/RunId"}],
+        "responses": {"200": {"description": "输出清单"}}
+      }
+    },
+    "/analysis-runs/{run_id}/outputs/download": {
+      "get": {
+        "operationId": "downloadAnalysisOutput",
+        "summary": "校验成功时输出证据后流式下载文件",
+        "x-required-scope": "analysis:download",
+        "parameters": [{"$ref": "#/components/parameters/RunId"}, {"name": "key", "in": "query", "required": true, "schema": {"type": "string"}}],
+        "responses": {"200": {"description": "文件流"}, "409": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/tool-test-runs/preflight": {
+      "post": {
+        "operationId": "preflightToolTest",
+        "summary": "预检不可变 ToolVersion 的独立测试",
+        "x-required-scope": "task:test",
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ToolTestPreflight"}}}},
+        "responses": {"200": {"description": "预检通过"}}
+      }
+    },
+    "/tool-test-runs": {
+      "post": {
+        "operationId": "submitToolTest",
+        "summary": "幂等提交不可变 ToolVersion 小数据测试",
+        "x-required-scope": "task:test",
+        "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ToolTestSubmission"}}}},
+        "responses": {"201": {"description": "测试运行"}, "409": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/tools": {
+      "get": {"operationId": "listTools", "summary": "读取已发布 ToolVersion 基本信息", "x-required-scope": "library:read", "responses": {"200": {"description": "工具版本列表"}}}
+    },
+    "/software": {
+      "get": {"operationId": "listSoftware", "summary": "读取软件知识库基本信息", "x-required-scope": "library:read", "responses": {"200": {"description": "软件列表"}}}
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "serviceToken": {"type": "http", "scheme": "bearer", "bearerFormat": "BioWorkflowManage Service Token"}
+    },
+    "parameters": {
+      "RunId": {"name": "run_id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}},
+      "IdempotencyKey": {"name": "Idempotency-Key", "in": "header", "required": true, "schema": {"type": "string", "maxLength": 128}},
+      "RequestId": {"name": "X-Request-ID", "in": "header", "required": false, "schema": {"type": "string", "maxLength": 128}}
+    },
+    "responses": {
+      "Error": {"description": "结构化错误", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorEnvelope"}}}}
+    },
+    "schemas": {
+      "ExternalRef": {
+        "type": "object",
+        "required": ["external_run_id"],
+        "properties": {
+          "client_id": {"type": "string"},
+          "external_run_id": {"type": "string", "maxLength": 128},
+          "external_analysis_id": {"type": "string", "maxLength": 128}
+        }
+      },
+      "ManagedResource": {
+        "type": "object",
+        "required": ["root_alias", "relative_path"],
+        "properties": {
+          "root_alias": {"type": "string", "enum": ["rawdata", "database"]},
+          "relative_path": {"type": "string"},
+          "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+        }
+      },
+      "DatabaseSelection": {
+        "type": "object",
+        "properties": {
+          "reference_id": {"type": "string", "maxLength": 128},
+          "panel_id": {"type": "string", "maxLength": 128}
+        },
+        "additionalProperties": false
+      },
+      "AnalysisSubmission": {
+        "type": "object",
+        "required": ["external_ref", "workflow", "subject", "inputs"],
+        "properties": {
+          "external_ref": {"$ref": "#/components/schemas/ExternalRef"},
+          "workflow": {
+            "type": "object",
+            "required": ["source_type", "version_id", "expected_source_digest"],
+            "properties": {
+              "source_type": {"const": "workflow_version"},
+              "version_id": {"type": "integer", "minimum": 1},
+              "expected_source_digest": {"type": "string"}
+            }
+          },
+          "subject": {"type": "object", "required": ["sample_id"], "properties": {"sample_id": {"type": "string", "maxLength": 128}}},
+          "inputs": {"type": "object", "additionalProperties": true},
+          "database": {"$ref": "#/components/schemas/DatabaseSelection"},
+          "metadata": {"type": "object", "additionalProperties": true}
+        }
+      },
+      "AnalysisPreflight": {
+        "type": "object",
+        "required": ["workflow", "inputs"],
+        "properties": {
+          "workflow": {
+            "type": "object",
+            "required": ["source_type", "version_id", "expected_source_digest"],
+            "properties": {
+              "source_type": {"const": "workflow_version"},
+              "version_id": {"type": "integer", "minimum": 1},
+              "expected_source_digest": {"type": "string"}
+            }
+          },
+          "inputs": {"type": "object", "additionalProperties": true},
+          "database": {"$ref": "#/components/schemas/DatabaseSelection"},
+          "metadata": {"type": "object", "additionalProperties": true}
+        }
+      },
+      "ToolTestPreflight": {
+        "type": "object",
+        "required": ["tool", "inputs"],
+        "properties": {
+          "tool": {"type": "object", "required": ["tool_id", "version", "expected_digest"], "properties": {"tool_id": {"type": "string"}, "version": {"type": "string"}, "expected_digest": {"type": "string"}}},
+          "inputs": {"type": "object", "additionalProperties": true}
+        }
+      },
+      "ToolTestSubmission": {
+        "type": "object",
+        "required": ["external_ref", "tool", "inputs"],
+        "properties": {
+          "external_ref": {"$ref": "#/components/schemas/ExternalRef"},
+          "tool": {"type": "object", "required": ["tool_id", "version", "expected_digest"], "properties": {"tool_id": {"type": "string"}, "version": {"type": "string"}, "expected_digest": {"type": "string"}}},
+          "inputs": {"type": "object", "additionalProperties": true},
+          "label": {"type": "string", "maxLength": 256}
+        }
+      },
+      "AnalysisRun": {
+        "type": "object",
+        "required": ["id", "external_ref", "status", "status_version", "execution_status", "output_status"],
+        "properties": {
+          "id": {"type": "string", "format": "uuid"},
+          "external_ref": {"$ref": "#/components/schemas/ExternalRef"},
+          "status": {"type": "string", "enum": ["queued", "preparing", "running", "cancel_requested", "succeeded", "failed", "canceled"]},
+          "status_version": {"type": "integer", "minimum": 1},
+          "execution_status": {"type": "string"},
+          "output_status": {"type": "string", "enum": ["pending", "complete", "incomplete", "unavailable"]},
+          "progress": {"type": "integer", "minimum": 0, "maximum": 100},
+          "error": {"oneOf": [{"$ref": "#/components/schemas/Error"}, {"type": "null"}]},
+          "outputs": {"type": "array", "items": {"type": "object"}}
+        }
+      },
+      "ErrorEnvelope": {"type": "object", "required": ["error"], "properties": {"error": {"$ref": "#/components/schemas/Error"}}},
+      "Error": {
+        "type": "object",
+        "required": ["code", "category", "message", "retryable", "details"],
+        "properties": {
+          "code": {"type": "string"},
+          "category": {"type": "string", "enum": ["validation", "authentication", "authorization", "input", "workflow", "resource", "infrastructure", "application", "cancellation"]},
+          "message": {"type": "string"},
+          "retryable": {"type": "boolean"},
+          "details": {"type": "object"},
+          "request_id": {"type": "string"}
+        }
+      }
+    }
+  }
+}

@@ -43,7 +43,7 @@ const publishedSubworkflows = computed(() => mySubworkflows.value.filter(item =>
 const draftWorkflows = computed(() => myWorkflows.value.filter(item => item.kind === 'workflow' && !item.latest_version))
 const publishedTools = computed(() => tools.value.filter(item => item.latest_version))
 const myPackages = computed(() => packages.value.filter(item => item.is_mine && item.lifecycle === 'active'))
-const activeRuns = computed(() => runs.value.filter(item => ['queued', 'preparing', 'running'].includes(item.status)))
+const activeRuns = computed(() => runs.value.filter(item => ['queued', 'preparing', 'running', 'cancel_requested'].includes(item.status)))
 const failedRuns = computed(() => runs.value.filter(item => item.status === 'failed'))
 const readyRunWorkflows = computed(() => catalog.value?.workflows.filter(item => item.ready) ?? [])
 const blockedRunWorkflows = computed(() => catalog.value?.workflows.filter(item => !item.ready) ?? [])
@@ -70,8 +70,10 @@ function runStatusLabel(status: AnalysisRun['status']) {
     queued: '排队中',
     preparing: '准备中',
     running: '运行中',
+    cancel_requested: '取消中',
     succeeded: '已完成',
     failed: '失败',
+    canceled: '已取消',
   }[status]
 }
 

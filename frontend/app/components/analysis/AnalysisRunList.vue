@@ -18,8 +18,10 @@ const statusLabels: Record<string, string> = {
   queued: '排队',
   preparing: '准备',
   running: '运行中',
+  cancel_requested: '取消中',
   succeeded: '完成',
   failed: '失败',
+  canceled: '已取消',
 }
 
 function formatTime(value: string) {
