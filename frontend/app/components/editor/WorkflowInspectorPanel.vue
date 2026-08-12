@@ -6,6 +6,13 @@ const props = defineProps<{
   selectedData?: Record<string, any>
   selectedNodeId?: string
   selectedToolSpec?: Record<string, any>
+  selectedToolLifecycle?: {
+    toolId: string
+    version: string
+    isDraft: boolean
+    draftStatus: string | null
+    latestVersion: string | null
+  }
   workflowPortWdlTypes: string[]
   availableSubworkflowUpgrades: Array<Record<string, any>>
   selectedSubworkflowUpgrade?: Record<string, any>
@@ -32,6 +39,8 @@ const emit = defineEmits<{
   upgradeSubworkflow: []
   updateToolParameter: [port: Record<string, any>, event: Event]
   updateAnnotationSelection: [portName: string, values: string[]]
+  openToolReference: []
+  createToolPackage: []
   openArtifact: [artifact: any]
 }>()
 
@@ -193,6 +202,43 @@ function toggleAnnotation(option: Record<string, any>, checked: boolean) {
           <div><dt>工具版本</dt><dd><code>v{{ selectedData.version }}</code></dd></div>
           <div><dt>Docker</dt><dd><code>{{ selectedToolSpec?.container?.image ?? selectedData.dockerImage ?? '未定义' }}</code></dd></div>
         </dl>
+        <div class="tool-version-boundary">
+          <div>
+            <strong>随版本固定</strong>
+            <span>接口、容器、命令模板、资源规则</span>
+          </div>
+          <div>
+            <strong>当前节点可配置</strong>
+            <span>输入连接、参数值、注释项</span>
+          </div>
+        </div>
+        <div
+          v-if="selectedToolLifecycle"
+          class="tool-reference-state"
+          :class="{ 'tool-reference-state--draft': selectedToolLifecycle.isDraft }"
+        >
+          <div>
+            <strong>{{ selectedToolLifecycle.isDraft ? '待发布工具草稿' : '已固定工具版本' }}</strong>
+            <small>
+              {{
+                selectedToolLifecycle.isDraft
+                  ? '发布工具后，当前流程才能发布新版本。'
+                  : '当前画布不会自动跟随工具库最新版本。'
+              }}
+            </small>
+          </div>
+          <div class="tool-reference-state__actions">
+            <button
+              type="button"
+              class="text-button"
+              aria-label="以此工具创建工具包"
+              @click="emit('createToolPackage')"
+            >创建工具包</button>
+            <button type="button" class="secondary-button" @click="emit('openToolReference')">
+              {{ selectedToolLifecycle.isDraft ? '审查工具草稿' : '查看固定版本' }}
+            </button>
+          </div>
+        </div>
       </section>
 
       <section v-if="selectedData.kind === 'tool' && annotationConfig" class="inspector-section annotation-selector">
@@ -379,7 +425,7 @@ function toggleAnnotation(option: Record<string, any>, checked: boolean) {
 
       <section v-if="selectedData.kind === 'tool'" class="inspector-section">
         <div class="section-heading">
-          <h3>参数</h3>
+          <h3>本流程参数</h3>
           <span>{{ standardToolParameters.length }}</span>
         </div>
         <p v-if="standardToolParameters.length === 0" class="contract-help">
@@ -475,7 +521,7 @@ function toggleAnnotation(option: Record<string, any>, checked: boolean) {
 
     <div v-else-if="inspectorTab === 'artifacts'" class="inspector-content">
       <p v-if="artifacts.length === 0" class="empty-state empty-state--inspector">
-        尚无编译产物。验证通过后点击“编译流程”。
+        尚无编译产物。验证通过后发布流程版本。
       </p>
       <template v-else>
         <section v-for="artifact in artifacts" :key="artifact.name" class="artifact-card">

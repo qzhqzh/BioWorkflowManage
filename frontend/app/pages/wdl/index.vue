@@ -5,9 +5,8 @@ import type { WdlAsset, WdlTag } from '~/types/wdl'
 
 const { $api: $fetch } = useNuxtApp()
 
-type WorkspaceSection = 'edit' | 'tools' | 'packages' | 'artifacts' | 'runs' | 'wdl' | 'help'
-
 const assets = ref<WdlAsset[]>([])
+const { navigateSection } = useAppNavigation()
 const availableTags = ref<WdlTag[]>([])
 const searchQuery = ref('')
 const selectedTags = ref<string[]>([])
@@ -34,19 +33,6 @@ const importDraft = ref({
   sourceRepository: '',
   sourceRevision: '',
 })
-
-function navigateSection(section: WorkspaceSection) {
-  if (section === 'wdl') return
-  if (section === 'packages') {
-    void navigateTo('/wdl-packages')
-    return
-  }
-  if (section === 'runs') {
-    void navigateTo('/runs')
-    return
-  }
-  void navigateTo(`/?section=${section}`)
-}
 
 async function loadAssets() {
   loadState.value = 'loading'

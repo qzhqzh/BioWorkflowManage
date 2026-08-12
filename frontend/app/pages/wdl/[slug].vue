@@ -16,8 +16,8 @@ import type {
 } from '~/types/wdl'
 
 const { $api: $fetch } = useNuxtApp()
+const { navigateSection } = useAppNavigation()
 
-type WorkspaceSection = 'edit' | 'tools' | 'packages' | 'artifacts' | 'runs' | 'wdl' | 'help'
 type InspectorTab = 'structure' | 'diagnostics' | 'diff' | 'history'
 type WdlCodeEditorHandle = {
   applyFormattedValue: (value: string) => void
@@ -69,6 +69,18 @@ const metadataState = ref<'idle' | 'saving' | 'saved' | 'error'>('idle')
 const feedback = ref('')
 const revisionConflict = ref<RevisionConflict>()
 const metadataConflict = ref<MetadataConflict>()
+const lifecycleLoadState = ref<'loading' | 'ready' | 'error'>('loading')
+const directRunDestination = ref<{
+  ready: boolean
+  blockers: string[]
+  revision: number
+  digest: string
+}>()
+const derivedPackages = ref<Array<{
+  slug: string
+  name: string
+  latest_version?: { version: string } | null
+}>>([])
 const codeEditor = ref<WdlCodeEditorHandle>()
 const assetNameInput = ref<HTMLInputElement>()
 const assetDescriptionInput = ref<HTMLTextAreaElement>()
@@ -119,6 +131,30 @@ const isRawImportedRevision = computed(
 const analysis = computed(() => selectedRevision.value?.analysis)
 const auditEvents = computed(() => asset.value?.audit_events ?? [])
 const popularTags = computed(() => availableTags.value.slice(0, 3))
+const sourceWorkflowOrigin = computed(() => {
+  const source = asset.value?.source_repository ?? ''
+  const match = source.match(/^bioworkflow:\/\/editor\/workflows\/([A-Za-z_][A-Za-z0-9_]*)$/)
+  if (!match) return undefined
+  const versionMatch = (asset.value?.source_revision ?? '').match(/workflow-v(\d+)/)
+  const version = versionMatch ? Number(versionMatch[1]) : undefined
+  const wdlVersionMatch = (asset.value?.source_revision ?? '').match(/wdl-v(\d+)/)
+  const wdlVersion = wdlVersionMatch ? Number(wdlVersionMatch[1]) : undefined
+  return {
+    slug: match[1]!,
+    version,
+    wdlVersion,
+    to: {
+      path: '/',
+      query: {
+        section: 'artifacts',
+        workflow: match[1]!,
+        ...(wdlVersion
+          ? { wdlVersion: String(wdlVersion) }
+          : version ? { workflowVersion: String(version) } : {}),
+      },
+    },
+  }
+})
 const changeDiff = computed(() => {
   if (!dirty.value) return ''
   const version = selectedRevision.value?.version ?? '—'
@@ -145,6 +181,26 @@ const importedTasks = computed(() => new Set(
     .filter(event => event.action === 'tool_import')
     .map(event => `${event.changes.file_path}::${event.changes.task_name}`),
 ))
+const packageCreationLink = computed(() => ({
+  path: '/wdl-packages',
+  query: {
+    from: 'wdl',
+    asset: slug.value,
+    revision: String(selectedRevision.value?.version ?? latestVersion.value ?? 1),
+  },
+}))
+const directRunLink = computed(() => ({
+  path: '/runs',
+  query: {
+    workflow: slug.value,
+    revision: String(
+      directRunDestination.value?.revision
+      ?? selectedRevision.value?.version
+      ?? latestVersion.value
+      ?? 1,
+    ),
+  },
+}))
 const taskImportState = ref<Record<string, 'saving' | 'done' | 'error'>>({})
 const operationLabels: Record<WdlSourceRevision['operation'], string> = {
   import: '导入',
@@ -287,22 +343,6 @@ function localFileRequestPayload() {
     .map(file => ({ path: file.path, content: fileContents.value[file.path] ?? '' }))
 }
 
-function navigateSection(section: WorkspaceSection) {
-  if (section === 'packages') {
-    void navigateTo('/wdl-packages')
-    return
-  }
-  if (section === 'runs') {
-    void navigateTo('/runs')
-    return
-  }
-  if (section === 'wdl') {
-    void navigateTo('/wdl')
-    return
-  }
-  void navigateTo(`/?section=${section}`)
-}
-
 function applyRevision(revision: WdlSourceRevision) {
   selectedRevision.value = revision
   const files = revision.files?.length
@@ -341,6 +381,18 @@ async function loadAsset() {
     asset.value = assetResponse
     availableTags.value = tagResponse.results
     if (assetResponse.current_revision) applyRevision(assetResponse.current_revision)
+    const requestedRevision = Number(route.query.revision)
+    if (
+      Number.isInteger(requestedRevision)
+      && requestedRevision > 0
+      && requestedRevision !== assetResponse.current_revision?.version
+    ) {
+      await loadRevision(requestedRevision, false)
+    }
+    void loadLifecycleDestinations(
+      assetResponse,
+      selectedRevision.value?.version ?? assetResponse.current_revision?.version,
+    )
     selectedEvent.value = assetResponse.audit_events?.[0]
     loadState.value = 'ready'
   } catch {
@@ -348,13 +400,77 @@ async function loadAsset() {
   }
 }
 
-async function loadRevision(version: number) {
+let lifecycleLoadSequence = 0
+
+async function loadLifecycleDestinations(
+  currentAsset: WdlAsset,
+  revisionVersion?: number,
+) {
+  const sequence = ++lifecycleLoadSequence
+  lifecycleLoadState.value = 'loading'
+  directRunDestination.value = undefined
+  try {
+    const [catalog, packageResponse] = await Promise.all([
+      $fetch<{
+        workflows: Array<{
+          slug: string
+          source_slug?: string
+          source_type: 'wdl_asset' | 'workflow_version'
+          revision: number
+          digest: string
+          ready: boolean
+          blockers?: string[]
+        }>
+      }>('/api/v1/analysis/catalog', {
+        query: {
+          workflow: currentAsset.slug,
+          ...(revisionVersion ? { revision: revisionVersion } : {}),
+        },
+      }),
+      $fetch<{ results: Array<{
+        slug: string
+        name: string
+        latest_version?: {
+          version: string
+          source_repository?: string
+        } | null
+      }> }>('/api/v1/wdl-packages', { query: { lifecycle: 'active' } }),
+    ])
+    if (sequence !== lifecycleLoadSequence) return
+    const runDestination = catalog.workflows.find(
+      item => item.source_type === 'wdl_asset'
+        && (item.source_slug ?? item.slug) === currentAsset.slug
+        && (!revisionVersion || item.revision === revisionVersion),
+    )
+    directRunDestination.value = runDestination
+      ? {
+          ready: runDestination.ready,
+          blockers: runDestination.blockers ?? [],
+          revision: runDestination.revision,
+          digest: runDestination.digest,
+        }
+      : undefined
+    const sourceRepository = `bioworkflow://wdl-assets/${currentAsset.slug}`
+    derivedPackages.value = packageResponse.results.filter(
+      item => item.latest_version?.source_repository === sourceRepository,
+    )
+    lifecycleLoadState.value = 'ready'
+  } catch {
+    if (sequence !== lifecycleLoadSequence) return
+    lifecycleLoadState.value = 'error'
+  }
+}
+
+async function loadRevision(version: number, refreshLifecycle = true) {
   if (dirty.value && !window.confirm('当前未保存的修改会丢失，继续切换版本吗？')) return
   try {
     const revision = await $fetch<WdlSourceRevision>(
       `/api/v1/wdl-assets/${encodeURIComponent(slug.value)}/revisions/${version}`,
     )
     applyRevision(revision)
+    if (refreshLifecycle && asset.value) {
+      void loadLifecycleDestinations(asset.value, revision.version)
+    }
   } catch {
     feedback.value = `WDL v${version} 读取失败。`
   }
@@ -452,6 +568,9 @@ async function saveRevision() {
       // The immutable revision is already saved; keep it usable if refresh fails.
     }
     saveState.value = 'saved'
+    if (asset.value) {
+      void loadLifecycleDestinations(asset.value, visibleRevision.version)
+    }
     feedback.value = visibleRevision.version > revision.version
       ? `WDL v${revision.version} 已保存；已载入最新版本 v${visibleRevision.version}。`
       : `WDL v${revision.version} 已保存并写入操作历史。`
@@ -1079,6 +1198,9 @@ onBeforeRouteLeave(() => {
     <main v-if="loadState === 'ready' && asset" class="section-workspace wdl-workbench">
       <aside class="wdl-workbench__sidebar">
         <NuxtLink class="back-link" to="/wdl">← 返回 WDL 资产</NuxtLink>
+        <NuxtLink v-if="sourceWorkflowOrigin" class="wdl-source-workflow-link" :to="sourceWorkflowOrigin.to">
+          来源流程 {{ sourceWorkflowOrigin.slug }}<template v-if="sourceWorkflowOrigin.wdlVersion"> · WDL v{{ sourceWorkflowOrigin.wdlVersion }}</template><template v-if="sourceWorkflowOrigin.version"> · 基于 v{{ sourceWorkflowOrigin.version }}</template>
+        </NuxtLink>
         <div class="wdl-asset-heading">
           <h1
             v-if="editingMetadataField !== 'name'"
@@ -1122,6 +1244,43 @@ onBeforeRouteLeave(() => {
             @keydown.esc.prevent="cancelMetadataEdit"
           />
         </div>
+
+        <section class="wdl-lifecycle-path" aria-label="WDL 迁移与使用路径">
+          <article>
+            <div>
+              <strong>固定工具包</strong>
+              <small v-if="derivedPackages[0]">已固定 · {{ derivedPackages[0].latest_version?.version }}</small>
+              <small v-else>{{ lifecycleLoadState === 'loading' ? '正在检查…' : '尚未固定' }}</small>
+            </div>
+            <NuxtLink
+              class="text-button"
+              :to="derivedPackages[0] ? `/wdl-packages/${derivedPackages[0].slug}` : packageCreationLink"
+            >{{ derivedPackages[0] ? '查看' : '创建' }}</NuxtLink>
+          </article>
+          <article>
+            <div>
+              <strong>拆解工具</strong>
+              <small>{{ importedTasks.size }} / {{ analysis?.summary.task_count ?? 0 }} 已导入</small>
+            </div>
+            <button class="text-button" type="button" @click="inspectorTab = 'structure'">查看 Tasks</button>
+          </article>
+          <article>
+            <div>
+              <strong>直接运行</strong>
+              <small>
+                {{ directRunDestination
+                  ? `v${directRunDestination.revision} · ${directRunDestination.ready ? '运行配置就绪' : directRunDestination.blockers[0] || '运行前检查未通过'}`
+                  : (lifecycleLoadState === 'loading' ? '正在检查…' : '未配置受管运行') }}
+              </small>
+            </div>
+            <NuxtLink
+              v-if="directRunDestination"
+              class="text-button"
+              :to="directRunLink"
+            >去运行</NuxtLink>
+            <span v-else>—</span>
+          </article>
+        </section>
 
         <div
           v-if="metadataConflict"

@@ -298,6 +298,7 @@ def test_standard_and_annotation_tasks_compile_to_stable_miniwdl_workflow():
     )
     assert wdl.startswith("version development")
     assert "Directory input_humandb" in wdl
+    assert 'Array[String] annotation_items = ["refgene", "cytoband", "clinvar", "thousand_genomes", "dbsnp", "cosmic", "dbnsfp", "exac", "gnomad_genome"]' in wdl
     assert "~{sep=',' annotation_items}" in wdl
     assert "call normalize_vcf as normalize" in wdl
     assert f"call {ANNOVAR_TOOL_ID} as annotate" in wdl
@@ -324,12 +325,20 @@ def test_annotation_workflow_publishes_an_immutable_reusable_version():
 
     first = client.post(
         "/api/v1/editor/workflows/selectable_annotation_demo/versions",
-        {"reuse_unchanged": True},
+        {
+            "reuse_unchanged": True,
+            "base_document_version": saved.data["document_version"],
+            "base_document_digest": saved.data["document_digest"],
+        },
         format="json",
     )
     repeated = client.post(
         "/api/v1/editor/workflows/selectable_annotation_demo/versions",
-        {"reuse_unchanged": True},
+        {
+            "reuse_unchanged": True,
+            "base_document_version": saved.data["document_version"],
+            "base_document_digest": saved.data["document_digest"],
+        },
         format="json",
     )
 

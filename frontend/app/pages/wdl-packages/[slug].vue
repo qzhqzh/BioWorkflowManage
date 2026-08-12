@@ -4,6 +4,7 @@ import AppTopbar from '~/components/layout/AppTopbar.vue'
 import WdlCodeEditor from '~/components/wdl/WdlCodeEditor.vue'
 import WdlFileTree from '~/components/wdl/WdlFileTree.vue'
 import type {
+  WdlAnalysis,
   WdlSourceFile,
   WdlTaskDefinition,
   WdlToolPackage,
@@ -11,10 +12,10 @@ import type {
 } from '~/types/wdl'
 
 const { $api: $fetch } = useNuxtApp()
+const { navigateSection } = useAppNavigation()
 const route = useRoute()
 const slug = computed(() => String(route.params.slug))
 
-type WorkspaceSection = 'edit' | 'tools' | 'packages' | 'artifacts' | 'runs' | 'wdl' | 'help'
 type InspectorTab = 'tasks' | 'diagnostics' | 'references' | 'history' | 'publish'
 type EditorHandle = { revealLine: (line: number) => void }
 
@@ -24,8 +25,13 @@ const activeFilePath = ref('')
 const loadState = ref<'loading' | 'ready' | 'error'>('loading')
 const inspectorTab = ref<InspectorTab>('tasks')
 const feedback = ref('')
-const publishState = ref<'idle' | 'saving' | 'error'>('idle')
+const publishState = ref<'idle' | 'previewing' | 'ready' | 'saving' | 'error'>('idle')
 const publishError = ref('')
+const publishPreview = ref<{
+  preview_digest: string
+  can_publish: boolean
+  analysis: WdlAnalysis
+}>()
 const extractState = ref<'idle' | 'saving' | 'error'>('idle')
 const extractResult = ref<{ taskCount: number; createdCount: number; reusedCount: number }>()
 const publishFile = ref<File>()
@@ -41,22 +47,12 @@ const content = computed({
   set: () => undefined,
 })
 const analysis = computed(() => selectedVersion.value?.analysis)
-
-function navigateSection(section: WorkspaceSection) {
-  if (section === 'packages') {
-    void navigateTo('/wdl-packages')
-    return
-  }
-  if (section === 'wdl') {
-    void navigateTo('/wdl')
-    return
-  }
-  if (section === 'runs') {
-    void navigateTo('/runs')
-    return
-  }
-  void navigateTo(`/?section=${section}`)
-}
+const packageSourceLink = computed(() => {
+  const source = selectedVersion.value?.source_repository ?? ''
+  const match = source.match(/^bioworkflow:\/\/wdl-assets\/([A-Za-z0-9_-]+)$/)
+  if (!match) return ''
+  return `/wdl/${encodeURIComponent(match[1]!)}`
+})
 
 async function loadVersion(version: string) {
   try {
@@ -65,6 +61,12 @@ async function loadVersion(version: string) {
     )
     activeFilePath.value = selectedVersion.value.files[0]?.path ?? ''
     feedback.value = ''
+    if (route.query.version !== version) {
+      await navigateTo({
+        path: route.path,
+        query: { ...route.query, version },
+      }, { replace: true })
+    }
   } catch {
     feedback.value = `版本 ${version} 读取失败。`
   }
@@ -95,13 +97,41 @@ function showTask(task: WdlTaskDefinition) {
 
 function selectPublishFile(event: Event) {
   publishFile.value = (event.target as HTMLInputElement).files?.[0]
+  publishPreview.value = undefined
+  publishState.value = 'idle'
   publishError.value = ''
 }
 
-async function publishVersion() {
-  if (!publishFile.value || !publishDraft.value.version.trim()) {
+async function previewPublishVersion() {
+  if (!publishFile.value) {
     publishState.value = 'error'
-    publishError.value = '请选择 ZIP，并填写版本。'
+    publishError.value = '请先选择 ZIP。'
+    return
+  }
+  publishState.value = 'previewing'
+  publishError.value = ''
+  try {
+    const body = new FormData()
+    body.append('archive', publishFile.value)
+    const preview = await $fetch<{
+      preview_digest: string
+      can_publish: boolean
+      analysis: WdlAnalysis
+    }>('/api/v1/wdl-packages/preview', { method: 'POST', body })
+    publishPreview.value = preview
+    publishState.value = preview.can_publish ? 'ready' : 'error'
+    if (!preview.can_publish) publishError.value = '请先处理检查结果中的问题。'
+  } catch (error: any) {
+    publishPreview.value = undefined
+    publishState.value = 'error'
+    publishError.value = error?.data?.error?.message ?? 'ZIP 分析失败。'
+  }
+}
+
+async function publishVersion() {
+  if (!publishFile.value || !publishDraft.value.version.trim() || !publishPreview.value?.can_publish) {
+    publishState.value = 'error'
+    publishError.value = '请先分析 ZIP，再填写版本并发布。'
     return
   }
   publishState.value = 'saving'
@@ -113,12 +143,15 @@ async function publishVersion() {
     body.append('source_repository', publishDraft.value.sourceRepository.trim())
     body.append('source_revision', publishDraft.value.sourceRevision.trim())
     body.append('note', publishDraft.value.note.trim())
+    body.append('confirm_preview', 'true')
+    body.append('preview_digest', publishPreview.value.preview_digest)
     const created = await $fetch<WdlToolPackageVersion>(
       `/api/v1/wdl-packages/${encodeURIComponent(slug.value)}/versions`,
       { method: 'POST', body },
     )
     publishState.value = 'idle'
     publishFile.value = undefined
+    publishPreview.value = undefined
     publishDraft.value = { version: '', sourceRepository: '', sourceRevision: '', note: '' }
     if (publishInput.value) publishInput.value.value = ''
     inspectorTab.value = 'tasks'
@@ -190,7 +223,9 @@ async function toggleArchive() {
   }
 }
 
-onMounted(() => void loadPackage())
+onMounted(() => void loadPackage(
+  typeof route.query.version === 'string' ? route.query.version : undefined,
+))
 </script>
 
 <template>
@@ -234,6 +269,21 @@ onMounted(() => void loadPackage())
             <span v-for="tag in packageAsset.tags" :key="tag">{{ tag }}</span>
           </div>
         </div>
+
+        <section class="wdl-package-provenance" aria-label="工具包版本来源">
+          <div>
+            <span>固定版本</span>
+            <strong>{{ selectedVersion.version }}</strong>
+          </div>
+          <div v-if="selectedVersion.source_repository">
+            <span>来源</span>
+            <NuxtLink v-if="packageSourceLink" :to="packageSourceLink">
+              {{ selectedVersion.source_revision || selectedVersion.source_repository }}
+            </NuxtLink>
+            <code v-else>{{ selectedVersion.source_revision || selectedVersion.source_repository }}</code>
+          </div>
+          <code>{{ selectedVersion.digest }}</code>
+        </section>
 
         <section class="wdl-sidebar-section wdl-source-files">
           <h2>文件 <span>{{ sourceFiles.length }}</span></h2>
@@ -371,13 +421,30 @@ onMounted(() => void loadPackage())
           <button class="button button--ghost" type="button" @click="publishInput?.click()">
             {{ publishFile?.name || '选择 ZIP' }}
           </button>
+          <button
+            class="button button--ghost"
+            type="button"
+            :disabled="!publishFile || publishState === 'previewing' || publishState === 'saving'"
+            @click="previewPublishVersion"
+          >{{ publishState === 'previewing' ? '正在分析…' : '分析内容' }}</button>
+          <div v-if="publishPreview" class="wdl-package-publish__preview" aria-label="新版本分析预览">
+            <strong>{{ publishPreview.can_publish ? '内容检查通过' : '内容需要处理' }}</strong>
+            <span>
+              {{ publishPreview.analysis.summary.task_count }} task ·
+              {{ publishPreview.analysis.files?.length ?? 0 }} 文件
+            </span>
+          </div>
           <label class="field"><span>版本</span><input v-model="publishDraft.version" required placeholder="1.1.0" /></label>
           <label class="field"><span>来源仓库</span><input v-model="publishDraft.sourceRepository" /></label>
           <label class="field"><span>来源版本</span><input v-model="publishDraft.sourceRevision" /></label>
           <label class="field"><span>备注</span><input v-model="publishDraft.note" /></label>
           <p v-if="publishError" class="inline-error" role="alert">{{ publishError }}</p>
-          <button class="button button--primary" type="submit" :disabled="publishState === 'saving'">
-            {{ publishState === 'saving' ? '正在分析…' : '发布版本' }}
+          <button
+            class="button button--primary"
+            type="submit"
+            :disabled="publishState === 'saving' || !publishPreview?.can_publish"
+          >
+            {{ publishState === 'saving' ? '正在发布…' : '发布版本' }}
           </button>
         </form>
       </aside>
@@ -418,5 +485,44 @@ onMounted(() => void loadPackage())
 .wdl-package-reference-asset code {
   color: var(--color-muted);
   font-size: 11px;
+}
+
+.wdl-package-publish__preview {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+}
+
+.wdl-package-publish__preview span {
+  color: var(--color-muted);
+  font-size: 12px;
+}
+
+.wdl-package-provenance {
+  display: grid;
+  gap: var(--space-2);
+  padding-bottom: var(--space-3);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.wdl-package-provenance > div {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.wdl-package-provenance span,
+.wdl-package-provenance > code {
+  color: var(--color-muted);
+  font-size: var(--text-caption);
+}
+
+.wdl-package-provenance > code {
+  overflow-wrap: anywhere;
 }
 </style>

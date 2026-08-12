@@ -58,6 +58,8 @@ class Command(BaseCommand):
                 "workflow_graph": graph,
                 "editor_document": editor_document,
                 "tool_specs": tools,
+                "created_by": "zhuqin",
+                "updated_by": "zhuqin",
             },
         )
         self._seed_compiled_snapshot(
@@ -79,6 +81,8 @@ class Command(BaseCommand):
                 "workflow_graph": fastp_graph,
                 "editor_document": fastp_editor,
                 "tool_specs": [tools[0]],
+                "created_by": "zhuqin",
+                "updated_by": "zhuqin",
             },
         )
         self._seed_compiled_snapshot(
@@ -111,6 +115,8 @@ class Command(BaseCommand):
                 "workflow_graph": subflow_graph,
                 "editor_document": subflow_editor,
                 "tool_specs": [tools[0]],
+                "created_by": "zhuqin",
+                "updated_by": "zhuqin",
             },
         )
         contract = {
@@ -134,6 +140,10 @@ class Command(BaseCommand):
             kind=WorkflowDocument.Kind.SUBWORKFLOW,
             interface_contract=contract,
         )
+        WorkflowDocument.objects.filter(
+            slug__in=[graph["id"], fastp_graph["id"], subflow_graph["id"]],
+            created_by="local-user",
+        ).update(created_by="zhuqin")
         self.stdout.write(
             "Created Phase 1 demos." if created else "Phase 1 demos already exist."
         )
@@ -180,6 +190,20 @@ class Command(BaseCommand):
         validation, artifacts = compile_workflow(graph, tools)
         if validation["status"] != "valid":
             raise CommandError(f"Demo workflow {workflow.slug} did not compile.")
+        compiled_bundle = {
+            "entrypoint": "workflow.wdl",
+            "files": {
+                item["name"]: item["content"]
+                for item in artifacts
+                if item.get("media_type") == "application/wdl"
+            },
+            "call_count": sum(
+                1
+                for node in graph.get("nodes", [])
+                if node.get("type") in {"tool", "subworkflow"}
+            ),
+        }
+        compiled_digest = canonical_digest(compiled_bundle)
         workflow_version, _ = WorkflowVersion.objects.get_or_create(
             workflow=workflow,
             version=1,
@@ -193,8 +217,22 @@ class Command(BaseCommand):
                 "tool_specs": tools,
                 "interface_contract": interface_contract or {},
                 "subworkflow_references": [],
+                "compiled_bundle": compiled_bundle,
+                "compiled_digest": compiled_digest,
+                "compiler_profile": "compiler-core-v1",
             },
         )
+        if not workflow_version.compiled_bundle or not workflow_version.compiled_digest:
+            workflow_version.compiled_bundle = compiled_bundle
+            workflow_version.compiled_digest = compiled_digest
+            workflow_version.compiler_profile = "compiler-core-v1"
+            workflow_version.save(
+                update_fields=[
+                    "compiled_bundle",
+                    "compiled_digest",
+                    "compiler_profile",
+                ]
+            )
         CompilationRecord.objects.get_or_create(
             workflow=workflow,
             request_id=request_id,

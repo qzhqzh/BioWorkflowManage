@@ -1,6 +1,7 @@
 export default defineNuxtRouteMiddleware(async (to) => {
   if (import.meta.server) return
-  const { $api } = useNuxtApp()
+  const nuxtApp = useNuxtApp()
+  const { $api } = nuxtApp
   const auth = useAuth()
   if (!auth.ready.value) {
     try {
@@ -13,12 +14,14 @@ export default defineNuxtRouteMiddleware(async (to) => {
     }
   }
   if (to.path === '/login') {
-    if (auth.user.value) return navigateTo(defaultRouteForUser(auth.user.value))
+    if (auth.user.value) {
+      return navigateTo(defaultRouteForUser(auth.user.value), { external: nuxtApp.isHydrating })
+    }
     return
   }
-  if (!auth.user.value) return navigateTo('/login')
+  if (!auth.user.value) return navigateTo('/login', { external: nuxtApp.isHydrating })
   const section = routeSection(to.path, to.query.section)
   if (!auth.user.value.allowed_sections.includes(section)) {
-    return navigateTo(defaultRouteForUser(auth.user.value))
+    return navigateTo(defaultRouteForUser(auth.user.value), { external: nuxtApp.isHydrating })
   }
 })

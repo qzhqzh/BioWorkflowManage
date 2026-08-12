@@ -94,7 +94,7 @@ async function mockWdlApi(page: Page, options: {
     body: JSON.stringify({
       user: {
         username: 'zhuqin', is_admin: true, role: 'admin',
-        allowed_sections: ['edit', 'tools', 'packages', 'artifacts', 'runs', 'wdl', 'help'],
+        allowed_sections: ['overview', 'edit', 'tools', 'packages', 'artifacts', 'runs', 'wdl', 'help'],
       },
     }),
   }))
@@ -433,9 +433,64 @@ async function mockWdlApi(page: Page, options: {
       body: JSON.stringify({ results: [] }),
     })
   })
+  await page.route('**/api/v1/analysis/catalog*', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      workflows: [{
+        slug: 'solid-tumor-hg38',
+        source_slug: 'solid-tumor-hg38',
+        source_type: 'wdl_asset',
+        revision: revisionVersion,
+        digest: currentRevision().digest,
+        ready: true,
+        blockers: [],
+      }],
+    }),
+  }))
 
   return { metadataRequests, revisionRequests, tagRequests }
 }
+
+test('shows explicit package, tool extraction, and direct-run paths', async ({ page }) => {
+  await mockWdlApi(page)
+  await page.goto('/wdl/solid-tumor-hg38')
+
+  const lifecycle = page.getByLabel('WDL 迁移与使用路径')
+  await expect(lifecycle).toContainText('固定工具包')
+  await expect(lifecycle).toContainText('0 / 1 已导入')
+  await expect(lifecycle.getByRole('link', { name: '创建', exact: true })).toHaveAttribute(
+    'href',
+    '/wdl-packages?from=wdl&asset=solid-tumor-hg38&revision=1',
+  )
+  await expect(lifecycle.getByRole('link', { name: '去运行', exact: true })).toHaveAttribute(
+    'href',
+    '/runs?workflow=solid-tumor-hg38&revision=1',
+  )
+})
+
+test('imports one historical WDL task into an exact tool draft', async ({ page }) => {
+  await mockWdlApi(page)
+  let importRequest: Record<string, any> | undefined
+  await page.route('**/api/v1/wdl-assets/solid-tumor-hg38/tasks/import', async (route) => {
+    importRequest = route.request().postDataJSON()
+    await route.fulfill({
+      status: 201,
+      contentType: 'application/json',
+      body: JSON.stringify({ tool_id: 'hello' }),
+    })
+  })
+  await page.goto('/wdl/solid-tumor-hg38')
+
+  await page.getByRole('button', { name: '导入工具', exact: true }).click()
+
+  expect(importRequest).toEqual({
+    version: 1,
+    file_path: 'solid-tumor.wdl',
+    task_name: 'hello',
+  })
+  await expect(page).toHaveURL(/section=tools.*tool=hello/)
+})
 
 test('references a fixed tool-package version without copying package files into the revision', async ({ page }) => {
   await mockWdlApi(page)

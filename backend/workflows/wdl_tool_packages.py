@@ -13,14 +13,18 @@ from rest_framework import status
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 
+from compiler_core import canonical_digest, render_tool_wdl, validate_tool_spec
+
 from .models import (
     WDLToolPackage,
     WDLToolPackageAuditEvent,
     WDLToolPackageFile,
     WDLToolPackageTag,
     WDLToolPackageVersion,
+    WorkflowDocument,
 )
 from .request_ids import request_id, with_request_id
+from .workflow_document_state import workflow_document_digest
 from .wdl_packages import (
     WDLPackageError,
     analyze_wdl_library,
@@ -30,7 +34,11 @@ from .wdl_packages import (
     read_wdl_library_archive,
 )
 from .wdl_source_references import current_source_references
-from .wdl_task_import import WDLTaskImportError, import_package_task_as_tool_draft
+from .wdl_task_import import (
+    WDLTaskImportError,
+    import_package_task_as_tool_draft,
+    recommended_package_tool_id,
+)
 
 
 VERSION_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}\Z")
@@ -126,6 +134,158 @@ def _request_files(request) -> dict[str, str]:
     )
 
 
+@api_view(["POST"])
+def workflow_tool_package_source(request, slug: str):
+    document = WorkflowDocument.objects.filter(slug=slug).first()
+    if document is None:
+        return _error(
+            request,
+            "WORKFLOW_NOT_FOUND",
+            "Workflow not found.",
+            status.HTTP_404_NOT_FOUND,
+        )
+
+    base_version = request.data.get("base_document_version")
+    base_digest = request.data.get("base_document_digest")
+    if base_version is None or not base_digest:
+        return _error(
+            request,
+            "WORKFLOW_PACKAGE_SOURCE_PRECONDITION_REQUIRED",
+            "从画布创建工具包必须携带当前文档版本和摘要，请刷新后重试。",
+            status.HTTP_428_PRECONDITION_REQUIRED,
+        )
+    if (
+        not isinstance(base_version, int)
+        or base_version < 1
+        or not isinstance(base_digest, str)
+    ):
+        return _error(
+            request,
+            "WORKFLOW_PACKAGE_SOURCE_PRECONDITION_INVALID",
+            "流程文档版本或摘要格式无效。",
+            status.HTTP_400_BAD_REQUEST,
+        )
+    current_digest = workflow_document_digest(document)
+    if document.document_version != base_version or current_digest != base_digest:
+        return _error(
+            request,
+            "WORKFLOW_PACKAGE_SOURCE_CONFLICT",
+            "当前画布已被更新，请返回编辑器刷新后重新创建工具包。",
+            status.HTTP_409_CONFLICT,
+            details={
+                "current_document_version": document.document_version,
+                "current_document_digest": current_digest,
+            },
+        )
+
+    requested = request.data.get("tool_digests")
+    if not isinstance(requested, list) or not requested:
+        return _error(
+            request,
+            "WORKFLOW_PACKAGE_SOURCE_TOOLS_REQUIRED",
+            "请至少选择一个当前画布中的工具版本。",
+            status.HTTP_400_BAD_REQUEST,
+        )
+    if any(not isinstance(item, str) for item in requested):
+        return _error(
+            request,
+            "WORKFLOW_PACKAGE_SOURCE_TOOLS_INVALID",
+            "tool_digests 必须是工具摘要数组。",
+            status.HTTP_400_BAD_REQUEST,
+        )
+
+    used_digests = {
+        str((node.get("tool_ref") or {}).get("digest") or "")
+        for node in document.workflow_graph.get("nodes", [])
+        if node.get("type") == "tool"
+    }
+    specs_by_digest = {
+        canonical_digest(spec): spec
+        for spec in document.tool_specs
+        if isinstance(spec, dict)
+    }
+    unique_requested = list(dict.fromkeys(requested))
+    unavailable = [
+        digest
+        for digest in unique_requested
+        if digest not in used_digests or digest not in specs_by_digest
+    ]
+    if unavailable:
+        return _error(
+            request,
+            "WORKFLOW_PACKAGE_SOURCE_TOOL_NOT_REFERENCED",
+            "只能打包当前画布实际引用的工具版本。",
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            details={"tool_digests": unavailable},
+        )
+
+    generated = []
+    files: dict[str, str] = {}
+    for digest in unique_requested:
+        spec = specs_by_digest[digest]
+        validation = validate_tool_spec(spec)
+        if validation["status"] != "valid":
+            return _error(
+                request,
+                "WORKFLOW_PACKAGE_SOURCE_TOOL_INVALID",
+                f"工具 {spec.get('id', digest)} 未通过 ToolSpec 校验。",
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                details={"tool_digest": digest, "validation": validation},
+            )
+        tool_id = str(spec["id"])
+        path = f"tasks/{tool_id}.wdl"
+        content = render_tool_wdl(spec)
+        files[path] = content
+        generated.append(
+            {
+                "path": path,
+                "content": content,
+                "tool_id": tool_id,
+                "tool_version": str(spec["tool_version"]),
+                "tool_digest": digest,
+            }
+        )
+
+    analysis = analyze_wdl_library(files)
+    if analysis["status"] != "valid":
+        return _error(
+            request,
+            "WORKFLOW_PACKAGE_SOURCE_WDL_INVALID",
+            "当前工具版本无法生成有效的 WDL 工具包。",
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            details={"analysis": analysis},
+        )
+    latest = WorkflowDocument.objects.filter(pk=document.pk).first()
+    if (
+        latest is None
+        or latest.document_version != base_version
+        or workflow_document_digest(latest) != base_digest
+    ):
+        return _error(
+            request,
+            "WORKFLOW_PACKAGE_SOURCE_CONFLICT",
+            "生成工具包期间画布已被更新，请返回编辑器刷新后重试。",
+            status.HTTP_409_CONFLICT,
+        )
+    return with_request_id(
+        Response(
+            {
+                "workflow": {
+                    "slug": document.slug,
+                    "name": document.name,
+                    "document_version": document.document_version,
+                    "document_digest": current_digest,
+                },
+                "files": generated,
+                "preview_digest": package_digest(files),
+                "can_publish": True,
+                "analysis": analysis,
+            }
+        ),
+        request_id(request),
+    )
+
+
 def _file_payload(item: WDLToolPackageFile, *, include_content: bool = False) -> dict:
     return {
         "path": item.path,
@@ -169,7 +329,12 @@ def _audit_payload(item: WDLToolPackageAuditEvent) -> dict:
     }
 
 
-def _package_payload(item: WDLToolPackage, *, include_detail: bool = False) -> dict:
+def _package_payload(
+    item: WDLToolPackage,
+    *,
+    include_detail: bool = False,
+    actor: str | None = None,
+) -> dict:
     latest = item.versions.first()
     references = current_source_references().filter(package_version__package=item)
     payload = {
@@ -179,6 +344,7 @@ def _package_payload(item: WDLToolPackage, *, include_detail: bool = False) -> d
         "lifecycle": item.lifecycle,
         "tags": [tag.name for tag in item.tags.all()],
         "created_by": item.created_by,
+        "is_mine": actor is not None and item.created_by == actor,
         "created_at": item.created_at.isoformat(),
         "updated_at": item.updated_at.isoformat(),
         "version_count": item.versions.count(),
@@ -229,6 +395,38 @@ def _create_version(request, package: WDLToolPackage):
             status.HTTP_400_BAD_REQUEST,
             details=error.details,
         )
+    content_digest = package_digest(files)
+    preview_digest = str(request.data.get("preview_digest") or "").strip()
+    confirm_preview = str(request.data.get("confirm_preview") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    if confirm_preview and not preview_digest:
+        return None, False, _error(
+            request,
+            "WDL_TOOL_PACKAGE_PREVIEW_REQUIRED",
+            "Preview the WDL package before confirming this version.",
+            status.HTTP_428_PRECONDITION_REQUIRED,
+        )
+    if preview_digest and preview_digest != content_digest:
+        return None, False, _error(
+            request,
+            "WDL_TOOL_PACKAGE_PREVIEW_STALE",
+            "The WDL package changed after preview. Analyze it again before creating the version.",
+            status.HTTP_409_CONFLICT,
+        )
+    if analysis["status"] != "valid":
+        return None, False, _error(
+            request,
+            "WDL_TOOL_PACKAGE_PREVIEW_INVALID",
+            "Resolve the WDL diagnostics before creating a fixed package version.",
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            details={
+                "summary": analysis["summary"],
+                "diagnostics": analysis["diagnostics"],
+            },
+        )
     if analysis["summary"]["task_count"] == 0:
         return None, False, _error(
             request,
@@ -237,7 +435,6 @@ def _create_version(request, package: WDLToolPackage):
             status.HTTP_400_BAD_REQUEST,
         )
 
-    content_digest = package_digest(files)
     existing = package.versions.filter(version=version).first()
     if existing is not None:
         if existing.digest == content_digest:
@@ -296,6 +493,35 @@ def _create_version(request, package: WDLToolPackage):
     return package_version, True, None
 
 
+@api_view(["POST"])
+def preview_wdl_tool_package(request):
+    value = request_id(request)
+    try:
+        files = _request_files(request)
+        analysis = analyze_wdl_library(files)
+    except WDLPackageError as error:
+        return _error(
+            request,
+            error.code,
+            error.message,
+            status.HTTP_400_BAD_REQUEST,
+            details=error.details,
+        )
+    can_publish = (
+        analysis["status"] == "valid" and analysis["summary"]["task_count"] > 0
+    )
+    return with_request_id(
+        Response(
+            {
+                "preview_digest": package_digest(files),
+                "can_publish": can_publish,
+                "analysis": analysis,
+            }
+        ),
+        value,
+    )
+
+
 @api_view(["GET", "POST"])
 def wdl_tool_packages(request):
     value = request_id(request)
@@ -316,7 +542,14 @@ def wdl_tool_packages(request):
         if tags:
             packages = packages.filter(tags__name__in=tags).distinct()
         return with_request_id(
-            Response({"results": [_package_payload(item) for item in packages]}),
+            Response(
+                {
+                    "results": [
+                        _package_payload(item, actor=_actor(request))
+                        for item in packages
+                    ]
+                }
+            ),
             value,
         )
 
@@ -351,7 +584,10 @@ def wdl_tool_packages(request):
             changes={"tags": {"before": [], "after": canonical_tags}},
         )
     return with_request_id(
-        Response(_package_payload(package, include_detail=True), status=status.HTTP_201_CREATED),
+        Response(
+            _package_payload(package, include_detail=True, actor=_actor(request)),
+            status=status.HTTP_201_CREATED,
+        ),
         value,
     )
 
@@ -391,7 +627,12 @@ def wdl_tool_package_detail(request, slug: str):
         )
     value = request_id(request)
     if request.method == "GET":
-        return with_request_id(Response(_package_payload(package, include_detail=True)), value)
+        return with_request_id(
+            Response(
+                _package_payload(package, include_detail=True, actor=_actor(request))
+            ),
+            value,
+        )
 
     changes = {}
     if "name" in request.data:
@@ -445,7 +686,10 @@ def wdl_tool_package_detail(request, slug: str):
             note=str(request.data.get("note") or "").strip(),
             changes=changes,
         )
-    return with_request_id(Response(_package_payload(package, include_detail=True)), value)
+    return with_request_id(
+        Response(_package_payload(package, include_detail=True, actor=_actor(request))),
+        value,
+    )
 
 
 @api_view(["GET", "POST"])
@@ -536,6 +780,14 @@ def extract_wdl_tool_package_tasks(request, slug: str):
     tasks = package_version.analysis.get("tasks", [])
     actor = _actor(request)
     replace = bool(request.data.get("replace", False))
+    base_drafts = request.data.get("base_drafts", {})
+    if replace and not isinstance(base_drafts, dict):
+        return _error(
+            request,
+            "TOOL_DRAFT_PRECONDITION_INVALID",
+            "base_drafts must map tool IDs to draft version and digest.",
+            status.HTTP_400_BAD_REQUEST,
+        )
     results = []
     created_count = 0
     warning_count = 0
@@ -552,12 +804,19 @@ def extract_wdl_tool_package_tasks(request, slug: str):
                 status.HTTP_409_CONFLICT,
             )
         try:
+            tool_id = recommended_package_tool_id(
+                package_version, source_file.path, task_name
+            )
+            raw_base_draft = base_drafts.get(tool_id, {}) if replace else {}
+            base_draft = raw_base_draft if isinstance(raw_base_draft, dict) else {}
             document, created, warnings = import_package_task_as_tool_draft(
                 package_version=package_version,
                 source_file=source_file,
                 task_name=task_name,
                 actor=actor,
                 replace=replace,
+                base_draft_version=base_draft.get("version"),
+                base_draft_digest=str(base_draft.get("digest") or ""),
             )
         except WDLTaskImportError as error:
             transaction.set_rollback(True)
@@ -565,9 +824,13 @@ def extract_wdl_tool_package_tasks(request, slug: str):
                 request,
                 error.code,
                 error.message,
-                status.HTTP_409_CONFLICT
-                if error.code == "TOOL_DRAFT_EXISTS"
-                else status.HTTP_400_BAD_REQUEST,
+                (
+                    428
+                    if error.code == "TOOL_DRAFT_PRECONDITION_REQUIRED"
+                    else status.HTTP_409_CONFLICT
+                    if error.code in {"TOOL_DRAFT_EXISTS", "TOOL_DRAFT_CONFLICT"}
+                    else status.HTTP_400_BAD_REQUEST
+                ),
             )
         created_count += int(created)
         warning_count += len(warnings)

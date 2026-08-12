@@ -16,12 +16,20 @@ const statusLabels: Record<string, string> = {
 
 const events = computed(() => [...(props.run?.events ?? [])].reverse().slice(0, 30))
 const timing = computed(() => props.run?.timing)
+const graphSummary = computed(() => props.run?.workflow.graph_summary)
 const taskTimings = computed(() => timing.value?.tasks ?? [])
 const timingScale = computed(() => Math.max(
   timing.value?.execution_seconds ?? 0,
   ...taskTimings.value.map(task => task.offset_seconds + task.duration_seconds),
   1,
 ))
+const workflowLink = computed(() => {
+  if (!props.run) return ''
+  if (props.run.workflow.source_type === 'workflow_version') {
+    return `/?section=artifacts&workflow=${encodeURIComponent(props.run.workflow.slug)}&workflowVersion=${props.run.workflow.revision}`
+  }
+  return `/wdl/${encodeURIComponent(props.run.workflow.slug)}?revision=${props.run.workflow.revision}`
+})
 
 const taskStatusLabels = {
   running: '运行中',
@@ -76,7 +84,10 @@ function taskBarStyle(offset: number, duration: number) {
     <template v-else>
       <header class="analysis-run-header">
         <div>
-          <span>{{ run.workflow.name }} · v{{ run.workflow.revision }}</span>
+          <NuxtLink class="analysis-run-workflow-link" :to="workflowLink">
+            {{ run.workflow.name }} · v{{ run.workflow.revision }}
+            <span>{{ run.workflow.source_type === 'workflow_version' ? '查看流程版本 →' : '查看历史 WDL →' }}</span>
+          </NuxtLink>
           <h2>{{ run.sample_id }}</h2>
           <p>{{ run.request.dataset_name }}<template v-if="run.request.control_dataset_name"> + {{ run.request.control_dataset_name }}</template></p>
         </div>
@@ -94,13 +105,37 @@ function taskBarStyle(offset: number, duration: number) {
       </div>
 
       <dl class="analysis-run-meta">
-        <div><dt>参考版本</dt><dd>{{ run.request.reference_name }}</dd></div>
-        <div><dt>Panel</dt><dd>{{ run.request.panel_name }}</dd></div>
+        <div><dt>参考版本</dt><dd>{{ run.request.reference_name || '—' }}</dd></div>
+        <div><dt>Panel</dt><dd>{{ run.request.panel_name || '—' }}</dd></div>
         <div><dt>提交人</dt><dd>{{ run.actor }}</dd></div>
         <div><dt>提交时间</dt><dd>{{ formatTime(run.created_at) }}</dd></div>
         <div><dt>开始时间</dt><dd>{{ formatTime(run.started_at) }}</dd></div>
         <div><dt>完成时间</dt><dd>{{ formatTime(run.finished_at) }}</dd></div>
       </dl>
+
+      <details v-if="graphSummary" class="analysis-run-source-details">
+        <summary>
+          <span>本次固定的流程结构</span>
+          <strong>{{ graphSummary.node_count }} 节点 · {{ graphSummary.edge_count }} 连接</strong>
+        </summary>
+        <div class="analysis-run-source-details__body">
+          <div class="analysis-run-source-details__counts">
+            <span>{{ graphSummary.input_count }} 输入</span>
+            <span>{{ graphSummary.tool_count }} 工具</span>
+            <span v-if="graphSummary.subworkflow_count">{{ graphSummary.subworkflow_count }} 子流程</span>
+            <span>{{ graphSummary.output_count }} 输出</span>
+          </div>
+          <ul v-if="graphSummary.tools.length || graphSummary.subworkflows.length">
+            <li v-for="tool in graphSummary.tools" :key="`tool:${tool.id}:${tool.version}`">
+              <span>{{ tool.name }}</span><code>工具 v{{ tool.version }}</code>
+            </li>
+            <li v-for="subworkflow in graphSummary.subworkflows" :key="`subworkflow:${subworkflow.slug}:${subworkflow.version}`">
+              <span>{{ subworkflow.name }}</span><code>子流程 v{{ subworkflow.version }}</code>
+            </li>
+          </ul>
+          <code class="analysis-run-source-details__digest">{{ run.workflow.digest }}</code>
+        </div>
+      </details>
 
       <div v-if="run.error" class="analysis-run-error" role="alert">
         <strong>运行失败</strong>

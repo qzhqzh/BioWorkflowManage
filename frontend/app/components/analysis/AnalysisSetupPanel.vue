@@ -10,6 +10,8 @@ const props = defineProps<{
   catalog: AnalysisCatalog | null
   busy: boolean
   error: string
+  initialWorkflow?: string
+  initialRevision?: number
 }>()
 
 const emit = defineEmits<{
@@ -43,6 +45,15 @@ const panels = computed<AnalysisDatabaseOption[]>(() => (
   props.catalog?.database.panels.filter(item => !item.reference || item.reference === referenceId.value) ?? []
 ))
 const selectedWorkflow = computed(() => workflows.value.find(item => item.slug === workflowSlug.value))
+const selectedGraphSummary = computed(() => selectedWorkflow.value?.graph_summary)
+const selectedWorkflowLink = computed(() => {
+  const workflow = selectedWorkflow.value
+  if (!workflow?.revision) return ''
+  if (workflow.source_type === 'workflow_version') {
+    return `/?section=artifacts&workflow=${encodeURIComponent(workflow.source_slug ?? workflow.slug)}&workflowVersion=${workflow.revision}`
+  }
+  return `/wdl/${encodeURIComponent(workflow.source_slug ?? workflow.slug)}?revision=${workflow.revision}`
+})
 const requiresReference = computed(() => selectedWorkflow.value?.requires_reference !== false)
 const requiresPanel = computed(() => selectedWorkflow.value?.requires_panel !== false)
 const selectedDataset = computed(() => datasets.value.find(item => item.id === datasetId.value))
@@ -73,7 +84,15 @@ watch(
   () => props.catalog,
   (catalog) => {
     if (!catalog) return
-    workflowSlug.value ||= catalog.workflows[0]?.slug ?? ''
+    if (!workflowSlug.value) {
+      const requested = props.initialWorkflow
+        ? catalog.workflows.find(item => (
+            (item.slug === props.initialWorkflow || item.source_slug === props.initialWorkflow)
+            && (!props.initialRevision || item.revision === props.initialRevision)
+          ))
+        : undefined
+      workflowSlug.value = requested?.slug ?? (props.initialWorkflow ? '' : catalog.workflows[0]?.slug ?? '')
+    }
     datasetId.value ||= catalog.datasets[0]?.id ?? ''
     referenceId.value ||= catalog.database.references[0]?.id ?? ''
     const availablePanels = catalog.database.panels.filter(
@@ -201,6 +220,41 @@ function submit() {
         <p v-if="selectedWorkflow?.blockers.length" class="analysis-inline-note analysis-inline-note--warning">
           {{ selectedWorkflow.blockers[0] }}
         </p>
+        <p v-else-if="initialWorkflow && !selectedWorkflow" class="analysis-inline-note analysis-inline-note--warning">
+          请求的流程版本当前不在可运行目录中，请重新选择。
+        </p>
+        <div v-if="selectedWorkflow" class="analysis-selected-workflow">
+          <div>
+            <p>{{ selectedWorkflow.description || '未填写流程说明' }}</p>
+            <div v-if="selectedGraphSummary" class="analysis-selected-workflow__counts" aria-label="固定流程结构摘要">
+              <span>{{ selectedGraphSummary.input_count }} 输入</span>
+              <span>{{ selectedGraphSummary.tool_count }} 工具</span>
+              <span v-if="selectedGraphSummary.subworkflow_count">{{ selectedGraphSummary.subworkflow_count }} 子流程</span>
+              <span>{{ selectedGraphSummary.output_count }} 输出</span>
+              <span>{{ selectedGraphSummary.edge_count }} 连接</span>
+            </div>
+            <details v-if="selectedGraphSummary" class="analysis-selected-workflow__details">
+              <summary>核对固定内容</summary>
+              <ul v-if="selectedGraphSummary.tools.length || selectedGraphSummary.subworkflows.length">
+                <li v-for="tool in selectedGraphSummary.tools" :key="`tool:${tool.id}:${tool.version}`">
+                  <span>{{ tool.name }}</span><code>工具 v{{ tool.version }}</code>
+                </li>
+                <li v-for="subworkflow in selectedGraphSummary.subworkflows" :key="`subworkflow:${subworkflow.slug}:${subworkflow.version}`">
+                  <span>{{ subworkflow.name }}</span><code>子流程 v{{ subworkflow.version }}</code>
+                </li>
+              </ul>
+              <code class="analysis-selected-workflow__digest">{{ selectedWorkflow.digest }}</code>
+            </details>
+            <code v-else>{{ selectedWorkflow.digest }}</code>
+          </div>
+          <NuxtLink
+            v-if="selectedWorkflowLink"
+            class="button button--ghost button-link"
+            :to="selectedWorkflowLink"
+            target="_blank"
+            rel="noopener"
+          >{{ selectedWorkflow.source_type === 'workflow_version' ? '查看发布版本' : '查看历史 WDL' }}</NuxtLink>
+        </div>
       </section>
 
       <section v-if="requiresReference || requiresPanel" class="analysis-setup-section">

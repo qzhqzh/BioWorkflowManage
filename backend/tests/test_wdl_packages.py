@@ -4,6 +4,7 @@ import zipfile
 import pytest
 from rest_framework.test import APIClient
 
+from compiler_core import canonical_digest
 from workflows.models import ToolDocument, WDLAuditEvent, WDLAsset
 
 
@@ -118,6 +119,55 @@ def test_multifile_asset_revision_export_and_task_import():
     )
     assert idempotent_response.status_code == 200
     assert WDLAuditEvent.objects.filter(asset__slug=slug, action="tool_import").count() == 2
+
+    unprotected_replace = client.post(
+        f"/api/v1/wdl-assets/{slug}/tasks/import",
+        {
+            "version": 2,
+            "file_path": "task/hello.wdl",
+            "task_name": "Hello",
+            "replace": True,
+        },
+        format="json",
+    )
+    assert unprotected_replace.status_code == 428
+    assert (
+        unprotected_replace.json()["error"]["code"]
+        == "TOOL_DRAFT_PRECONDITION_REQUIRED"
+    )
+
+    base_version = tool.draft_version
+    base_digest = canonical_digest(tool.draft_spec)
+    replaced = client.post(
+        f"/api/v1/wdl-assets/{slug}/tasks/import",
+        {
+            "version": 2,
+            "file_path": "task/hello.wdl",
+            "task_name": "Hello",
+            "replace": True,
+            "base_draft_version": base_version,
+            "base_draft_digest": base_digest,
+        },
+        format="json",
+    )
+    assert replaced.status_code == 200
+    tool.refresh_from_db()
+    assert tool.draft_version == base_version + 1
+
+    stale_replace = client.post(
+        f"/api/v1/wdl-assets/{slug}/tasks/import",
+        {
+            "version": 2,
+            "file_path": "task/hello.wdl",
+            "task_name": "Hello",
+            "replace": True,
+            "base_draft_version": base_version,
+            "base_draft_digest": base_digest,
+        },
+        format="json",
+    )
+    assert stale_replace.status_code == 409
+    assert stale_replace.json()["error"]["code"] == "TOOL_DRAFT_CONFLICT"
 
 
 @pytest.mark.django_db

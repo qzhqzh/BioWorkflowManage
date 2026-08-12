@@ -83,7 +83,9 @@ def test_infrastructure_error_does_not_retry_application_failure(tmp_path):
         encoding="utf-8",
     )
 
-    assert _is_infrastructure_error("command failed with exit status 2", log_path) is False
+    assert (
+        _is_infrastructure_error("command failed with exit status 2", log_path) is False
+    )
 
 
 def test_lease_loss_escalates_from_term_to_kill(monkeypatch):
@@ -194,8 +196,18 @@ def _published_fastq_workflow(*, include_annotation_directory=False):
         "tool_version": "1.0.0",
         "container": {"engine": "docker", "image": "ubuntu:24.04"},
         "inputs": [
-            {"name": "read1", "wdl_type": "File", "semantic_type": "bio.fastq.gz.r1", "required": True},
-            {"name": "read2", "wdl_type": "File", "semantic_type": "bio.fastq.gz.r2", "required": True},
+            {
+                "name": "read1",
+                "wdl_type": "File",
+                "semantic_type": "bio.fastq.gz.r1",
+                "required": True,
+            },
+            {
+                "name": "read2",
+                "wdl_type": "File",
+                "semantic_type": "bio.fastq.gz.r2",
+                "required": True,
+            },
         ],
         "outputs": [
             {
@@ -215,17 +227,31 @@ def _published_fastq_workflow(*, include_annotation_directory=False):
         "schema_version": "1.0.0",
         "id": "published_fastq",
         "name": "Published FASTQ",
-        "target": {"language": "wdl", "version": "1.0", "profile": "miniwdl-compatible"},
+        "target": {
+            "language": "wdl",
+            "version": "1.0",
+            "profile": "miniwdl-compatible",
+        },
         "nodes": [
             {
                 "id": "read1",
                 "type": "workflow_input",
-                "port": {"name": "value", "wdl_type": "File", "semantic_type": "bio.fastq.gz.r1", "required": True},
+                "port": {
+                    "name": "value",
+                    "wdl_type": "File",
+                    "semantic_type": "bio.fastq.gz.r1",
+                    "required": True,
+                },
             },
             {
                 "id": "read2",
                 "type": "workflow_input",
-                "port": {"name": "value", "wdl_type": "File", "semantic_type": "bio.fastq.gz.r2", "required": True},
+                "port": {
+                    "name": "value",
+                    "wdl_type": "File",
+                    "semantic_type": "bio.fastq.gz.r2",
+                    "required": True,
+                },
             },
             {
                 "id": "copy",
@@ -240,18 +266,46 @@ def _published_fastq_workflow(*, include_annotation_directory=False):
             {
                 "id": "copied",
                 "type": "workflow_output",
-                "port": {"name": "value", "wdl_type": "File", "semantic_type": "bio.fastq.gz.r1"},
+                "port": {
+                    "name": "value",
+                    "wdl_type": "File",
+                    "semantic_type": "bio.fastq.gz.r1",
+                },
             },
         ],
         "edges": [
-            {"id": "e1", "source": {"node_id": "read1", "port": "value"}, "target": {"node_id": "copy", "port": "read1"}},
-            {"id": "e2", "source": {"node_id": "read2", "port": "value"}, "target": {"node_id": "copy", "port": "read2"}},
-            {"id": "e3", "source": {"node_id": "copy", "port": "copied"}, "target": {"node_id": "copied", "port": "value"}},
+            {
+                "id": "e1",
+                "source": {"node_id": "read1", "port": "value"},
+                "target": {"node_id": "copy", "port": "read1"},
+            },
+            {
+                "id": "e2",
+                "source": {"node_id": "read2", "port": "value"},
+                "target": {"node_id": "copy", "port": "read2"},
+            },
+            {
+                "id": "e3",
+                "source": {"node_id": "copy", "port": "copied"},
+                "target": {"node_id": "copied", "port": "value"},
+            },
         ],
     }
     interface_inputs = [
-        {"name": "read1", "label": "Read 1", "wdl_type": "File", "semantic_type": "bio.fastq.gz.r1", "required": True},
-        {"name": "read2", "label": "Read 2", "wdl_type": "File", "semantic_type": "bio.fastq.gz.r2", "required": True},
+        {
+            "name": "read1",
+            "label": "Read 1",
+            "wdl_type": "File",
+            "semantic_type": "bio.fastq.gz.r1",
+            "required": True,
+        },
+        {
+            "name": "read2",
+            "label": "Read 2",
+            "wdl_type": "File",
+            "semantic_type": "bio.fastq.gz.r2",
+            "required": True,
+        },
     ]
     if include_annotation_directory:
         graph["nodes"].insert(
@@ -382,7 +436,9 @@ def test_worker_marks_expired_running_lease_failed_without_retry(settings):
     assert run.lease_token is None
 
 
-def test_execute_run_retries_infrastructure_failure_once(settings, tmp_path, monkeypatch):
+def test_execute_run_retries_infrastructure_failure_once(
+    settings, tmp_path, monkeypatch
+):
     asset, revision = _asset("retryable", "Retryable")
     run = AnalysisRun.objects.create(
         asset=asset,
@@ -426,7 +482,9 @@ def test_execute_run_retries_infrastructure_failure_once(settings, tmp_path, mon
             self.finished = True
             return self.exit_code
 
-    monkeypatch.setattr("workflows.analysis_runtime.shutil.which", lambda _: "/bin/miniwdl")
+    monkeypatch.setattr(
+        "workflows.analysis_runtime.shutil.which", lambda _: "/bin/miniwdl"
+    )
     monkeypatch.setattr("workflows.analysis_runtime.subprocess.Popen", FakeProcess)
 
     execute_analysis_run(run)
@@ -478,7 +536,9 @@ def test_execute_run_terminates_process_when_event_recording_fails(
             raise RuntimeError("database write failed")
         return original_event(*args, **kwargs)
 
-    monkeypatch.setattr("workflows.analysis_runtime.shutil.which", lambda _: "/bin/miniwdl")
+    monkeypatch.setattr(
+        "workflows.analysis_runtime.shutil.which", lambda _: "/bin/miniwdl"
+    )
     monkeypatch.setattr("workflows.analysis_runtime.subprocess.Popen", FakeProcess)
     monkeypatch.setattr("workflows.analysis_runtime._event", fail_on_miniwdl_event)
     monkeypatch.setattr(
@@ -543,7 +603,9 @@ def analysis_workspace(settings, tmp_path):
     }
     for relative in directories.values():
         (databases / relative).mkdir(parents=True)
-    (databases / "hg19/reference/hg19.simp.fa").write_text(">chr1\nA\n", encoding="utf-8")
+    (databases / "hg19/reference/hg19.simp.fa").write_text(
+        ">chr1\nA\n", encoding="utf-8"
+    )
     (databases / "hg19/reference/hg19.simp.fa.fai").write_text(
         "chr1\t1\t6\t1\t2\n",
         encoding="utf-8",
@@ -570,7 +632,11 @@ def analysis_workspace(settings, tmp_path):
                 "ref_version": "hg19",
                 "directories": directories,
                 "required": [
-                    {"path": "hg19/reference", "kind": "directory", "label": "reference"}
+                    {
+                        "path": "hg19/reference",
+                        "kind": "directory",
+                        "label": "reference",
+                    }
                 ],
             }
         ],
@@ -581,7 +647,11 @@ def analysis_workspace(settings, tmp_path):
                 **panel_files,
                 "cnvkit_db": "task_resource/cnvkit",
                 "required": [
-                    {"path": "task_resource/panel.bed", "kind": "file", "label": "panel"}
+                    {
+                        "path": "task_resource/panel.bed",
+                        "kind": "file",
+                        "label": "panel",
+                    }
                 ],
             }
         ],
@@ -598,7 +668,9 @@ def analysis_workspace(settings, tmp_path):
     return rawdata, databases, runs, catalog
 
 
-def test_catalog_discovers_fastq_pair_and_reports_managed_workflow(client, analysis_workspace):
+def test_catalog_discovers_fastq_pair_and_reports_managed_workflow(
+    client, analysis_workspace
+):
     _asset("solidtumorsingle", "SolidTumorSingle")
 
     response = client.get("/api/v1/analysis/catalog")
@@ -609,22 +681,38 @@ def test_catalog_discovers_fastq_pair_and_reports_managed_workflow(client, analy
     assert dataset["name"] == "SAMPLE01"
     assert [item["mate"] for item in dataset["files"]] == [1, 2]
     workflow = next(
-        item for item in response.data["workflows"] if item["slug"] == "solidtumorsingle"
+        item
+        for item in response.data["workflows"]
+        if item["slug"] == "solidtumorsingle"
     )
     assert workflow["ready"] is True
     assert response.data["database"]["references"][0]["ready"] is True
 
 
-def test_catalog_and_submit_support_latest_published_workflow(client, analysis_workspace):
+def test_catalog_and_submit_support_latest_published_workflow(
+    client, analysis_workspace
+):
     version = _published_fastq_workflow()
     catalog = client.get("/api/v1/analysis/catalog").data
     workflow = next(
-        item for item in catalog["workflows"] if item["source_type"] == "workflow_version"
+        item
+        for item in catalog["workflows"]
+        if item["source_type"] == "workflow_version"
     )
 
     assert workflow["revision"] == version.version
     assert workflow["ready"] is True
     assert workflow["requires_reference"] is False
+    assert workflow["graph_summary"] == {
+        "node_count": 4,
+        "edge_count": 3,
+        "input_count": 2,
+        "tool_count": 1,
+        "subworkflow_count": 0,
+        "output_count": 1,
+        "tools": [{"id": "copy_reads", "name": "copy_reads", "version": "1.0.0"}],
+        "subworkflows": [],
+    }
 
     response = client.post(
         "/api/v1/analysis-runs",
@@ -646,6 +734,56 @@ def test_catalog_and_submit_support_latest_published_workflow(client, analysis_w
     assert run.request_payload["compiled_source_digest"] == run.source_digest
     assert run.request_payload["input_digest"].startswith("sha256:")
     assert run.input_values["published_fastq.read1"].endswith("_R1.fq.gz")
+    assert response.data["workflow"]["graph_summary"]["tool_count"] == 1
+
+
+def test_catalog_adds_requested_historical_published_workflow(
+    client, analysis_workspace
+):
+    first = _published_fastq_workflow()
+    second = WorkflowVersion.objects.create(
+        workflow=first.workflow,
+        version=2,
+        name="Published FASTQ v2",
+        description=first.description,
+        kind=first.kind,
+        semantic_digest="sha256:published-v2",
+        workflow_graph=first.workflow_graph,
+        editor_document=first.editor_document,
+        tool_specs=first.tool_specs,
+        compiled_bundle=first.compiled_bundle,
+        compiled_digest=first.compiled_digest,
+        compiler_profile=first.compiler_profile,
+        interface_contract=first.interface_contract,
+        subworkflow_references=first.subworkflow_references,
+    )
+
+    default_catalog = client.get("/api/v1/analysis/catalog").data
+    default_versions = [
+        item["revision"]
+        for item in default_catalog["workflows"]
+        if item.get("source_slug") == first.workflow.slug
+    ]
+    assert default_versions == [second.version]
+
+    requested_catalog = client.get(
+        "/api/v1/analysis/catalog",
+        {"workflow": first.workflow.slug, "revision": first.version},
+    ).data
+    requested_versions = [
+        item["revision"]
+        for item in requested_catalog["workflows"]
+        if item.get("source_slug") == first.workflow.slug
+    ]
+    assert requested_versions == [first.version, second.version]
+    historical = next(
+        item
+        for item in requested_catalog["workflows"]
+        if item.get("source_slug") == first.workflow.slug
+        and item["revision"] == first.version
+    )
+    assert historical["slug"] == f"published:{first.workflow.slug}:{first.version}"
+    assert historical["ready"] is True
 
 
 def test_published_annotation_workflow_injects_managed_database_directory(
@@ -654,7 +792,9 @@ def test_published_annotation_workflow_injects_managed_database_directory(
     _published_fastq_workflow(include_annotation_directory=True)
     catalog = client.get("/api/v1/analysis/catalog").data
     workflow = next(
-        item for item in catalog["workflows"] if item["source_type"] == "workflow_version"
+        item
+        for item in catalog["workflows"]
+        if item["source_type"] == "workflow_version"
     )
 
     assert workflow["ready"] is True
@@ -666,6 +806,8 @@ def test_published_annotation_workflow_injects_managed_database_directory(
             "dataset": catalog["datasets"][0]["id"],
             "reference": "hg19",
             "sample_id": "ANNO01",
+            "sample_type": "tissue",
+            "sample_gender": "女",
         },
         format="json",
     )
@@ -674,6 +816,10 @@ def test_published_annotation_workflow_injects_managed_database_directory(
     run = AnalysisRun.objects.get(pk=response.data["id"])
     assert run.input_values["published_fastq.humandb"].endswith("/hg19/humandb")
     assert run.request_payload["database_digest"].startswith("sha256:")
+    assert run.request_payload["reference_name"] == "hg19"
+    assert run.request_payload["panel_name"] is None
+    assert run.request_payload["sample_type"] == "tissue"
+    assert run.request_payload["sample_gender"] == "女"
 
 
 def test_catalog_returns_workflow_scoped_reference_readiness(
@@ -694,7 +840,9 @@ def test_catalog_returns_workflow_scoped_reference_readiness(
 
     catalog = client.get("/api/v1/analysis/catalog").data
     workflow = next(
-        item for item in catalog["workflows"] if item["source_type"] == "workflow_version"
+        item
+        for item in catalog["workflows"]
+        if item["source_type"] == "workflow_version"
     )
 
     assert catalog["database"]["references"][0]["ready"] is False
@@ -709,7 +857,9 @@ def test_published_workflow_derives_input_names_from_graph_node_ids(
     WorkflowVersion.objects.filter(pk=version.pk).update(interface_contract={})
     catalog = client.get("/api/v1/analysis/catalog").data
     workflow = next(
-        item for item in catalog["workflows"] if item["source_type"] == "workflow_version"
+        item
+        for item in catalog["workflows"]
+        if item["source_type"] == "workflow_version"
     )
 
     response = client.post(
@@ -765,6 +915,65 @@ def test_create_run_fixes_revision_and_inputs(client, analysis_workspace):
     assert run.events.get().message == "运行已进入队列。"
 
 
+def test_historical_wdl_revision_is_selected_and_frozen_explicitly(
+    client, analysis_workspace
+):
+    asset, first = _asset("solidtumorsingle", "SolidTumorSingle")
+    second = WDLSourceRevision.objects.create(
+        asset=asset,
+        version=2,
+        operation=WDLSourceRevision.Operation.EDIT,
+        content=first.content.replace("sample_out", "latest_sample_out"),
+        digest="sha256:latest-revision",
+        analysis=first.analysis,
+    )
+    WDLSourceFile.objects.create(
+        revision=second,
+        path="workflow.wdl",
+        content=second.content,
+        digest="sha256:latest-revision-file",
+        is_entry=True,
+    )
+
+    catalog = client.get(
+        "/api/v1/analysis/catalog",
+        {"workflow": asset.slug, "revision": first.version},
+    ).data
+    managed = [
+        item for item in catalog["workflows"] if item.get("source_slug") == asset.slug
+    ]
+    historical = next(item for item in managed if item["revision"] == first.version)
+    latest = next(item for item in managed if item["revision"] == second.version)
+
+    assert latest["slug"] == asset.slug
+    assert historical["slug"] == f"wdl-asset:{asset.slug}:{first.version}"
+    assert historical["digest"] == first.digest
+    response = client.post(
+        "/api/v1/analysis-runs",
+        {
+            "workflow": historical["slug"],
+            "dataset": catalog["datasets"][0]["id"],
+            "reference": "hg19",
+            "panel": "panel",
+            "sample_id": "HISTORY01",
+            "sample_name": "历史修订验证",
+            "sample_type": "tissue",
+            "sample_gender": "女",
+        },
+        format="json",
+    )
+
+    assert response.status_code == 201
+    run = AnalysisRun.objects.get(pk=response.data["id"])
+    assert run.asset == asset
+    assert run.revision == first
+    assert run.request_payload["workflow"] == historical["slug"]
+    assert run.request_payload["wdl_revision"] == first.version
+    assert run.request_payload["wdl_revision_digest"] == first.digest
+    assert response.data["workflow"]["revision"] == first.version
+    assert response.data["workflow"]["digest"] == first.digest
+
+
 def test_create_run_uses_execution_roots_for_host_docker(
     client, analysis_workspace, settings
 ):
@@ -786,9 +995,7 @@ def test_create_run_uses_execution_roots_for_host_docker(
 
     assert response.status_code == 201
     inputs = AnalysisRun.objects.get(pk=response.data["id"]).input_values
-    assert inputs["SolidTumorSingle.fastq1"].startswith(
-        "/mnt/nas/workspace/rawdata/"
-    )
+    assert inputs["SolidTumorSingle.fastq1"].startswith("/mnt/nas/workspace/rawdata/")
     assert inputs["CallFusion.druggable_region"] == (
         "/mnt/nas/workspace/databases/task_resource/druggable.csv"
     )
@@ -851,7 +1058,9 @@ def test_regular_user_only_sees_own_runs(client, analysis_workspace):
     assert client.get(f"/api/v1/analysis-runs/{other.id}").status_code == 404
 
 
-def test_create_run_normalizes_english_gender_for_legacy_wdl(client, analysis_workspace):
+def test_create_run_normalizes_english_gender_for_legacy_wdl(
+    client, analysis_workspace
+):
     _asset("solidtumorsingle", "SolidTumorSingle")
     catalog = client.get("/api/v1/analysis/catalog").data
 
@@ -895,7 +1104,9 @@ def test_create_run_rejects_missing_database_before_queue(client, analysis_works
 
     assert response.status_code == 400
     assert response.data["error"]["code"] == "ANALYSIS_DATABASE_INCOMPLETE"
-    assert response.data["error"]["details"]["missing"][0]["path"].endswith("missing.fa")
+    assert response.data["error"]["details"]["missing"][0]["path"].endswith(
+        "missing.fa"
+    )
     assert AnalysisRun.objects.count() == 0
 
 
@@ -922,7 +1133,9 @@ def test_catalog_accepts_declared_database_file_alternative(client, analysis_wor
     assert reference["requirements"][-1]["present"] is True
 
 
-def test_run_detail_and_output_download_only_use_recorded_output_key(client, analysis_workspace):
+def test_run_detail_and_output_download_only_use_recorded_output_key(
+    client, analysis_workspace
+):
     asset, revision = _asset("solidtumorsingle", "SolidTumorSingle")
     _, _, runs, _ = analysis_workspace
     run_directory = runs / "result-run"
@@ -1037,9 +1250,7 @@ def test_run_output_translates_host_execution_path_for_backend_mount(
         progress=100,
         work_directory=str(host_root / "host-run"),
         outputs={
-            "outputs": {
-                "HostOutput.result": str(host_root / "host-run/out/result.txt")
-            }
+            "outputs": {"HostOutput.result": str(host_root / "host-run/out/result.txt")}
         },
     )
 

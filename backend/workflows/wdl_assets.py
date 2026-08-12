@@ -1413,12 +1413,20 @@ def import_wdl_task(request, slug: str):
             actor=actor,
             tool_id=str(request.data.get("tool_id") or "").strip(),
             replace=bool(request.data.get("replace", False)),
+            base_draft_version=request.data.get("base_draft_version"),
+            base_draft_digest=str(request.data.get("base_draft_digest") or ""),
         )
     except WDLTaskImportError as error:
         return _with_request_id(
             Response(
                 {"error": {"code": error.code, "message": error.message}},
-                status=status.HTTP_409_CONFLICT if error.code == "TOOL_DRAFT_EXISTS" else status.HTTP_400_BAD_REQUEST,
+                status=(
+                    428
+                    if error.code == "TOOL_DRAFT_PRECONDITION_REQUIRED"
+                    else status.HTTP_409_CONFLICT
+                    if error.code in {"TOOL_DRAFT_EXISTS", "TOOL_DRAFT_CONFLICT"}
+                    else status.HTTP_400_BAD_REQUEST
+                ),
             ),
             request_id,
         )

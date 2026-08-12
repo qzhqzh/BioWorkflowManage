@@ -36,6 +36,9 @@ class WorkflowDocument(models.Model):
     editor_document = models.JSONField(default=dict)
     tool_specs = models.JSONField(default=list)
     subworkflow_references = models.JSONField(default=list)
+    created_by = models.CharField(max_length=256, default="local-user")
+    updated_by = models.CharField(max_length=256, default="local-user")
+    document_version = models.PositiveIntegerField(default=1)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -67,6 +70,7 @@ class ToolDocument(models.Model):
     tool_id = models.CharField(max_length=256, unique=True)
     draft_spec = models.JSONField(default=dict)
     validation = models.JSONField(default=dict)
+    draft_version = models.PositiveIntegerField(default=1)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -148,11 +152,20 @@ class WDLRevision(ImmutableSnapshot):
         null=True,
         blank=True,
     )
+    base_revision = models.ForeignKey(
+        "self",
+        on_delete=models.PROTECT,
+        related_name="derived_revisions",
+        null=True,
+        blank=True,
+    )
     version = models.PositiveIntegerField()
     source = models.CharField(max_length=16, choices=Source.choices)
     content = models.TextField()
     digest = models.CharField(max_length=80)
     validation = models.JSONField(default=dict)
+    created_by = models.CharField(max_length=256, default="local-user")
+    note = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -161,6 +174,52 @@ class WDLRevision(ImmutableSnapshot):
             models.UniqueConstraint(
                 fields=["workflow", "version"],
                 name="unique_workflow_wdl_revision",
+            )
+        ]
+
+
+class WDLGraphProposal(models.Model):
+    class Status(models.TextChoices):
+        READY = "ready", "Ready"
+        BLOCKED = "blocked", "Blocked"
+        APPLIED = "applied", "Applied"
+
+    workflow = models.ForeignKey(
+        WorkflowDocument,
+        on_delete=models.PROTECT,
+        related_name="wdl_graph_proposals",
+    )
+    source_revision = models.ForeignKey(
+        WDLRevision,
+        on_delete=models.PROTECT,
+        related_name="graph_proposals",
+    )
+    base_document_version = models.PositiveIntegerField()
+    base_document_digest = models.CharField(max_length=80)
+    proposal_digest = models.CharField(max_length=80)
+    status = models.CharField(
+        max_length=16,
+        choices=Status.choices,
+        default=Status.READY,
+    )
+    proposal = models.JSONField(default=dict)
+    created_by = models.CharField(max_length=256, default="local-user")
+    applied_by = models.CharField(max_length=256, blank=True)
+    applied_document_version = models.PositiveIntegerField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    applied_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=[
+                    "workflow",
+                    "source_revision",
+                    "base_document_version",
+                    "proposal_digest",
+                ],
+                name="unique_wdl_graph_proposal",
             )
         ]
 

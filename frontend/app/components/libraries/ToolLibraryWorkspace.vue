@@ -8,6 +8,7 @@ interface RegistryTool {
   version: string
   status: string
   isDraftOnly: boolean
+  versionCount: number
 }
 
 interface ToolVersion {
@@ -28,10 +29,13 @@ const props = defineProps<{
   registryLoaded: boolean
   selectedToolId: string
   selectedToolVersions: ToolVersion[]
+  selectedToolVersion: string
+  selectedToolSpec?: Record<string, any>
   toolDraftState: 'idle' | 'saving' | 'saved' | 'publishing' | 'published' | 'error'
   toolDraftValidationStatus?: string
   toolOperationError?: ToolOperationError
   toolCreateState: 'idle' | 'saving' | 'error'
+  initialInspectorView: 'version' | 'draft'
 }>()
 
 const creatingTool = defineModel<boolean>('creatingTool', { required: true })
@@ -40,6 +44,7 @@ const searchQuery = defineModel<string>('searchQuery', { required: true })
 const toolDraft = defineModel<Record<string, any> | undefined>('toolDraft')
 
 const viewMode = ref<'list' | 'cards'>('list')
+const inspectorView = ref<'version' | 'draft'>(props.initialInspectorView)
 const currentPage = ref(1)
 const pageSize = 12
 const pageCount = computed(() => Math.max(1, Math.ceil(props.tools.length / pageSize)))
@@ -58,6 +63,31 @@ const paginationItems = computed<(number | 'ellipsis')[]>(() => {
   pages.push(pageCount.value)
   return pages
 })
+const selectedToolSource = computed<Record<string, any> | undefined>(
+  () => props.selectedToolSpec?.metadata?.source_wdl,
+)
+const selectedToolSourceLink = computed(() => {
+  const source = selectedToolSource.value
+  if (source?.package_slug) {
+    const version = source.package_version
+      ? `?version=${encodeURIComponent(source.package_version)}`
+      : ''
+    return `/wdl-packages/${encodeURIComponent(source.package_slug)}${version}`
+  }
+  if (source?.asset_slug) {
+    const revision = source.revision ? `?revision=${encodeURIComponent(source.revision)}` : ''
+    return `/wdl/${encodeURIComponent(source.asset_slug)}${revision}`
+  }
+  return ''
+})
+const selectedToolSourceLabel = computed(() => {
+  const source = selectedToolSource.value
+  if (source?.package_slug) return `${source.package_slug}@${source.package_version}`
+  if (source?.asset_slug) return `${source.asset_slug} · WDL v${source.revision}`
+  return ''
+})
+const inspectorPanel = ref<HTMLElement>()
+const lastToolTrigger = ref<HTMLElement>()
 
 watch(searchQuery, () => {
   currentPage.value = 1
@@ -72,11 +102,48 @@ function setViewMode(mode: 'list' | 'cards') {
   currentPage.value = 1
 }
 
+function openToolInspector(event: MouseEvent, toolId: string) {
+  lastToolTrigger.value = event.currentTarget as HTMLElement
+  emit('selectTool', toolId)
+}
+
+function closeToolInspector() {
+  emit('closeInspector')
+  void nextTick(() => lastToolTrigger.value?.focus())
+}
+
+watch(() => props.selectedToolId, (toolId) => {
+  if (!toolId) return
+  inspectorView.value = props.initialInspectorView
+  void nextTick(() => inspectorPanel.value?.focus({ preventScroll: true }))
+})
+
+watch(() => props.initialInspectorView, (view) => {
+  inspectorView.value = view
+})
+
+watch([toolDraft, () => props.selectedToolVersions.length], ([draft, versionCount]) => {
+  if (draft && versionCount === 0) inspectorView.value = 'draft'
+})
+
+function selectDraft() {
+  inspectorView.value = 'draft'
+  emit('selectDraft', props.selectedToolId)
+}
+
+function selectPublishedVersion(toolId: string, version: string) {
+  inspectorView.value = 'version'
+  emit('selectVersion', toolId, version)
+}
+
 const emit = defineEmits<{
   create: []
   import: []
   selectTool: [toolId: string]
+  closeInspector: []
   selectVersion: [toolId: string, version: string]
+  selectDraft: [toolId: string]
+  useVersionAsDraft: []
   draftDirty: []
   draftSave: []
   draftPublish: []
@@ -117,7 +184,9 @@ const emit = defineEmits<{
     </button>
   </form>
 
-  <div class="workspace-toolbar">
+  <div class="tool-library-browser" :class="{ 'tool-library-browser--selected': selectedToolId }">
+    <section class="tool-library-catalog">
+      <div class="workspace-toolbar">
     <label class="search-field workspace-search">
       <span aria-hidden="true">⌕</span>
       <input v-model="searchQuery" type="search" placeholder="搜索工具名称或版本" />
@@ -145,13 +214,13 @@ const emit = defineEmits<{
         </button>
       </div>
     </div>
-  </div>
+      </div>
 
-  <div
-    class="registry-list"
-    :class="{ 'registry-list--cards': viewMode === 'cards' }"
-    role="list"
-  >
+      <div
+        class="registry-list"
+        :class="{ 'registry-list--cards': viewMode === 'cards' }"
+        role="list"
+      >
     <article v-for="tool in pagedTools" :key="tool.id" class="registry-row" role="listitem">
       <span class="library-item__mark">{{ tool.name.slice(0, 2).toLowerCase() }}</span>
       <div>
@@ -159,9 +228,17 @@ const emit = defineEmits<{
         <p>{{ tool.description }}</p>
       </div>
       <span class="registry-status">● {{ tool.status }}</span>
-      <code>{{ tool.isDraftOnly ? tool.version : `v${tool.version}` }}</code>
-      <button class="button button--ghost" type="button" @click="emit('selectTool', tool.id)">
-        {{ selectedToolId === tool.id ? '已展开' : '查看版本' }}
+      <code>
+        {{ tool.isDraftOnly ? tool.version : `v${tool.version} · ${tool.versionCount} 版` }}
+      </code>
+      <button
+        class="button button--ghost"
+        type="button"
+        :aria-expanded="selectedToolId === tool.id"
+        :aria-controls="selectedToolId === tool.id ? 'tool-version-inspector' : undefined"
+        @click="openToolInspector($event, tool.id)"
+      >
+        {{ selectedToolId === tool.id ? '查看中' : '查看版本' }}
       </button>
     </article>
     <div v-if="registryLoaded && tools.length === 0" class="empty-state registry-empty">
@@ -177,9 +254,9 @@ const emit = defineEmits<{
         清除搜索
       </button>
     </div>
-  </div>
+      </div>
 
-  <nav v-if="tools.length > pageSize" class="registry-pagination" aria-label="工具库分页">
+      <nav v-if="tools.length > pageSize" class="registry-pagination" aria-label="工具库分页">
     <button
       type="button"
       :disabled="currentPage === 1"
@@ -209,41 +286,146 @@ const emit = defineEmits<{
     >
       下一页
     </button>
-  </nav>
+      </nav>
+    </section>
 
-  <section v-if="selectedToolId" class="tool-version-panel">
-    <header>
-      <div>
-        <span>工具详情与版本</span>
-        <h2>{{ selectedToolId }}</h2>
-      </div>
-      <strong>{{ selectedToolVersions.length }} 个版本</strong>
-    </header>
-    <div class="tool-detail-layout">
-      <div v-if="selectedToolVersions.length" class="tool-version-list">
-        <article v-for="version in selectedToolVersions" :key="version.version">
-          <div>
-            <button type="button" @click="emit('selectVersion', version.tool_id, version.version)">
-              v{{ version.version }}
+    <button
+      v-if="selectedToolId"
+      class="tool-version-backdrop"
+      type="button"
+      aria-label="关闭版本详情"
+      @click="closeToolInspector"
+    />
+    <aside
+      v-if="selectedToolId"
+      id="tool-version-inspector"
+      ref="inspectorPanel"
+      class="tool-version-panel"
+      aria-label="工具版本检查器"
+      tabindex="-1"
+      @keydown.esc="closeToolInspector"
+    >
+      <header>
+        <div>
+          <span>工具检查器</span>
+          <h2>{{ selectedToolId }}</h2>
+        </div>
+        <div class="tool-version-panel__header-actions">
+          <strong>{{ selectedToolVersions.length }} 个版本</strong>
+          <button type="button" @click="closeToolInspector">关闭</button>
+        </div>
+      </header>
+
+      <div class="tool-version-panel__body">
+        <section class="tool-version-rail" aria-label="草稿与已发布版本">
+          <header>
+            <strong>草稿与版本</strong>
+            <small>选择后右侧立即查看</small>
+          </header>
+          <div v-if="toolDraft || selectedToolVersions.length" class="tool-version-list">
+            <button
+              v-if="toolDraft"
+              type="button"
+              class="tool-version-list__draft"
+              :class="{ 'is-active': inspectorView === 'draft' }"
+              @click="selectDraft"
+            >
+              <span>
+                <strong>待发布草稿</strong>
+                <small>{{ toolDraftValidationStatus === 'valid' ? '校验通过' : '待修正' }}</small>
+              </span>
+              <code>v{{ toolDraft.tool_version ?? '未指定版本' }}</code>
             </button>
-            <small>{{ new Date(version.created_at).toLocaleString('zh-CN') }}</small>
+            <button
+              v-for="version in selectedToolVersions"
+              :key="version.version"
+              type="button"
+              :class="{ 'is-active': inspectorView === 'version' && selectedToolVersion === version.version }"
+              @click="selectPublishedVersion(version.tool_id, version.version)"
+            >
+              <span><strong>v{{ version.version }}</strong><small>{{ new Date(version.created_at).toLocaleDateString('zh-CN') }}</small></span>
+              <code>{{ version.digest.slice(0, 18) }}…</code>
+            </button>
           </div>
-          <code>{{ version.digest }}</code>
-          <span>不可变快照</span>
-        </article>
-      </div>
-      <p v-else class="empty-state">该工具还没有已发布版本。</p>
+          <p v-else class="empty-state tool-version-panel__empty">尚无草稿或已发布版本</p>
+        </section>
 
-      <ToolDraftEditor
-        v-if="toolDraft"
-        v-model:draft="toolDraft"
-        :state="toolDraftState"
-        :validation-status="toolDraftValidationStatus"
-        :operation-error="toolOperationError"
-        @dirty="emit('draftDirty')"
-        @save="emit('draftSave')"
-        @publish="emit('draftPublish')"
-      />
-    </div>
-  </section>
+        <div class="tool-version-detail">
+          <section
+            v-if="inspectorView === 'draft' && toolDraft"
+            class="tool-draft-workspace tool-draft-workspace--active"
+          >
+            <header>
+              <div>
+                <strong>待发布工具草稿</strong>
+                <span>校验、审查并发布后形成新的固定版本。</span>
+              </div>
+              <small>{{ toolDraftValidationStatus === 'valid' ? '校验通过' : '需要修正' }}</small>
+            </header>
+            <ToolDraftEditor
+              v-model:draft="toolDraft"
+              :state="toolDraftState"
+              :validation-status="toolDraftValidationStatus"
+              :operation-error="toolOperationError"
+              @dirty="emit('draftDirty')"
+              @save="emit('draftSave')"
+              @publish="emit('draftPublish')"
+            />
+          </section>
+          <section v-else-if="selectedToolSpec" class="tool-version-snapshot">
+            <header>
+              <div>
+                <strong>v{{ selectedToolVersion }} 固定内容</strong>
+                <span>接口、容器和命令随版本锁定</span>
+              </div>
+              <button class="button button--ghost" type="button" @click="emit('useVersionAsDraft')">基于此版本修改</button>
+            </header>
+            <dl>
+              <div><dt>容器</dt><dd><code>{{ selectedToolSpec.container?.image }}</code></dd></div>
+              <div><dt>运行资源</dt><dd>{{ selectedToolSpec.runtime?.cpu ?? '—' }} CPU · {{ selectedToolSpec.runtime?.memory_gb ?? '—' }} GB 内存</dd></div>
+              <div v-if="selectedToolSource">
+                <dt>来源</dt>
+                <dd>
+                  <NuxtLink v-if="selectedToolSourceLink" :to="selectedToolSourceLink">
+                    {{ selectedToolSourceLabel }}
+                  </NuxtLink>
+                  <span v-else>{{ selectedToolSourceLabel || 'WDL 导入' }}</span>
+                </dd>
+              </div>
+            </dl>
+
+            <div class="tool-version-interface">
+              <section>
+                <header><strong>输入</strong><span>{{ selectedToolSpec.inputs?.length ?? 0 }}</span></header>
+                <ul v-if="selectedToolSpec.inputs?.length">
+                  <li v-for="input in selectedToolSpec.inputs.slice(0, 8)" :key="input.name">
+                    <code>{{ input.name }}</code><small>{{ input.wdl_type }}</small>
+                  </li>
+                </ul>
+                <small v-else>无输入</small>
+                <small v-if="(selectedToolSpec.inputs?.length ?? 0) > 8">还有 {{ selectedToolSpec.inputs.length - 8 }} 项</small>
+              </section>
+              <section>
+                <header><strong>输出</strong><span>{{ selectedToolSpec.outputs?.length ?? 0 }}</span></header>
+                <ul v-if="selectedToolSpec.outputs?.length">
+                  <li v-for="output in selectedToolSpec.outputs.slice(0, 8)" :key="output.name">
+                    <code>{{ output.name }}</code><small>{{ output.wdl_type }}</small>
+                  </li>
+                </ul>
+                <small v-else>无输出</small>
+                <small v-if="(selectedToolSpec.outputs?.length ?? 0) > 8">还有 {{ selectedToolSpec.outputs.length - 8 }} 项</small>
+              </section>
+            </div>
+
+            <section v-if="selectedToolSpec.command?.template" class="tool-command-preview">
+              <header><strong>命令模板</strong></header>
+              <pre>{{ selectedToolSpec.command.template }}</pre>
+            </section>
+          </section>
+          <p v-else-if="inspectorView === 'version' && selectedToolVersions.length" class="empty-state tool-version-detail__empty">正在读取版本内容…</p>
+          <p v-else class="empty-state tool-version-detail__empty">这个工具还没有可查看的草稿或已发布版本。</p>
+        </div>
+      </div>
+    </aside>
+  </div>
 </template>
