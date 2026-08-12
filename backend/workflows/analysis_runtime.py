@@ -16,8 +16,10 @@ from typing import Any
 
 from django.conf import settings
 from django.db import close_old_connections, transaction
+from django.db.models import F
 from django.utils import timezone
 
+from .integration_outputs import build_output_manifest
 from .models import AnalysisRun, AnalysisRunEvent
 from .wdl_packages import normalize_package_path
 from .wdl_source_references import (
@@ -65,6 +67,69 @@ def _terminate_process_group(process: subprocess.Popen) -> None:
         return
 
 
+def _cleanup_swarm_services_for_run(
+    run_directory: Path,
+    *,
+    docker_client=None,
+) -> tuple[list[str], list[str]]:
+    """Remove only miniwdl Swarm services mounting this AnalysisRun directory."""
+
+    root = run_directory.resolve()
+    created_client = docker_client is None
+    removed: list[str] = []
+    errors: list[str] = []
+    try:
+        if docker_client is None:
+            import docker
+
+            docker_client = docker.from_env(timeout=10)
+        services = docker_client.services.list(filters={"label": "miniwdl_run_id"})
+        for service in services:
+            specification = service.attrs.get("Spec") or {}
+            labels = specification.get("Labels") or {}
+            if "miniwdl_run_id" not in labels:
+                continue
+            container = (specification.get("TaskTemplate") or {}).get(
+                "ContainerSpec"
+            ) or {}
+            belongs_to_run = False
+            for mount in container.get("Mounts") or []:
+                source = str(mount.get("Source") or "")
+                if not source or not Path(source).is_absolute():
+                    continue
+                try:
+                    Path(source).resolve().relative_to(root)
+                    belongs_to_run = True
+                    break
+                except (OSError, ValueError):
+                    continue
+            if not belongs_to_run:
+                continue
+            name = str(getattr(service, "name", None) or service.id)
+            last_error: Exception | None = None
+            for attempt in range(3):
+                try:
+                    service.remove()
+                    removed.append(name)
+                    last_error = None
+                    break
+                except Exception as error:
+                    last_error = error
+                    if attempt < 2:
+                        time.sleep(0.25)
+            if last_error is not None:
+                errors.append(f"{name}: {last_error}")
+    except Exception as error:
+        errors.append(str(error))
+    finally:
+        if created_client and docker_client is not None:
+            try:
+                docker_client.close()
+            except Exception:
+                pass
+    return removed, errors
+
+
 def _write_json(path: Path, value: Any) -> None:
     path.write_text(
         json.dumps(value, ensure_ascii=False, indent=2, default=str) + "\n",
@@ -91,14 +156,25 @@ def _event(
 
 def _update_run(run: AnalysisRun, **values) -> None:
     lease_token = run.lease_token
+    status_changed = "status" in values and values["status"] != run.status
+    if "progress" in values:
+        values["progress"] = max(run.progress, int(values["progress"]))
+    if status_changed:
+        values["status_version"] = F("status_version") + 1
     values["updated_at"] = timezone.now()
     queryset = AnalysisRun.objects.filter(pk=run.pk)
     if lease_token is not None:
-        queryset = queryset.filter(lease_token=lease_token)
+        queryset = queryset.filter(
+            lease_token=lease_token,
+            status__in=[AnalysisRun.Status.PREPARING, AnalysisRun.Status.RUNNING],
+        )
     if queryset.update(**values) != 1:
         raise AnalysisRunLeaseLost(f"analysis run {run.id} lease is no longer active")
     for name, value in values.items():
-        setattr(run, name, value)
+        if name != "status_version":
+            setattr(run, name, value)
+    if status_changed:
+        run.status_version += 1
 
 
 def _renew_lease(run: AnalysisRun) -> bool:
@@ -125,6 +201,10 @@ class _LeaseHeartbeat:
         self.thread: threading.Thread | None = None
         self.process: subprocess.Popen | None = None
         self.process_lock = threading.Lock()
+        self.lease_deadline = time.monotonic() + float(
+            settings.ANALYSIS_RUN_LEASE_SECONDS
+        )
+        self.cleanup_errors: list[str] = []
 
     def __enter__(self):
         if self.run.lease_token is None:
@@ -133,6 +213,9 @@ class _LeaseHeartbeat:
             raise AnalysisRunLeaseLost(
                 f"analysis run {self.run.id} lease is no longer active"
             )
+        self.lease_deadline = time.monotonic() + float(
+            settings.ANALYSIS_RUN_LEASE_SECONDS
+        )
         self.thread = threading.Thread(
             target=self._heartbeat,
             name=f"analysis-heartbeat-{self.run.id}",
@@ -146,14 +229,32 @@ class _LeaseHeartbeat:
         while not self.stop.wait(interval):
             close_old_connections()
             try:
-                if not _renew_lease(self.run):
-                    self.lease_lost.set()
-                    self._terminate_process()
+                if not self._renew_or_expire():
                     return
-            except Exception:
-                continue
             finally:
                 close_old_connections()
+
+    def _renew_or_expire(self) -> bool:
+        try:
+            renewed = _renew_lease(self.run)
+        except Exception:
+            if time.monotonic() < self.lease_deadline:
+                return True
+            renewed = False
+        if renewed:
+            self.lease_deadline = time.monotonic() + float(
+                settings.ANALYSIS_RUN_LEASE_SECONDS
+            )
+            return True
+        self.lease_lost.set()
+        self._terminate_process()
+        try:
+            _finalize_cancelled_run(self.run.pk, self.run.lease_token)
+        except Exception:
+            # The database may be the reason renewal expired. The fenced process
+            # is already stopped; stale-run recovery will converge the row later.
+            pass
+        return False
 
     def __exit__(self, exc_type, exc, traceback):
         self.stop.set()
@@ -177,26 +278,96 @@ class _LeaseHeartbeat:
 
     def _terminate_process_locked(self) -> None:
         process = self.process
-        if process is None:
+        if process is not None:
+            _terminate_process_group(process)
+        self.cleanup_services()
+
+    def cleanup_services(self) -> None:
+        work_directory = str(getattr(self.run, "work_directory", "") or "")
+        if not work_directory:
             return
-        _terminate_process_group(process)
+        _, errors = _cleanup_swarm_services_for_run(Path(work_directory))
+        self.cleanup_errors.extend(errors)
+
+
+def _finalize_cancelled_run(run_id, lease_token) -> bool:
+    with transaction.atomic():
+        run = AnalysisRun.objects.select_for_update().filter(pk=run_id).first()
+        if run is None or run.status != AnalysisRun.Status.CANCEL_REQUESTED:
+            return False
+        if lease_token is not None and run.lease_token != lease_token:
+            return False
+        run.status = AnalysisRun.Status.CANCELED
+        run.status_version += 1
+        run.current_step = "运行已取消"
+        run.error = "运行已按请求取消。"
+        run.finished_at = timezone.now()
+        run.output_status = AnalysisRun.OutputStatus.UNAVAILABLE
+        run.error_code = "ANALYSIS_CANCELED"
+        run.error_category = "cancellation"
+        run.error_retryable = False
+        run.error_details = {}
+        run.lease_token = None
+        run.worker_heartbeat_at = None
+        run.lease_expires_at = None
+        run.save(
+            update_fields=[
+                "status",
+                "status_version",
+                "current_step",
+                "error",
+                "finished_at",
+                "output_status",
+                "error_code",
+                "error_category",
+                "error_retryable",
+                "error_details",
+                "lease_token",
+                "worker_heartbeat_at",
+                "lease_expires_at",
+                "updated_at",
+            ]
+        )
+        _event(run, "运行已按请求取消。", kind="cancellation", level="warning")
+        return True
 
 
 def _recover_stale_runs(now) -> None:
     stale_runs = list(
         AnalysisRun.objects.select_for_update(skip_locked=True)
         .filter(
-            status__in=[AnalysisRun.Status.PREPARING, AnalysisRun.Status.RUNNING],
+            status__in=[
+                AnalysisRun.Status.PREPARING,
+                AnalysisRun.Status.RUNNING,
+                AnalysisRun.Status.CANCEL_REQUESTED,
+            ],
             lease_expires_at__lt=now,
         )
         .order_by("lease_expires_at")[:20]
     )
     for run in stale_runs:
-        if run.status == AnalysisRun.Status.PREPARING and not run.work_directory:
+        stale_work_directory = str(run.work_directory or "")
+        if run.status == AnalysisRun.Status.CANCEL_REQUESTED:
+            run.status = AnalysisRun.Status.CANCELED
+            run.current_step = "运行已取消"
+            run.error = "运行已按请求取消。"
+            run.finished_at = now
+            run.output_status = AnalysisRun.OutputStatus.UNAVAILABLE
+            run.error_code = "ANALYSIS_CANCELED"
+            run.error_category = "cancellation"
+            run.error_retryable = False
+            run.error_details = {}
+            level = "warning"
+            message = "取消中的运行租约已过期，状态已收敛为已取消。"
+        elif run.status == AnalysisRun.Status.PREPARING and not run.work_directory:
             run.status = AnalysisRun.Status.QUEUED
-            run.progress = 0
             run.current_step = "worker 中断，已安全重新排队"
             run.started_at = None
+            run.error = ""
+            run.error_code = ""
+            run.error_category = ""
+            run.error_retryable = False
+            run.error_details = {}
             level = "warning"
             message = "准备阶段 worker 租约过期，运行已重新排队。"
         else:
@@ -204,14 +375,26 @@ def _recover_stale_runs(now) -> None:
             run.progress = 100
             run.current_step = "worker 连接中断，需手动重跑"
             run.error = "worker 心跳超时；为避免重复执行，系统没有自动重跑。"
+            run.error_code = "ANALYSIS_WORKER_LEASE_LOST"
+            run.error_category = "infrastructure"
+            run.error_retryable = True
+            run.error_details = {"lease_expired_at": run.lease_expires_at.isoformat()}
+            run.output_status = AnalysisRun.OutputStatus.UNAVAILABLE
             run.finished_at = now
             level = "error"
             message = "运行阶段 worker 租约过期，已停止自动恢复以避免重复任务。"
+        run.status_version += 1
         run.lease_token = None
         run.worker_heartbeat_at = None
         run.lease_expires_at = None
         run.save()
         _event(run, message, kind="lease", level=level)
+        if stale_work_directory:
+            transaction.on_commit(
+                lambda work_directory=stale_work_directory: (
+                    _cleanup_swarm_services_for_run(Path(work_directory))
+                )
+            )
 
 
 def _available_memory_bytes(path: Path = Path("/proc/meminfo")) -> int | None:
@@ -224,8 +407,13 @@ def _available_memory_bytes(path: Path = Path("/proc/meminfo")) -> int | None:
     return None
 
 
-def _resource_wait_message() -> str | None:
+def _resource_wait_message(run: AnalysisRun | None = None) -> str | None:
     minimum_gb = max(0.0, float(settings.ANALYSIS_MIN_AVAILABLE_MEMORY_GB))
+    if run is not None and run.run_kind == AnalysisRun.Kind.TOOL_TEST:
+        requested_gb = float(
+            (run.tool_version.tool_spec.get("runtime") or {}).get("memory_gb") or 1
+        )
+        minimum_gb = min(minimum_gb, max(2.0, requested_gb * 1.25))
     if minimum_gb == 0:
         return None
     available = _available_memory_bytes()
@@ -249,7 +437,9 @@ def claim_next_run() -> AnalysisRun | None:
         )
         if run is None:
             return None
-        wait_message = _resource_wait_message()
+        if run.tool_version_id:
+            run.tool_version
+        wait_message = _resource_wait_message(run)
         if wait_message:
             if not run.current_step.startswith("等待计算资源"):
                 run.current_step = wait_message
@@ -257,6 +447,7 @@ def claim_next_run() -> AnalysisRun | None:
                 _event(run, wait_message, kind="resource", level="warning")
             return None
         run.status = AnalysisRun.Status.PREPARING
+        run.status_version += 1
         run.progress = 5
         run.current_step = "正在准备 WDL 与输入"
         run.started_at = now
@@ -269,6 +460,7 @@ def claim_next_run() -> AnalysisRun | None:
         run.save(
             update_fields=[
                 "status",
+                "status_version",
                 "progress",
                 "current_step",
                 "started_at",
@@ -287,11 +479,13 @@ def claim_next_run() -> AnalysisRun | None:
         if run.workflow_version_id:
             run.workflow_version
             run.workflow_version.workflow
+        if run.tool_version_id:
+            run.tool_version
         return run
 
 
 def _revision_bundle(run: AnalysisRun) -> tuple[dict[str, str], str]:
-    if run.workflow_version_id:
+    if run.workflow_version_id or run.tool_version_id:
         if _canonical_bundle_digest(run.source_bundle) != run.source_digest:
             raise RuntimeError("已发布 Workflow 的运行编译产物摘要不匹配。")
         files = run.source_bundle.get("files")
@@ -474,6 +668,39 @@ def _is_infrastructure_error(message: str, log_path: Path) -> bool:
     return any(pattern in lowered for pattern in INFRASTRUCTURE_ERROR_PATTERNS)
 
 
+def _failure_metadata(message: str) -> dict[str, Any]:
+    lowered = message.lower()
+    if "受管资源" in message or "resource" in lowered and "changed" in lowered:
+        return {
+            "code": "ANALYSIS_RESOURCE_CHANGED",
+            "category": "resource",
+            "retryable": False,
+        }
+    if any(pattern in lowered for pattern in INFRASTRUCTURE_ERROR_PATTERNS):
+        return {
+            "code": "ANALYSIS_INFRASTRUCTURE_ERROR",
+            "category": "infrastructure",
+            "retryable": True,
+        }
+    if "check json input" in lowered or "unknown input/output" in lowered:
+        return {
+            "code": "ANALYSIS_WORKFLOW_INPUT_ERROR",
+            "category": "workflow",
+            "retryable": False,
+        }
+    if "file not found" in lowered or "no such file" in lowered:
+        return {
+            "code": "ANALYSIS_RESOURCE_MISSING",
+            "category": "resource",
+            "retryable": False,
+        }
+    return {
+        "code": "ANALYSIS_TASK_FAILED",
+        "category": "application",
+        "retryable": False,
+    }
+
+
 def _attempt_paths(run_directory: Path, attempt: int) -> dict[str, Path]:
     attempt_directory = run_directory / f"attempt-{attempt}"
     attempt_directory.mkdir()
@@ -521,6 +748,13 @@ def execute_analysis_run(
                 }
                 if run.workflow_version_id
                 else {
+                    "kind": "tool_version",
+                    "tool_id": run.tool_version.tool_id,
+                    "version": run.tool_version.version,
+                    "digest": run.tool_version.digest,
+                }
+                if run.tool_version_id
+                else {
                     "kind": "wdl_asset",
                     "slug": run.asset.slug,
                     "revision": run.revision.version,
@@ -544,12 +778,14 @@ def execute_analysis_run(
     source_name = (
         f"{run.workflow_version.name} v{run.workflow_version.version}"
         if run.workflow_version_id
+        else f"{run.tool_version.name} v{run.tool_version.version}"
+        if run.tool_version_id
         else f"{run.asset.name} v{run.revision.version}"
     )
     _event(run, f"已固定 {source_name}，启动 miniwdl。")
 
     total_calls = 1
-    if run.workflow_version_id:
+    if run.workflow_version_id or run.tool_version_id:
         total_calls = max(1, int(run.source_bundle.get("call_count", 1)))
     else:
         workflows = run.revision.analysis.get("workflows", [])
@@ -684,12 +920,18 @@ def execute_analysis_run(
         time.sleep(max(0.0, float(settings.ANALYSIS_INFRASTRUCTURE_RETRY_DELAY_SECONDS)))
 
     if result is None:
+        failure = _failure_metadata(failure_message)
         _update_run(
             run,
             status=AnalysisRun.Status.FAILED,
             progress=100,
             current_step="运行失败",
             error=failure_message[:8000],
+            error_code=failure["code"],
+            error_category=failure["category"],
+            error_retryable=failure["retryable"],
+            error_details={},
+            output_status=AnalysisRun.OutputStatus.UNAVAILABLE,
             finished_at=timezone.now(),
             lease_token=None,
             worker_heartbeat_at=None,
@@ -697,35 +939,78 @@ def execute_analysis_run(
         )
         _event(run, failure_message, level="error")
         return
+    output_manifest = {}
+    output_status = AnalysisRun.OutputStatus.COMPLETE
+    output_error = None
+    if run.service_account_id:
+        output_manifest, output_status, output_error = build_output_manifest(run, result)
+    current_step = (
+        "工具测试完成"
+        if run.run_kind == AnalysisRun.Kind.TOOL_TEST
+        else "分析完成"
+    )
+    if output_error:
+        current_step = "执行完成，但必需输出不完整"
     _update_run(
         run,
         status=AnalysisRun.Status.SUCCEEDED,
         progress=100,
-        current_step="分析完成",
+        current_step=current_step,
         outputs=result,
-        error="",
+        output_manifest=output_manifest,
+        output_status=output_status,
+        error="" if output_error is None else "必需输出不完整。",
+        error_code=output_error["code"] if output_error else "",
+        error_category=output_error["category"] if output_error else "",
+        error_retryable=output_error["retryable"] if output_error else False,
+        error_details=output_error["details"] if output_error else {},
         finished_at=timezone.now(),
         lease_token=None,
         worker_heartbeat_at=None,
         lease_expires_at=None,
     )
-    _event(run, "分析完成，结果文件已就绪。")
+    if output_error:
+        _event(
+            run,
+            "WDL 执行成功，但必需输出不完整。",
+            kind="output",
+            level="error",
+            details=output_error["details"],
+        )
+    else:
+        _event(
+            run,
+            (
+                "工具测试完成，结果文件已就绪。"
+                if run.run_kind == AnalysisRun.Kind.TOOL_TEST
+                else "分析完成，结果文件已就绪。"
+            ),
+        )
 
 
 def process_analysis_run(run: AnalysisRun) -> None:
+    heartbeat = _LeaseHeartbeat(run)
     try:
-        with _LeaseHeartbeat(run) as heartbeat:
+        with heartbeat:
             execute_analysis_run(run, heartbeat)
     except AnalysisRunLeaseLost:
+        heartbeat.cleanup_services()
+        _finalize_cancelled_run(run.pk, run.lease_token)
         return
     except Exception as error:
         try:
+            failure = _failure_metadata(str(error))
             _update_run(
                 run,
                 status=AnalysisRun.Status.FAILED,
                 progress=100,
                 current_step="运行失败",
                 error=str(error)[:8000],
+                error_code=failure["code"],
+                error_category=failure["category"],
+                error_retryable=failure["retryable"],
+                error_details={},
+                output_status=AnalysisRun.OutputStatus.UNAVAILABLE,
                 finished_at=timezone.now(),
                 lease_token=None,
                 worker_heartbeat_at=None,

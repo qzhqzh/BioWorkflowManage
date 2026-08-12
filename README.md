@@ -41,6 +41,8 @@ BioWorkflowManage 是面向生物信息学流程工程化的可视化 Workflow �
 - ToolSpec、Workflow Graph、DAG 与类型校验；
 - Graph -> Compiler IR -> WDL 1.0 和 miniwdl 校验；
 - 独立 miniwdl 隔离执行环境、真实容器 smoke 和数据案例预检；
+- Service Account、幂等第三方投递、受管输入、取消/重跑和语义化输出；
+- 通过受限 MCP 查询流程/软件并独立测试固定 WorkflowVersion 或 ToolVersion；
 - 工具、流程、WDL 与子流程的不可变版本；
 - 子流程以固定 `slug + version + digest` 的黑盒节点复用，并编译为 WDL
   `import/call`；
@@ -58,8 +60,8 @@ BioWorkflowManage 是面向生物信息学流程工程化的可视化 Workflow �
 - 并发编辑保护、备份恢复等生产能力。
 
 认证登录、WDL 工具包管理和运行分析页面已经落地；运行分析由独立
-`analysis-worker` 领取队列任务并记录进度。取消、日志流、成本与资源监控属于后续执行
-引擎阶段。
+`analysis-worker` 领取队列任务并记录进度、事件、取消、重跑和输出证据。成本、集群资源
+配额与签名 Webhook 属于后续执行引擎阶段。
 
 ## miniwdl 校验与真实运行
 
@@ -88,6 +90,8 @@ BioWorkflowManage 是面向生物信息学流程工程化的可视化 Workflow �
 
 完整说明和 fastp→BWA 案例边界见
 [`docs/12-miniwdl-execution.md`](docs/12-miniwdl-execution.md)。
+第三方报告系统和 AI Agent 接入见
+[`docs/14-integration-api-and-mcp.md`](docs/14-integration-api-and-mcp.md)。
 
 ## Phase 1: Workflow Compiler Foundation
 
@@ -136,6 +140,7 @@ conditional 仍未实现。
 
 - [`schemas/tool-spec.schema.json`](schemas/tool-spec.schema.json)
 - [`schemas/workflow-graph.schema.json`](schemas/workflow-graph.schema.json)
+- [`schemas/integration-openapi-v1.json`](schemas/integration-openapi-v1.json)
 
 当前 contracts/golden 基线：
 

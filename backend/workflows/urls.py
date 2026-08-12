@@ -5,6 +5,9 @@ from . import (
     analysis_runs,
     api_overrides,
     auth_views,
+    integration_api,
+    software_library,
+    tool_runs,
     views,
     wdl_assets,
     wdl_graph_proposals,
@@ -38,12 +41,96 @@ urlpatterns = [
     path("auth/login", auth_views.login_view),
     path("auth/me", auth_views.me),
     path("auth/logout", auth_views.logout_view),
+    path("integration/openapi", integration_api.integration_openapi),
+    path(
+        "integration/workflow-versions",
+        integration_api.integration_workflow_versions,
+    ),
+    path(
+        "integration/workflow-versions/<int:version_id>",
+        integration_api.integration_workflow_version_detail,
+    ),
+    path(
+        "integration/analysis-runs/preflight",
+        integration_api.integration_preflight,
+    ),
+    path(
+        "integration/analysis-runs/by-external-ref",
+        integration_api.integration_analysis_run_by_external_ref,
+    ),
+    path(
+        "integration/analysis-runs",
+        integration_api.integration_analysis_runs,
+    ),
+    path(
+        "integration/analysis-runs/batch-status",
+        integration_api.integration_analysis_runs_batch_status,
+    ),
+    path(
+        "integration/analysis-runs/<uuid:run_id>",
+        integration_api.integration_analysis_run_detail,
+    ),
+    path(
+        "integration/analysis-runs/<uuid:run_id>/events",
+        integration_api.integration_analysis_run_events,
+    ),
+    path(
+        "integration/analysis-runs/<uuid:run_id>/cancel",
+        integration_api.integration_analysis_run_cancel,
+    ),
+    path(
+        "integration/analysis-runs/<uuid:run_id>/retry",
+        integration_api.integration_analysis_run_retry,
+    ),
+    path(
+        "integration/analysis-runs/<uuid:run_id>/outputs",
+        integration_api.integration_analysis_run_outputs,
+    ),
+    path(
+        "integration/analysis-runs/<uuid:run_id>/outputs/download",
+        integration_api.integration_analysis_run_output_download,
+    ),
+    path(
+        "integration/tool-test-runs/preflight",
+        integration_api.integration_tool_test_preflight,
+    ),
+    path(
+        "integration/tool-test-runs",
+        integration_api.integration_tool_test_runs,
+    ),
+    path("integration/tools", integration_api.integration_tools),
+    path("integration/software", integration_api.integration_software),
     path("analysis/catalog", analysis_runs.analysis_catalog),
     path("analysis-runs", analysis_runs.analysis_runs),
     path("analysis-runs/<uuid:run_id>", analysis_runs.analysis_run_detail),
     path(
         "analysis-runs/<uuid:run_id>/outputs",
         analysis_runs.analysis_run_output,
+    ),
+    path("tool-test-resources", tool_runs.tool_test_resources),
+    path("tool-test-runs", tool_runs.tool_test_runs),
+    path("tool-test-runs/<uuid:run_id>", tool_runs.tool_test_run_detail),
+    path(
+        "tool-test-runs/<uuid:run_id>/outputs",
+        tool_runs.tool_test_run_output,
+    ),
+    path("software", software_library.software_assets),
+    path("software/<slug:slug>", software_library.software_asset_detail),
+    path(
+        "software/<slug:slug>/releases",
+        software_library.software_releases,
+    ),
+    path(
+        "software/<slug:slug>/releases/<int:release_id>",
+        software_library.software_release_detail,
+    ),
+    path(
+        "software/<slug:slug>/tool-links",
+        software_library.software_tool_links,
+    ),
+    path(
+        "software/<slug:slug>/tool-links/<int:link_id>",
+        software_library.software_tool_link_detail,
     ),
     path("contracts", views.contracts),
     path("contracts/<str:contract_name>", views.contracts),

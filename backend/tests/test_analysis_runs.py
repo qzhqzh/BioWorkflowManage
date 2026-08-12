@@ -17,6 +17,7 @@ from compiler_core import canonical_digest, compile_workflow
 from workflows.analysis_runtime import (
     GIB,
     _available_memory_bytes,
+    _cleanup_swarm_services_for_run,
     _is_infrastructure_error,
     _LeaseHeartbeat,
     _result_error,
@@ -112,6 +113,76 @@ def test_lease_loss_escalates_from_term_to_kill(monkeypatch):
     heartbeat._terminate_process()
 
     assert signals == [(1234, signal.SIGTERM), (1234, signal.SIGKILL)]
+
+
+def test_heartbeat_fences_process_after_database_errors_exceed_lease(monkeypatch):
+    finalized = []
+    run = type(
+        "Run",
+        (),
+        {
+            "id": "run-1",
+            "pk": "run-1",
+            "lease_token": "lease-1",
+            "work_directory": "",
+        },
+    )()
+    heartbeat = _LeaseHeartbeat(run)
+    heartbeat.lease_deadline = 0
+    monkeypatch.setattr(
+        "workflows.analysis_runtime._renew_lease",
+        lambda run: (_ for _ in ()).throw(RuntimeError("database unavailable")),
+    )
+    monkeypatch.setattr(
+        "workflows.analysis_runtime._finalize_cancelled_run",
+        lambda run_id, lease: finalized.append((run_id, lease)),
+    )
+
+    assert heartbeat._renew_or_expire() is False
+    assert heartbeat.lease_lost.is_set()
+    assert finalized == [("run-1", "lease-1")]
+
+
+def test_swarm_cleanup_only_removes_service_mounted_under_run(tmp_path):
+    run_directory = tmp_path / "run-1"
+    run_directory.mkdir()
+
+    class FakeService:
+        def __init__(self, name, source):
+            self.name = name
+            self.id = name
+            self.removed = False
+            self.attrs = {
+                "Spec": {
+                    "Labels": {"miniwdl_run_id": "call-task"},
+                    "TaskTemplate": {
+                        "ContainerSpec": {"Mounts": [{"Source": str(source)}]}
+                    },
+                }
+            }
+
+        def remove(self):
+            self.removed = True
+
+    owned = FakeService("owned", run_directory / "attempt-1/work/task")
+    other = FakeService("other", tmp_path / "another-run/work/task")
+
+    class FakeClient:
+        class Services:
+            def list(self, **kwargs):
+                assert kwargs["filters"] == {"label": "miniwdl_run_id"}
+                return [owned, other]
+
+        services = Services()
+
+    removed, errors = _cleanup_swarm_services_for_run(
+        run_directory, docker_client=FakeClient()
+    )
+
+    assert removed == ["owned"]
+    assert errors == []
+    assert owned.removed is True
+    assert other.removed is False
 
 
 def test_timing_marks_interrupted_task_as_failed(tmp_path):

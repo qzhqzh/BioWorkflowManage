@@ -10,7 +10,9 @@
 4. 由独立 Worker 执行运行页提交的受管历史 WDL，并把进度、事件和输出记录到数据库。
 
 miniwdl 不在 Django 请求内运行。开发/CI 案例仍使用独立脚本；产品运行通过数据库队列
-交给 `analysis-worker`。当前不包含取消、暂停、资源配额和执行节点多租户隔离。
+交给 `analysis-worker`。运行支持安全取消、固定快照重跑、Service Account 隔离和语义化
+输出；当前不包含暂停、跨节点资源配额和恶意 WDL 多租户隔离。第三方投递与 MCP 见
+[第 14 章](14-integration-api-and-mcp.md)。
 
 ## 运行分析页面
 

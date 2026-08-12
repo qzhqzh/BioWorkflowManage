@@ -24,8 +24,10 @@ const statusLabels: Record<string, string> = {
   queued: '排队中',
   preparing: '准备中',
   running: '运行中',
+  cancel_requested: '取消中',
   succeeded: '已完成',
   failed: '失败',
+  canceled: '已取消',
 }
 
 function formatDuration(seconds?: number) {

@@ -215,7 +215,7 @@ def _visible_runs(request):
         "revision",
         "workflow_version",
         "workflow_version__workflow",
-    )
+    ).filter(run_kind=AnalysisRun.Kind.WORKFLOW)
     user = getattr(request, "user", None)
     if user is not None and getattr(user, "is_authenticated", False):
         if getattr(user, "is_superuser", False) or getattr(user, "is_staff", False):

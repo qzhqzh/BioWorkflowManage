@@ -85,6 +85,13 @@ interface ToolVersionEntry {
   digest: string
   created_at: string
   tool_spec?: Record<string, any>
+  software_links?: Array<{
+    id: number
+    role: string
+    note: string
+    software: { slug: string; name: string }
+    release?: { id: number; version: string }
+  }>
 }
 interface ToolOperationError {
   code: string
@@ -313,6 +320,7 @@ const selectedToolId = ref('')
 const selectedToolVersions = ref<ToolVersionEntry[]>([])
 const selectedToolVersion = ref('')
 const selectedToolSpec = ref<Record<string, any>>()
+const selectedToolSoftwareLinks = ref<NonNullable<ToolVersionEntry['software_links']>>([])
 const toolDraft = ref<Record<string, any>>()
 const toolDraftBaseVersion = ref<number>()
 const toolDraftBaseDigest = ref<string>()
@@ -2639,6 +2647,7 @@ function closeToolInspector() {
   selectedToolVersions.value = []
   selectedToolVersion.value = ''
   selectedToolSpec.value = undefined
+  selectedToolSoftwareLinks.value = []
   toolDraft.value = undefined
   toolDraftBaseVersion.value = undefined
   toolDraftBaseDigest.value = undefined
@@ -2653,6 +2662,7 @@ async function loadToolVersions(toolId: string, requestedVersion = '') {
   selectedToolVersions.value = []
   selectedToolVersion.value = ''
   selectedToolSpec.value = undefined
+  selectedToolSoftwareLinks.value = []
   toolDraft.value = undefined
   toolDraftBaseVersion.value = undefined
   toolDraftBaseDigest.value = undefined
@@ -2702,12 +2712,14 @@ async function loadToolDraft(toolId: string) {
 }
 
 async function loadToolVersionDetail(toolId: string, version: string) {
+  selectedToolSoftwareLinks.value = []
   try {
     const detail = await $fetch<ToolVersionEntry>(
       `/api/v1/tools/${encodeURIComponent(toolId)}/versions/${encodeURIComponent(version)}`,
     )
     selectedToolVersion.value = version
     selectedToolSpec.value = detail.tool_spec
+    selectedToolSoftwareLinks.value = detail.software_links ?? []
   } catch (error) {
     console.error('Failed to load tool version detail', error)
   }
@@ -3408,6 +3420,7 @@ onBeforeRouteLeave(() => {
         :selected-tool-versions="selectedToolVersions"
         :selected-tool-version="selectedToolVersion"
         :selected-tool-spec="selectedToolSpec"
+        :selected-tool-software-links="selectedToolSoftwareLinks"
         :tool-draft-state="toolDraftState"
         :tool-draft-validation-status="toolDraftValidationStatus"
         :tool-operation-error="toolOperationError"

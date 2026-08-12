@@ -23,7 +23,7 @@ const detailError = ref('')
 const submitError = ref('')
 let pollTimer: ReturnType<typeof setTimeout> | undefined
 
-const activeRun = computed(() => selectedRun.value && ['queued', 'preparing', 'running'].includes(selectedRun.value.status))
+const activeRun = computed(() => selectedRun.value && ['queued', 'preparing', 'running', 'cancel_requested'].includes(selectedRun.value.status))
 const initialWorkflow = computed(() => typeof route.query.workflow === 'string' ? route.query.workflow : undefined)
 const initialRevision = computed(() => {
   const value = Number(route.query.revision)

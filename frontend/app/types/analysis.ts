@@ -115,7 +115,7 @@ export interface AnalysisRunTiming {
   tasks: AnalysisTaskTiming[]
 }
 
-export type AnalysisRunStatus = 'queued' | 'preparing' | 'running' | 'succeeded' | 'failed'
+export type AnalysisRunStatus = 'queued' | 'preparing' | 'running' | 'cancel_requested' | 'succeeded' | 'failed' | 'canceled'
 
 export interface AnalysisRun {
   id: string

@@ -742,6 +742,25 @@ def _tool_version_payload(tool_version: ToolVersion, *, include_spec=False) -> d
     }
     if include_spec:
         payload["tool_spec"] = tool_version.tool_spec
+        payload["software_links"] = [
+            {
+                "id": link.id,
+                "role": link.role,
+                "note": link.note,
+                "software": {
+                    "slug": link.software.slug,
+                    "name": link.software.name,
+                },
+                "release": (
+                    {"id": link.release_id, "version": link.release.version}
+                    if link.release_id
+                    else None
+                ),
+            }
+            for link in tool_version.software_links.select_related(
+                "software", "release"
+            )
+        ]
     return payload
 
 

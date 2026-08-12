@@ -1,0 +1,1077 @@
+from __future__ import annotations
+
+import gzip
+import json
+import uuid
+from datetime import timedelta
+from io import StringIO
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+from django.core.management import call_command
+from django.utils import timezone
+from rest_framework.test import APIClient
+
+from compiler_core import canonical_digest, compile_workflow
+from manage_mcp import TOOLS, handle, tool_call
+from workflows.analysis_runtime import (
+    _finalize_cancelled_run,
+    claim_next_run,
+    process_analysis_run,
+)
+from workflows.integration_outputs import build_output_manifest
+from workflows.integration_tokens import issue_service_token
+from workflows.models import (
+    AnalysisRun,
+    ServiceAccount,
+    ServiceToken,
+    SoftwareAsset,
+    ToolVersion,
+    WorkflowDocument,
+    WorkflowVersion,
+)
+
+
+ALL_SCOPES = [
+    "analysis:submit",
+    "analysis:read",
+    "analysis:cancel",
+    "analysis:retry",
+    "analysis:download",
+    "workflow:read",
+    "library:read",
+    "task:test",
+]
+
+
+def _token_client(*, client_id="okb", scopes=None):
+    account = ServiceAccount.objects.create(
+        client_id=client_id,
+        name=client_id.upper(),
+        scopes=scopes or ALL_SCOPES,
+    )
+    token, raw_token = issue_service_token(account, name="test", actor="pytest")
+    client = APIClient()
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {raw_token}")
+    return account, token, raw_token, client
+
+
+def _write_fastq(path: Path, mate: int, *, read_id="read-001"):
+    with gzip.open(path, "wt", encoding="utf-8") as handle:
+        handle.write(f"@{read_id}/{mate}\nACGT\n+\n!!!!\n")
+
+
+@pytest.fixture
+def integration_workspace(settings, tmp_path: Path):
+    rawdata = tmp_path / "rawdata"
+    database = tmp_path / "database"
+    runs = tmp_path / "runs"
+    rawdata.mkdir()
+    database.mkdir()
+    runs.mkdir()
+    _write_fastq(rawdata / "S001_R1.fastq.gz", 1)
+    _write_fastq(rawdata / "S001_R2.fastq.gz", 2)
+    settings.ANALYSIS_RAWDATA_ROOT = rawdata
+    settings.ANALYSIS_RAWDATA_EXECUTION_ROOT = rawdata
+    settings.ANALYSIS_DATABASE_ROOT = database
+    settings.ANALYSIS_DATABASE_EXECUTION_ROOT = database
+    settings.ANALYSIS_RUN_ROOT = runs
+    settings.ANALYSIS_RUN_EXECUTION_ROOT = runs
+    settings.ANALYSIS_MIN_AVAILABLE_MEMORY_GB = 0
+    return rawdata, database, runs
+
+
+def _workflow_version() -> WorkflowVersion:
+    tool = {
+        "schema_version": "1.0.0",
+        "id": "copy_read",
+        "name": "copy_read",
+        "display_name": "Copy read",
+        "tool_version": "1.0.0",
+        "description": "Small integration fixture",
+        "container": {"engine": "docker", "image": "ubuntu:24.04"},
+        "inputs": [
+            {
+                "name": "read1",
+                "label": "Read 1",
+                "wdl_type": "File",
+                "semantic_type": "bio.fastq.gz.r1",
+                "required": True,
+            },
+            {
+                "name": "read2",
+                "label": "Read 2",
+                "wdl_type": "File",
+                "semantic_type": "bio.fastq.gz.r2",
+                "required": True,
+            },
+        ],
+        "outputs": [
+            {
+                "name": "result",
+                "label": "QC result",
+                "wdl_type": "File",
+                "semantic_type": "report.qc_tsv",
+                "capture": {"mode": "path", "value": "result.tsv"},
+            }
+        ],
+        "command": {
+            "shell": "bash",
+            "strict_mode": True,
+            "template": 'cp "~{read1}" result.tsv\n',
+        },
+        "runtime": {"cpu": 1, "memory_gb": 1, "disk_gb": 1},
+    }
+    graph = {
+        "schema_version": "1.0.0",
+        "id": "integration_smoke",
+        "name": "Integration smoke",
+        "target": {
+            "language": "wdl",
+            "version": "1.0",
+            "profile": "miniwdl-compatible",
+        },
+        "nodes": [
+            {
+                "id": "read1",
+                "type": "workflow_input",
+                "label": "Read 1",
+                "port": {
+                    "name": "value",
+                    "wdl_type": "File",
+                    "semantic_type": "bio.fastq.gz.r1",
+                    "required": True,
+                },
+            },
+            {
+                "id": "read2",
+                "type": "workflow_input",
+                "label": "Read 2",
+                "port": {
+                    "name": "value",
+                    "wdl_type": "File",
+                    "semantic_type": "bio.fastq.gz.r2",
+                    "required": True,
+                },
+            },
+            {
+                "id": "copy",
+                "type": "tool",
+                "label": "Copy",
+                "tool_ref": {
+                    "id": tool["id"],
+                    "tool_version": tool["tool_version"],
+                    "spec_version": tool["schema_version"],
+                    "digest": canonical_digest(tool),
+                },
+                "parameter_values": {},
+            },
+            {
+                "id": "result",
+                "type": "workflow_output",
+                "label": "QC result",
+                "port": {
+                    "name": "value",
+                    "wdl_type": "File",
+                    "semantic_type": "report.qc_tsv",
+                    "required": True,
+                },
+            },
+        ],
+        "edges": [
+            {"id": "e1", "source": {"node_id": "read1", "port": "value"}, "target": {"node_id": "copy", "port": "read1"}},
+            {"id": "e2", "source": {"node_id": "read2", "port": "value"}, "target": {"node_id": "copy", "port": "read2"}},
+            {"id": "e3", "source": {"node_id": "copy", "port": "result"}, "target": {"node_id": "result", "port": "value"}},
+        ],
+    }
+    validation, artifacts = compile_workflow(graph, [tool])
+    assert validation["status"] == "valid", validation
+    bundle = {
+        "entrypoint": "workflow.wdl",
+        "files": {
+            item["name"]: item["content"]
+            for item in artifacts
+            if item.get("media_type") == "application/wdl"
+        },
+        "call_count": 1,
+    }
+    document = WorkflowDocument.objects.create(
+        slug="integration-smoke",
+        name="Integration smoke",
+        workflow_graph=graph,
+        tool_specs=[tool],
+    )
+    return WorkflowVersion.objects.create(
+        workflow=document,
+        version=1,
+        name=document.name,
+        semantic_digest=canonical_digest(graph),
+        workflow_graph=graph,
+        tool_specs=[tool],
+        compiled_bundle=bundle,
+        compiled_digest=canonical_digest(bundle),
+        compiler_profile="compiler-core-v1",
+        interface_contract={
+            "contract_version": "1.0.0",
+            "inputs": [
+                {**tool["inputs"][0], "name": "read1"},
+                {**tool["inputs"][1], "name": "read2"},
+            ],
+            "outputs": [
+                {
+                    "name": "result",
+                    "label": "QC result",
+                    "wdl_type": "File",
+                    "semantic_type": "report.qc_tsv",
+                    "required": True,
+                }
+            ],
+        },
+    )
+
+
+def _submission(version: WorkflowVersion, *, external_run_id="okb-run-1"):
+    return {
+        "external_ref": {
+            "client_id": "okb",
+            "external_run_id": external_run_id,
+            "external_analysis_id": "analysis-1",
+        },
+        "workflow": {
+            "source_type": "workflow_version",
+            "version_id": version.pk,
+            "expected_source_digest": version.compiled_digest,
+        },
+        "subject": {"sample_id": "S001"},
+        "inputs": {
+            "read1": {"root_alias": "rawdata", "relative_path": "S001_R1.fastq.gz"},
+            "read2": {"root_alias": "rawdata", "relative_path": "S001_R2.fastq.gz"},
+        },
+        "metadata": {"product_code": "PANEL001"},
+    }
+
+
+@pytest.mark.django_db
+def test_service_token_auth_scope_revocation_and_isolation(settings):
+    settings.AUTH_REQUIRED = True
+    account, token, raw_token, client = _token_client(scopes=["workflow:read"])
+    other, _, _, other_client = _token_client(client_id="other")
+    version = _workflow_version()
+
+    unauthenticated = APIClient().get(
+        "/api/v1/integration/workflow-versions",
+        HTTP_X_REQUEST_ID="okb-auth-check",
+    )
+    assert unauthenticated.status_code == 401
+    assert unauthenticated.data["error"]["code"] == "SERVICE_AUTHENTICATION_REQUIRED"
+    assert unauthenticated.data["error"]["request_id"] == "okb-auth-check"
+    assert unauthenticated["X-Request-ID"] == "okb-auth-check"
+    assert client.get("/api/v1/integration/workflow-versions").status_code == 200
+    forbidden = client.post("/api/v1/integration/analysis-runs/preflight", {}, format="json")
+    assert forbidden.status_code == 403
+    assert forbidden.data["error"]["code"] == "SERVICE_SCOPE_REQUIRED"
+
+    run = AnalysisRun.objects.create(
+        workflow_version=version,
+        service_account=account,
+        external_run_id="hidden-run",
+        idempotency_key="hidden-idempotency",
+        workflow_name="integration_smoke",
+        sample_id="S001",
+        actor="service:okb",
+        source_bundle=version.compiled_bundle,
+        source_digest=version.compiled_digest,
+    )
+    assert other_client.get(f"/api/v1/integration/analysis-runs/{run.id}").status_code == 404
+
+    token.revoked_at = timezone.now()
+    token.save(update_fields=["revoked_at"])
+    revoked = client.get("/api/v1/integration/workflow-versions")
+    assert revoked.status_code == 401
+    assert revoked.data["error"]["retryable"] is False
+    assert ServiceToken.objects.get(pk=token.pk).token_hash != raw_token
+    assert other.client_id == "other"
+
+
+@pytest.mark.django_db
+def test_service_token_is_rejected_by_legacy_browser_api(settings):
+    settings.AUTH_REQUIRED = True
+    _, _, _, client = _token_client(scopes=["workflow:read"])
+
+    response = client.get("/api/v1/analysis-runs")
+
+    assert response.status_code == 403
+
+
+@pytest.mark.django_db
+def test_service_account_token_rotation_does_not_reactivate_disabled_account():
+    account = ServiceAccount.objects.create(
+        client_id="disabled",
+        name="Disabled",
+        scopes=["workflow:read"],
+        is_active=False,
+    )
+    token, _ = issue_service_token(account, name="old", actor="pytest")
+
+    output = StringIO()
+    call_command(
+        "manage_service_account",
+        client_id="disabled",
+        revoke_prefix=token.prefix,
+        actor="pytest",
+        stdout=output,
+    )
+    account.refresh_from_db()
+    token.refresh_from_db()
+    assert account.is_active is False
+    assert token.revoked_at is not None
+
+    call_command(
+        "manage_service_account",
+        client_id="disabled",
+        activate=True,
+        actor="pytest",
+        stdout=StringIO(),
+    )
+    account.refresh_from_db()
+    assert account.is_active is True
+
+
+@pytest.mark.django_db
+def test_integration_not_found_and_validation_errors_use_stable_envelope(settings):
+    settings.AUTH_REQUIRED = True
+    _, _, _, client = _token_client()
+    missing = client.get(f"/api/v1/integration/analysis-runs/{uuid.uuid4()}")
+    assert missing.status_code == 404
+    assert missing.data["error"]["code"] == "INTEGRATION_RESOURCE_NOT_FOUND"
+    assert missing.data["error"]["category"] == "validation"
+    assert missing["X-Request-ID"] == missing.data["error"]["request_id"]
+
+    invalid_batch = client.post(
+        "/api/v1/integration/analysis-runs/batch-status",
+        {"run_ids": ["not-a-uuid"]},
+        format="json",
+    )
+    assert invalid_batch.status_code == 400
+    assert invalid_batch.data["error"]["code"] == "BATCH_STATUS_RUN_ID_INVALID"
+
+
+@pytest.mark.django_db
+def test_preflight_rejects_unsafe_paths_and_bad_fastq_pair(integration_workspace):
+    _, _, _, client = _token_client()
+    version = _workflow_version()
+    body = _submission(version)
+
+    ready = client.post("/api/v1/integration/analysis-runs/preflight", body, format="json")
+    assert ready.status_code == 200, ready.data
+    assert ready.data["ready"] is True
+    assert {item["check"] for item in ready.data["checks"]} >= {
+        "workflow_snapshot",
+        "fastq_pair",
+        "output_contract",
+    }
+
+    unsafe = _submission(version)
+    unsafe["inputs"]["read1"]["relative_path"] = "../escape.fastq.gz"
+    rejected = client.post("/api/v1/integration/analysis-runs/preflight", unsafe, format="json")
+    assert rejected.status_code == 400
+    assert rejected.data["error"]["code"] == "MANAGED_RESOURCE_PATH_INVALID"
+
+    rawdata, _, _ = integration_workspace
+    _write_fastq(rawdata / "S001_R2.fastq.gz", 2, read_id="different")
+    mismatch = client.post("/api/v1/integration/analysis-runs/preflight", body, format="json")
+    assert mismatch.status_code == 400
+    assert mismatch.data["error"]["code"] == "FASTQ_PAIR_MISMATCH"
+
+    nul_path = _submission(version)
+    nul_path["inputs"]["read1"]["relative_path"] = "bad\x00.fastq.gz"
+    response = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        nul_path,
+        format="json",
+    )
+    assert response.status_code == 400
+    assert response.data["error"]["code"] == "MANAGED_RESOURCE_INVALID"
+
+    rawdata, _, _ = integration_workspace
+    (rawdata / "invalid_R1.fastq.gz").write_bytes(b"not a gzip stream")
+    invalid_gzip = _submission(version)
+    invalid_gzip["inputs"]["read1"]["relative_path"] = "invalid_R1.fastq.gz"
+    response = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        invalid_gzip,
+        format="json",
+    )
+    assert response.status_code == 400
+    assert response.data["error"]["code"] == "FASTQ_GZIP_INVALID"
+
+
+@pytest.mark.django_db
+def test_preflight_reports_transient_resource_wait(
+    integration_workspace, monkeypatch, settings
+):
+    _, _, _, client = _token_client()
+    version = _workflow_version()
+    monkeypatch.setattr("workflows.integration_api._available_memory_bytes", lambda: 0)
+    settings.ANALYSIS_MIN_AVAILABLE_MEMORY_GB = 8
+
+    response = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        _submission(version),
+        format="json",
+    )
+
+    assert response.status_code == 200, response.data
+    assert response.data["ready"] is False
+    assert response.data["submission_allowed"] is True
+    assert response.data["waiting_for"] == ["execution_memory"]
+
+
+@pytest.mark.django_db
+def test_preflight_validates_and_snapshots_database_catalog(
+    integration_workspace, settings
+):
+    _, database, _ = integration_workspace
+    _, _, _, client = _token_client()
+    version = _workflow_version()
+    contract = dict(version.interface_contract)
+    contract["database"] = {
+        "required": True,
+        "panel_required": True,
+        "allowed_reference_ids": ["hg19"],
+        "allowed_panel_ids": ["panel-a"],
+    }
+    WorkflowVersion.objects.filter(pk=version.pk).update(interface_contract=contract)
+    version.refresh_from_db()
+    catalog_path = database / "catalog.json"
+    catalog_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "references": [
+                    {
+                        "id": "hg19",
+                        "required": [
+                            {"path": "hg19/reference.fa", "kind": "file"}
+                        ],
+                    }
+                ],
+                "panels": [
+                    {
+                        "id": "panel-a",
+                        "reference": "hg19",
+                        "required": [{"path": "panels/a.bed", "kind": "file"}],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    settings.ANALYSIS_DATABASE_CATALOG = catalog_path
+    body = _submission(version)
+    body["database"] = {"reference_id": "hg19", "panel_id": "panel-a"}
+
+    missing = client.post(
+        "/api/v1/integration/analysis-runs/preflight", body, format="json"
+    )
+    assert missing.status_code == 400
+    assert missing.data["error"]["code"] == "ANALYSIS_DATABASE_INCOMPLETE"
+    assert {item["path"] for item in missing.data["error"]["details"]["missing"]} == {
+        "hg19/reference.fa",
+        "panels/a.bed",
+    }
+
+    (database / "hg19").mkdir()
+    (database / "panels").mkdir()
+    (database / "hg19/reference.fa").write_text(">chr1\nACGT\n", encoding="utf-8")
+    (database / "panels/a.bed").write_text("chr1\t0\t4\n", encoding="utf-8")
+    ready = client.post(
+        "/api/v1/integration/analysis-runs/preflight", body, format="json"
+    )
+    assert ready.status_code == 200, ready.data
+    assert ready.data["ready"] is True
+    assert {item["check"] for item in ready.data["checks"]} >= {
+        "database_reference",
+        "database_panel",
+    }
+    assert ready.data["resource_manifest"]["database_selection"] == {
+        "reference_id": "hg19",
+        "panel_id": "panel-a",
+    }
+
+    submitted = client.post(
+        "/api/v1/integration/analysis-runs",
+        body,
+        format="json",
+        HTTP_IDEMPOTENCY_KEY="okb-run-1",
+    )
+    assert submitted.status_code == 201, submitted.data
+    run = AnalysisRun.objects.get(pk=submitted.data["id"])
+    assert run.request_payload["database_selection"]["reference_id"] == "hg19"
+    assert run.request_payload["reference_resource_manifest"]["resources"]
+    assert run.request_payload["panel_resource_manifest"]["resources"]
+
+
+@pytest.mark.django_db
+def test_preflight_rejects_symlink_escape_wrong_mate_digest_and_nested_identity(
+    integration_workspace,
+    tmp_path: Path,
+):
+    rawdata, _, _ = integration_workspace
+    _, _, _, client = _token_client()
+    version = _workflow_version()
+
+    outside = tmp_path / "outside.fastq.gz"
+    _write_fastq(outside, 1)
+    (rawdata / "escape.fastq.gz").symlink_to(outside)
+    escaped = _submission(version)
+    escaped["inputs"]["read1"]["relative_path"] = "escape.fastq.gz"
+    response = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        escaped,
+        format="json",
+    )
+    assert response.status_code == 400
+    assert response.data["error"]["code"] == "MANAGED_RESOURCE_ESCAPE"
+
+    absolute = _submission(version)
+    absolute["inputs"]["read1"]["relative_path"] = str(outside)
+    response = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        absolute,
+        format="json",
+    )
+    assert response.status_code == 400
+    assert response.data["error"]["code"] == "MANAGED_RESOURCE_PATH_INVALID"
+
+    _write_fastq(rawdata / "S001_R1.fastq.gz", 2)
+    wrong_mate = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        _submission(version),
+        format="json",
+    )
+    assert wrong_mate.status_code == 400
+    assert wrong_mate.data["error"]["code"] == "FASTQ_MATE_INVALID"
+
+    _write_fastq(rawdata / "S001_R1.fastq.gz", 1)
+    digest_mismatch = _submission(version)
+    digest_mismatch["workflow"]["expected_source_digest"] = "sha256:" + "0" * 64
+    response = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        digest_mismatch,
+        format="json",
+    )
+    assert response.status_code == 409
+    assert response.data["error"]["code"] == "WORKFLOW_VERSION_CHANGED"
+
+    clinical = _submission(version)
+    clinical["metadata"] = {"context": {"patientName": "sensitive"}}
+    response = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        clinical,
+        format="json",
+    )
+    assert response.status_code == 400
+    assert response.data["error"]["code"] == "METADATA_CONTAINS_CLINICAL_IDENTITY"
+
+    WorkflowVersion.objects.filter(pk=version.pk).update(compiled_bundle={})
+    not_runnable = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        _submission(version),
+        format="json",
+    )
+    assert not_runnable.status_code == 400
+    assert not_runnable.data["error"]["code"] == "WORKFLOW_VERSION_NOT_RUNNABLE"
+
+
+@pytest.mark.django_db
+def test_idempotent_submission_find_cancel_and_status_version(integration_workspace):
+    account, _, _, client = _token_client()
+    version = _workflow_version()
+    body = _submission(version)
+    headers = {"HTTP_IDEMPOTENCY_KEY": "okb-run-1"}
+
+    created = client.post("/api/v1/integration/analysis-runs", body, format="json", **headers)
+    assert created.status_code == 201, created.data
+    run_id = created.data["id"]
+    assert AnalysisRun.objects.filter(service_account=account).count() == 1
+
+    replayed = client.post("/api/v1/integration/analysis-runs", body, format="json", **headers)
+    assert replayed.status_code == 200
+    assert replayed["Idempotency-Replayed"] == "true"
+    assert replayed.data["id"] == run_id
+    assert AnalysisRun.objects.filter(service_account=account).count() == 1
+
+    changed = _submission(version)
+    changed["metadata"]["product_code"] = "OTHER"
+    conflict = client.post("/api/v1/integration/analysis-runs", changed, format="json", **headers)
+    assert conflict.status_code == 409
+    assert conflict.data["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+
+    found = client.get(
+        "/api/v1/integration/analysis-runs/by-external-ref",
+        {"external_run_id": "okb-run-1"},
+    )
+    assert found.status_code == 200
+    assert found.data["id"] == run_id
+
+    canceled = client.post(f"/api/v1/integration/analysis-runs/{run_id}/cancel", {}, format="json")
+    assert canceled.status_code == 200
+    assert canceled.data["status"] == "canceled"
+    assert canceled.data["status_version"] == 2
+    repeated = client.post(f"/api/v1/integration/analysis-runs/{run_id}/cancel", {}, format="json")
+    assert repeated.data["status_version"] == 2
+
+
+@pytest.mark.django_db
+def test_retry_is_new_record_and_rejects_changed_inputs(integration_workspace):
+    account, _, _, client = _token_client()
+    version = _workflow_version()
+    created = client.post(
+        "/api/v1/integration/analysis-runs",
+        _submission(version),
+        format="json",
+        HTTP_IDEMPOTENCY_KEY="original",
+    )
+    original = AnalysisRun.objects.get(pk=created.data["id"])
+    original.status = AnalysisRun.Status.FAILED
+    original.error = "fixture failure"
+    original.save(update_fields=["status", "error", "updated_at"])
+
+    retry_body = {
+        "external_ref": {
+            "client_id": "okb",
+            "external_run_id": "okb-run-retry-1",
+            "external_analysis_id": "analysis-1",
+        }
+    }
+    retried = client.post(
+        f"/api/v1/integration/analysis-runs/{original.id}/retry",
+        retry_body,
+        format="json",
+        HTTP_IDEMPOTENCY_KEY="retry-1",
+    )
+    assert retried.status_code == 201, retried.data
+    retry = AnalysisRun.objects.get(pk=retried.data["id"])
+    assert retry.retry_of == original
+    assert retry.source_digest == original.source_digest
+    assert retry.input_values == original.input_values
+    assert retry.service_account == account
+    original.refresh_from_db()
+    assert original.status == AnalysisRun.Status.FAILED
+
+    rawdata, _, _ = integration_workspace
+    _write_fastq(rawdata / "S001_R1.fastq.gz", 1, read_id="replacement")
+    changed_body = {
+        "external_ref": {
+            "client_id": "okb",
+            "external_run_id": "okb-run-retry-2",
+        }
+    }
+    changed = client.post(
+        f"/api/v1/integration/analysis-runs/{original.id}/retry",
+        changed_body,
+        format="json",
+        HTTP_IDEMPOTENCY_KEY="retry-2",
+    )
+    assert changed.status_code == 409
+    assert changed.data["error"]["code"] == "ANALYSIS_RESOURCE_CHANGED"
+
+
+@pytest.mark.django_db
+def test_semantic_output_manifest_download_and_integrity(
+    integration_workspace, settings
+):
+    account, _, _, client = _token_client()
+    version = _workflow_version()
+    run = AnalysisRun.objects.create(
+        workflow_version=version,
+        service_account=account,
+        external_run_id="output-run",
+        idempotency_key="output-run",
+        workflow_name="integration_smoke",
+        sample_id="S001",
+        actor="service:okb",
+        source_bundle=version.compiled_bundle,
+        source_digest=version.compiled_digest,
+        status=AnalysisRun.Status.SUCCEEDED,
+        request_payload={
+            "integration_output_contract": [
+                {
+                    "key": "integration_smoke.result",
+                    "name": "result",
+                    "label": "QC result",
+                    "semantic_type": "report.qc_tsv",
+                    "wdl_type": "File",
+                    "required": True,
+                },
+                {
+                    "key": "integration_smoke.note",
+                    "name": "note",
+                    "label": "Note",
+                    "semantic_type": "report.note",
+                    "wdl_type": "String",
+                    "required": False,
+                },
+            ]
+        },
+    )
+    _, _, run_root = integration_workspace
+    directory = run_root / str(run.id)
+    directory.mkdir()
+    output = directory / "result.tsv"
+    output.write_text("sample\tvalue\nS001\t1\n", encoding="utf-8")
+    run.work_directory = str(directory)
+    result = {
+        "outputs": {
+            "integration_smoke.result": str(output),
+            "integration_smoke.note": f"stored at {run_root}/internal",
+            "integration_smoke.internal_path": "/mnt/nas/private/result.txt",
+        }
+    }
+    manifest, output_status, error = build_output_manifest(run, result)
+    assert error is None
+    execution_root = Path("/execution/analysis-runs")
+    settings.ANALYSIS_RUN_EXECUTION_ROOT = execution_root
+    manifest["items"][0]["path"] = str(
+        execution_root / output.relative_to(run_root)
+    )
+    run.outputs = result
+    run.output_manifest = manifest
+    run.output_status = output_status
+    run.save(update_fields=["work_directory", "outputs", "output_manifest", "output_status", "updated_at"])
+
+    listed = client.get(f"/api/v1/integration/analysis-runs/{run.id}/outputs")
+    assert listed.status_code == 200
+    item = listed.data["results"][0]
+    assert item["semantic_type"] == "report.qc_tsv"
+    assert item["sha256"].startswith("sha256:")
+    assert "path" not in item and "identity" not in item
+    assert len(listed.data["results"]) == 2
+    assert listed.data["results"][1]["value"] == "stored at <managed-root>/internal"
+    assert "private" not in json.dumps(listed.data)
+    assert manifest["uncontracted_output_keys"] == ["integration_smoke.internal_path"]
+
+    account.scopes = ["analysis:read"]
+    account.save(update_fields=["scopes", "updated_at"])
+    forbidden = client.get(item["download_url"])
+    assert forbidden.status_code == 403
+    assert forbidden.data["error"]["code"] == "SERVICE_SCOPE_REQUIRED"
+    account.scopes = ALL_SCOPES
+    account.save(update_fields=["scopes", "updated_at"])
+
+    downloaded = client.get(item["download_url"])
+    assert downloaded.status_code == 200
+    assert b"".join(downloaded.streaming_content) == output.read_bytes()
+
+    output.write_text("tampered\n", encoding="utf-8")
+    changed = client.get(item["download_url"])
+    assert changed.status_code == 409
+    assert changed.data["error"]["code"] == "ANALYSIS_OUTPUT_CHANGED"
+
+
+@pytest.mark.django_db
+def test_required_output_missing_is_distinct_from_execution_failure(integration_workspace):
+    account, _, _, _ = _token_client()
+    version = _workflow_version()
+    run = AnalysisRun.objects.create(
+        workflow_version=version,
+        service_account=account,
+        external_run_id="missing-output",
+        idempotency_key="missing-output",
+        workflow_name="integration_smoke",
+        sample_id="S001",
+        actor="service:okb",
+        source_bundle=version.compiled_bundle,
+        source_digest=version.compiled_digest,
+        request_payload={
+            "integration_output_contract": [
+                {
+                    "key": "integration_smoke.result",
+                    "semantic_type": "report.qc_tsv",
+                    "wdl_type": "File",
+                    "required": True,
+                }
+            ]
+        },
+    )
+    _, _, run_root = integration_workspace
+    directory = run_root / str(run.id)
+    directory.mkdir()
+    run.work_directory = str(directory)
+    manifest, output_status, error = build_output_manifest(run, {"outputs": {}})
+    assert output_status == AnalysisRun.OutputStatus.INCOMPLETE
+    assert error["code"] == "REQUIRED_OUTPUT_MISSING"
+    assert manifest["missing_required"][0]["semantic_type"] == "report.qc_tsv"
+
+
+@pytest.mark.django_db
+def test_tool_test_submission_and_library_endpoints(integration_workspace):
+    _, _, _, client = _token_client()
+    spec = {
+        "schema_version": "1.0.0",
+        "id": "echo_task",
+        "name": "echo_task",
+        "display_name": "Echo Task",
+        "tool_version": "1.0.0",
+        "description": "Shell-only task",
+        "container": {"engine": "docker", "image": "ubuntu:24.04"},
+        "inputs": [{"name": "message", "wdl_type": "String", "semantic_type": "core.value.string", "required": True}],
+        "outputs": [{"name": "result", "wdl_type": "File", "semantic_type": "core.file.any", "capture": {"mode": "path", "value": "result.txt"}}],
+        "command": {"shell": "bash", "strict_mode": True, "template": 'printf "%s\\n" "~{message}" > result.txt'},
+        "runtime": {"cpu": 1, "memory_gb": 1, "disk_gb": 1},
+    }
+    tool = ToolVersion.objects.create(
+        tool_id=spec["id"],
+        version=spec["tool_version"],
+        name=spec["display_name"],
+        digest=canonical_digest(spec),
+        tool_spec=spec,
+    )
+    SoftwareAsset.objects.create(slug="shell", name="Shell", summary="Runtime notes")
+    body = {
+        "external_ref": {"client_id": "okb", "external_run_id": "task-test-1"},
+        "tool": {"tool_id": tool.tool_id, "version": tool.version, "expected_digest": tool.digest},
+        "inputs": {"message": "hello"},
+    }
+    ready = client.post("/api/v1/integration/tool-test-runs/preflight", body, format="json")
+    assert ready.status_code == 200, ready.data
+    submitted = client.post(
+        "/api/v1/integration/tool-test-runs",
+        body,
+        format="json",
+        HTTP_IDEMPOTENCY_KEY="task-test-1",
+    )
+    assert submitted.status_code == 201, submitted.data
+    assert submitted.data["run_kind"] == "tool_test"
+    assert client.get("/api/v1/integration/tools").data["results"][0]["tool_id"] == "echo_task"
+    assert client.get("/api/v1/integration/software").data["results"][0]["slug"] == "shell"
+
+
+@pytest.mark.django_db
+def test_tool_test_submission_rolls_back_if_initial_event_fails(integration_workspace):
+    account, _, _, client = _token_client()
+    spec = {
+        "schema_version": "1.0.0",
+        "id": "atomic_echo",
+        "name": "atomic_echo",
+        "display_name": "Atomic echo",
+        "tool_version": "1.0.0",
+        "description": "Transaction fixture",
+        "container": {"engine": "docker", "image": "ubuntu:24.04"},
+        "inputs": [{"name": "message", "wdl_type": "String", "semantic_type": "core.value.string", "required": True}],
+        "outputs": [{"name": "result", "wdl_type": "File", "semantic_type": "core.file.any", "capture": {"mode": "path", "value": "result.txt"}}],
+        "command": {"shell": "bash", "strict_mode": True, "template": 'printf "%s\\n" "~{message}" > result.txt'},
+        "runtime": {"cpu": 1, "memory_gb": 1, "disk_gb": 1},
+    }
+    tool = ToolVersion.objects.create(
+        tool_id=spec["id"],
+        version=spec["tool_version"],
+        name=spec["display_name"],
+        digest=canonical_digest(spec),
+        tool_spec=spec,
+    )
+    body = {
+        "external_ref": {"client_id": account.client_id, "external_run_id": "atomic-tool-test"},
+        "tool": {"tool_id": tool.tool_id, "version": tool.version, "expected_digest": tool.digest},
+        "inputs": {"message": "hello"},
+    }
+    client.raise_request_exception = False
+
+    with patch(
+        "workflows.integration_api.AnalysisRunEvent.objects.create",
+        side_effect=RuntimeError("event storage unavailable"),
+    ):
+        response = client.post(
+            "/api/v1/integration/tool-test-runs",
+            body,
+            format="json",
+            HTTP_IDEMPOTENCY_KEY="atomic-tool-test",
+        )
+
+    assert response.status_code == 500
+    assert not AnalysisRun.objects.filter(
+        service_account=account, external_run_id="atomic-tool-test"
+    ).exists()
+
+
+@pytest.mark.django_db
+def test_active_cancel_finalizes_after_worker_lease_is_revoked():
+    account, _, _, _ = _token_client()
+    version = _workflow_version()
+    lease = uuid.uuid4()
+    run = AnalysisRun.objects.create(
+        workflow_version=version,
+        service_account=account,
+        external_run_id="active-cancel",
+        idempotency_key="active-cancel",
+        workflow_name="integration_smoke",
+        sample_id="S001",
+        actor="service:okb",
+        source_bundle=version.compiled_bundle,
+        source_digest=version.compiled_digest,
+        status=AnalysisRun.Status.CANCEL_REQUESTED,
+        status_version=3,
+        lease_token=lease,
+    )
+    assert _finalize_cancelled_run(run.pk, lease) is True
+    run.refresh_from_db()
+    assert run.status == AnalysisRun.Status.CANCELED
+    assert run.status_version == 4
+    assert run.finished_at is not None
+    assert run.lease_token is None
+
+
+@pytest.mark.django_db
+def test_worker_cancel_race_and_stale_lease_have_terminal_structured_state(
+    django_capture_on_commit_callbacks,
+):
+    account, _, _, _ = _token_client()
+    version = _workflow_version()
+    canceled = AnalysisRun.objects.create(
+        workflow_version=version,
+        service_account=account,
+        external_run_id="cancel-race",
+        idempotency_key="cancel-race",
+        workflow_name="integration_smoke",
+        sample_id="S001",
+        actor="service:okb",
+        source_bundle=version.compiled_bundle,
+        source_digest=version.compiled_digest,
+        status=AnalysisRun.Status.CANCEL_REQUESTED,
+        status_version=2,
+        lease_token=uuid.uuid4(),
+    )
+    process_analysis_run(canceled)
+    canceled.refresh_from_db()
+    assert canceled.status == AnalysisRun.Status.CANCELED
+    assert canceled.error_code == "ANALYSIS_CANCELED"
+
+    stale = AnalysisRun.objects.create(
+        workflow_version=version,
+        service_account=account,
+        external_run_id="stale-running",
+        idempotency_key="stale-running",
+        workflow_name="integration_smoke",
+        sample_id="S001",
+        actor="service:okb",
+        source_bundle=version.compiled_bundle,
+        source_digest=version.compiled_digest,
+        status=AnalysisRun.Status.RUNNING,
+        status_version=2,
+        lease_token=uuid.uuid4(),
+        lease_expires_at=timezone.now() - timedelta(seconds=1),
+        work_directory="/managed/run",
+    )
+    with patch(
+        "workflows.analysis_runtime._cleanup_swarm_services_for_run"
+    ) as cleanup:
+        with django_capture_on_commit_callbacks(execute=True):
+            assert claim_next_run() is None
+    cleanup.assert_called_once_with(Path("/managed/run"))
+    stale.refresh_from_db()
+    assert stale.status == AnalysisRun.Status.FAILED
+    assert stale.error_code == "ANALYSIS_WORKER_LEASE_LOST"
+    assert stale.error_category == "infrastructure"
+    assert stale.error_retryable is True
+
+
+def test_mcp_protocol_advertises_scoped_read_and_write_tools():
+    class FakeClient:
+        pass
+
+    initialized = handle(
+        FakeClient(),
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+    )
+    assert initialized["result"]["serverInfo"]["name"] == "bioworkflow-manage"
+    listed = handle(FakeClient(), {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+    names = {item["name"] for item in listed["result"]["tools"]}
+    assert names == {item["name"] for item in TOOLS}
+    assert {"preflight_workflow", "submit_workflow", "preflight_task_test", "submit_task_test"} <= names
+    cancel = next(item for item in TOOLS if item["name"] == "cancel_run")
+    assert cancel["annotations"]["destructiveHint"] is True
+
+    unknown = handle(
+        FakeClient(),
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {"name": "not_a_tool", "arguments": {}},
+        },
+    )
+    assert unknown["error"]["code"] == -32602
+
+    missing = handle(
+        FakeClient(),
+        {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {"name": "get_run", "arguments": {}},
+        },
+    )
+    assert missing["result"]["isError"] is True
+
+
+def test_mcp_submit_tools_preserve_idempotency_and_database_selection():
+    calls = []
+
+    class FakeClient:
+        def request(self, method, path, *, body=None, headers=None):
+            calls.append((method, path, body, headers))
+            return {"id": "run-1"}
+
+    arguments = {
+        "external_ref": {"client_id": "okb", "external_run_id": "run-1"},
+        "idempotency_key": "run-1",
+        "workflow": {
+            "source_type": "workflow_version",
+            "version_id": 1,
+            "expected_source_digest": "sha256:digest",
+        },
+        "subject": {"sample_id": "S001"},
+        "inputs": {},
+        "database": {"reference_id": "hg19"},
+    }
+
+    assert tool_call(FakeClient(), "submit_workflow", arguments) == {"id": "run-1"}
+    method, path, body, headers = calls[0]
+    assert (method, path) == ("POST", "/api/v1/integration/analysis-runs")
+    assert body["database"] == {"reference_id": "hg19"}
+    assert "idempotency_key" not in body
+    assert headers == {"Idempotency-Key": "run-1"}
+
+
+@pytest.mark.django_db
+def test_openapi_contract_covers_every_integration_route():
+    payload = json.loads(
+        (Path(__file__).parents[2] / "schemas" / "integration-openapi-v1.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    paths = payload["paths"]
+    assert {
+        "/openapi",
+        "/workflow-versions",
+        "/workflow-versions/{version_id}",
+        "/analysis-runs/preflight",
+        "/analysis-runs",
+        "/analysis-runs/by-external-ref",
+        "/analysis-runs/batch-status",
+        "/analysis-runs/{run_id}",
+        "/analysis-runs/{run_id}/events",
+        "/analysis-runs/{run_id}/cancel",
+        "/analysis-runs/{run_id}/retry",
+        "/analysis-runs/{run_id}/outputs",
+        "/analysis-runs/{run_id}/outputs/download",
+        "/tool-test-runs/preflight",
+        "/tool-test-runs",
+        "/tools",
+        "/software",
+    } <= set(paths)
+    served = APIClient().get("/api/v1/integration/openapi")
+    assert served.status_code == 200
+    assert served.data["info"]["version"] == payload["info"]["version"]

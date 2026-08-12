@@ -37,6 +37,7 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
+    "workflows.request_ids.IntegrationRequestIdMiddleware",
     "config.cors.CorsMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -47,7 +48,15 @@ CORS_ALLOWED_ORIGINS = _csv_environment(
     "https://wdl.qzhqzh.com,http://localhost:3000,http://127.0.0.1:3000",
 )
 CORS_ALLOWED_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
-CORS_ALLOWED_HEADERS = ["Accept", "Content-Type", "X-Request-ID", "X-CSRFToken"]
+CORS_ALLOWED_HEADERS = [
+    "Accept",
+    "Authorization",
+    "Content-Type",
+    "Idempotency-Key",
+    "X-Request-ID",
+    "X-CSRFToken",
+]
+CORS_EXPOSE_HEADERS = ["Idempotency-Replayed", "X-Request-ID"]
 CORS_PREFLIGHT_MAX_AGE = 600
 CORS_ALLOW_CREDENTIALS = True
 ROOT_URLCONF = "config.urls"
@@ -91,11 +100,13 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 REST_FRAMEWORK = {
     "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"],
     "DEFAULT_AUTHENTICATION_CLASSES": [
+        "workflows.auth_permissions.ServiceTokenAuthentication",
         "workflows.auth_permissions.SessionAuthenticationWithHeader",
     ],
     "DEFAULT_PERMISSION_CLASSES": [
         "workflows.auth_permissions.AuthenticationRequiredPermission",
     ],
+    "EXCEPTION_HANDLER": "workflows.integration_exceptions.integration_exception_handler",
     "UNAUTHENTICATED_USER": None,
 }
 

@@ -10,8 +10,10 @@ const statusLabels: Record<string, string> = {
   queued: '排队中',
   preparing: '准备中',
   running: '运行中',
+  cancel_requested: '取消中',
   succeeded: '已完成',
   failed: '失败',
+  canceled: '已取消',
 }
 
 const events = computed(() => [...(props.run?.events ?? [])].reverse().slice(0, 30))
@@ -138,7 +140,7 @@ function taskBarStyle(offset: number, duration: number) {
       </details>
 
       <div v-if="run.error" class="analysis-run-error" role="alert">
-        <strong>运行失败</strong>
+        <strong>{{ run.status === 'canceled' ? '运行已取消' : '运行失败' }}</strong>
         <pre>{{ run.error }}</pre>
       </div>
 
