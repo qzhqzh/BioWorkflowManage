@@ -763,6 +763,45 @@ def test_catalog_discovers_fastq_pair_and_reports_managed_workflow(
     assert response.data["database"]["references"][0]["ready"] is True
 
 
+def test_catalog_exposes_limited_rawdata_scan_without_partial_datasets(
+    client, analysis_workspace, monkeypatch
+):
+    monkeypatch.setattr(
+        "workflows.analysis_runs.discover_fastq_catalog",
+        lambda: {
+            "scan_limited": True,
+            "scanned_at": "2026-08-12T08:10:00+00:00",
+            "issues": [
+                {
+                    "code": "RAWDATA_SCAN_LIMIT_REACHED",
+                    "message": "本次扫描达到安全预算。",
+                }
+            ],
+            "datasets": [
+                {
+                    "id": "partial",
+                    "status": "scan_incomplete",
+                }
+            ],
+        },
+    )
+
+    response = client.get("/api/v1/analysis/catalog")
+
+    assert response.status_code == 200
+    assert response.data["datasets"] == []
+    assert response.data["rawdata_scan"] == {
+        "limited": True,
+        "scanned_at": "2026-08-12T08:10:00+00:00",
+        "issues": [
+            {
+                "code": "RAWDATA_SCAN_LIMIT_REACHED",
+                "message": "本次扫描达到安全预算。",
+            }
+        ],
+    }
+
+
 def test_catalog_scopes_resource_readiness_to_legacy_input_adapter(
     client, analysis_workspace
 ):
@@ -941,6 +980,38 @@ def test_catalog_and_submit_support_latest_published_workflow(
     assert run.request_payload["input_digest"].startswith("sha256:")
     assert run.input_values["published_fastq.read1"].endswith("_R1.fq.gz")
     assert response.data["workflow"]["graph_summary"]["tool_count"] == 1
+
+
+def test_submit_refreshes_cached_fastq_identity(client, analysis_workspace):
+    version = _published_fastq_workflow()
+    catalog = client.get("/api/v1/analysis/catalog").data
+    dataset = catalog["datasets"][0]
+    rawdata, _, _, _ = analysis_workspace
+    read1 = rawdata / dataset["files"][0]["relative_path"]
+    _write_fastq(read1, 1)
+    with gzip.open(read1, "at", encoding="ascii") as handle:
+        handle.write("@read-2/1\nTGCA\n+\nIIII\n")
+    current = read1.stat()
+
+    response = client.post(
+        "/api/v1/analysis-runs",
+        {
+            "workflow": f"published:{version.workflow.slug}:{version.version}",
+            "dataset": dataset["id"],
+            "sample_id": "CACHE01",
+            "sample_name": "缓存后修改",
+        },
+        format="json",
+    )
+
+    assert response.status_code == 201
+    run = AnalysisRun.objects.get(pk=response.data["id"])
+    manifest = run.request_payload["input_resource_manifest"]
+    recorded = manifest["files"][0]
+    assert recorded["size"] == current.st_size
+    assert recorded["mtime_ns"] == current.st_mtime_ns
+    assert recorded["inode"] == current.st_ino
+    _verify_run_resource_manifests(run)
 
 
 def test_catalog_adds_requested_historical_published_workflow(

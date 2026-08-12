@@ -33,15 +33,11 @@ from .resource_catalog import (
     entry_requirements,
     load_active_catalog,
 )
+from .rawdata_catalog import cached_rawdata_catalog
 
 
-FASTQ_PATTERN = re.compile(
-    r"^(?P<prefix>.+?)(?P<marker>[_\.-]R)(?P<mate>[12])(?P<suffix>(?:[_\.-].*)?)\.(?P<extension>fastq|fq)\.gz$",
-    re.IGNORECASE,
-)
 SAFE_SAMPLE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 SAFE_DISPLAY_VALUE = re.compile(r"^[\w\u4e00-\u9fff .()_-]{1,128}$", re.UNICODE)
-MAX_DISCOVERED_FASTQ = 2000
 PUBLISHED_WORKFLOW_PREFIX = "published:"
 WDL_ASSET_WORKFLOW_PREFIX = "wdl-asset:"
 SUPPORTED_PUBLISHED_INPUTS = {
@@ -435,80 +431,16 @@ def _run_timing_payload(run: AnalysisRun) -> dict[str, Any]:
     return timing
 
 
-def _sample_code(pair_stem: str) -> str:
-    parts = [item for item in pair_stem.split("_") if item]
-    if parts and re.fullmatch(r"L\d+", parts[-1], re.IGNORECASE):
-        parts.pop()
-    return (parts[-1] if parts else pair_stem)[-128:]
+def discover_fastq_catalog() -> dict[str, Any]:
+    return cached_rawdata_catalog(settings.ANALYSIS_RAWDATA_ROOT)
 
 
 def discover_fastq_datasets() -> list[dict[str, Any]]:
-    root = Path(settings.ANALYSIS_RAWDATA_ROOT)
-    if not root.is_dir():
-        return []
-    pairs: dict[str, dict[int, Path]] = {}
-    pair_stems: dict[str, str] = {}
-    for index, path in enumerate(sorted(root.rglob("*"))):
-        if index >= MAX_DISCOVERED_FASTQ:
-            break
-        if path.is_symlink() or not path.is_file():
-            continue
-        try:
-            relative = path.relative_to(root)
-        except ValueError:
-            continue
-        if len(relative.parts) > 4:
-            continue
-        match = FASTQ_PATTERN.match(path.name)
-        if not match:
-            continue
-        pair_name = (
-            f"{match.group('prefix')}{match.group('marker')}{{R}}"
-            f"{match.group('suffix')}.{match.group('extension').lower()}.gz"
-        )
-        key = str(relative.parent / pair_name)
-        pairs.setdefault(key, {})[int(match.group("mate"))] = path
-        pair_stems[key] = match.group("prefix")
-
-    datasets: list[dict[str, Any]] = []
-    for key, mates in sorted(pairs.items()):
-        if set(mates) != {1, 2}:
-            continue
-        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:20]
-        files = []
-        total_size = 0
-        for mate in (1, 2):
-            path = mates[mate]
-            stat = path.stat()
-            size = stat.st_size
-            total_size += size
-            files.append(
-                {
-                    "mate": mate,
-                    "name": path.name,
-                    "relative_path": path.relative_to(root).as_posix(),
-                    "size": size,
-                    "size_label": _format_size(size),
-                    "identity": {
-                        "size": size,
-                        "mtime_ns": stat.st_mtime_ns,
-                        "device": stat.st_dev,
-                        "inode": stat.st_ino,
-                    },
-                }
-            )
-        sample_code = _sample_code(pair_stems[key])
-        datasets.append(
-            {
-                "id": digest,
-                "name": sample_code,
-                "pair_key": key,
-                "files": files,
-                "total_size": total_size,
-                "total_size_label": _format_size(total_size),
-            }
-        )
-    return datasets
+    return [
+        item
+        for item in discover_fastq_catalog()["datasets"]
+        if item["status"] == "ready"
+    ]
 
 
 def _dataset_paths(dataset: dict[str, Any]) -> tuple[Path, Path]:
@@ -572,18 +504,32 @@ def _requirements(entry: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _dataset_manifest(dataset: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "schema_version": 1,
-        "dataset_id": dataset["id"],
-        "files": [
+    root = Path(settings.ANALYSIS_RAWDATA_ROOT)
+    files = []
+    for item in dataset["files"]:
+        path = _safe_path(root, item["relative_path"])
+        try:
+            stat = path.stat()
+        except OSError as error:
+            raise AnalysisInputError(
+                "ANALYSIS_FASTQ_MISSING",
+                f"原始数据不存在或无法读取：{path.name}",
+            ) from error
+        files.append(
             {
                 "mate": item["mate"],
                 "relative_path": item["relative_path"],
                 "verification": "identity",
-                **item["identity"],
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "device": stat.st_dev,
+                "inode": stat.st_ino,
             }
-            for item in dataset["files"]
-        ],
+        )
+    return {
+        "schema_version": 1,
+        "dataset_id": dataset["id"],
+        "files": files,
     }
 
 
@@ -1609,7 +1555,12 @@ def analysis_run_payload(
 
 @api_view(["GET"])
 def analysis_catalog(request):
-    datasets = discover_fastq_datasets()
+    rawdata_catalog = discover_fastq_catalog()
+    datasets = [
+        item
+        for item in rawdata_catalog["datasets"]
+        if item["status"] == "ready"
+    ]
     try:
         catalog = load_database_catalog()
         reference_entries = list(catalog["references"])
@@ -1651,6 +1602,11 @@ def analysis_catalog(request):
     return Response(
         {
             "rawdata_directory": "workspace/rawdata",
+            "rawdata_scan": {
+                "limited": rawdata_catalog["scan_limited"],
+                "scanned_at": rawdata_catalog["scanned_at"],
+                "issues": rawdata_catalog["issues"],
+            },
             "database_directory": "workspace/databases",
             "datasets": datasets,
             "workflows": workflows,
@@ -1889,10 +1845,15 @@ def analysis_runs(request):
             error.code, str(error), status.HTTP_400_BAD_REQUEST, details=error.details
         )
 
-    input_manifest = {
-        "primary": _dataset_manifest(dataset),
-        "control": _dataset_manifest(control) if control else None,
-    }
+    try:
+        input_manifest = {
+            "primary": _dataset_manifest(dataset),
+            "control": _dataset_manifest(control) if control else None,
+        }
+    except AnalysisInputError as error:
+        return _error(
+            error.code, str(error), status.HTTP_400_BAD_REQUEST, details=error.details
+        )
     reference_manifest = _catalog_resource_manifest(reference)
     panel_manifest = _catalog_resource_manifest(panel)
     run = AnalysisRun.objects.create(

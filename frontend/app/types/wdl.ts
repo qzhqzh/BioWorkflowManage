@@ -143,6 +143,11 @@ export interface WdlAuditEvent {
   created_at: string
 }
 
+export type WdlLatestActivity = Pick<
+  WdlAuditEvent,
+  'id' | 'action' | 'actor' | 'note' | 'revision' | 'created_at'
+>
+
 export interface WdlAsset {
   slug: string
   name: string
@@ -159,6 +164,12 @@ export interface WdlAsset {
   updated_at: string
   revision_count: number
   file_count: number
+  maintenance_status?: 'ready' | 'warning' | 'error'
+  maintenance_counts?: {
+    errors: number
+    warnings: number
+  }
+  latest_activity?: WdlLatestActivity | null
   current_revision?: WdlSourceRevision | null
   revisions?: WdlSourceRevision[]
   audit_events?: WdlAuditEvent[]

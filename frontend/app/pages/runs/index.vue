@@ -30,6 +30,7 @@ const initialRevision = computed(() => {
   return Number.isInteger(value) && value > 0 ? value : undefined
 })
 const initialRunId = computed(() => typeof route.query.run === 'string' ? route.query.run : undefined)
+const initialDataset = computed(() => typeof route.query.dataset === 'string' ? route.query.dataset : undefined)
 const initialComparisonId = computed(() => typeof route.query.compare === 'string' ? route.query.compare : undefined)
 const scopedRuns = computed(() => {
   if (!initialWorkflow.value) return runs.value
@@ -247,47 +248,59 @@ onBeforeUnmount(() => {
         <strong>运行环境暂时无法读取</strong>
         <button class="button button--ghost" type="button" @click="reloadNuxtApp()">重试</button>
       </div>
-      <div v-else class="analysis-runs-layout">
-        <aside class="analysis-runs-sidebar">
-          <AnalysisSetupPanel
-            :catalog="catalog"
-            :busy="submitting"
-            :error="submitError"
-            :initial-workflow="initialWorkflow"
-            :initial-revision="initialRevision"
-            @submit="submitRun"
-          />
-          <AnalysisRunList
-            :runs="scopedRuns"
-            :selected-id="selectedRun?.id ?? ''"
-            :comparison-id="comparisonRun?.id ?? ''"
-            :scope-label="runScopeLabel"
-            @select="selectRun"
-            @compare="selectComparison"
-            @clear-scope="clearRunScope"
-          />
-        </aside>
-        <div v-if="detailError" class="analysis-page-state analysis-page-state--error" role="alert">
-          <strong>{{ detailError }}</strong>
-          <button
-            v-if="selectedRun?.id"
-            class="button button--ghost"
-            type="button"
-            @click="loadRun(selectedRun.id)"
-          >重试</button>
+      <template v-else>
+        <div
+          v-if="catalog?.rawdata_scan?.limited"
+          class="analysis-rawdata-warning"
+          role="status"
+        >
+          <strong>原始数据扫描未完成</strong>
+          <span>{{ catalog.rawdata_scan.issues[0]?.message }} 当前仅显示已确认完整的数据。</span>
+          <NuxtLink to="/rawdata">查看原始数据</NuxtLink>
         </div>
-        <div v-else class="analysis-run-content">
-          <AnalysisRunCompare
-            v-if="selectedRun && comparisonRun"
-            ref="comparisonPanel"
-            :primary="selectedRun"
-            :comparison="comparisonRun"
-            :loading="comparisonLoading"
-            @close="closeComparison"
-          />
-          <AnalysisRunDetail :run="selectedRun" :loading="detailLoading" />
+        <div class="analysis-runs-layout">
+          <aside class="analysis-runs-sidebar">
+            <AnalysisSetupPanel
+              :catalog="catalog"
+              :busy="submitting"
+              :error="submitError"
+              :initial-workflow="initialWorkflow"
+              :initial-revision="initialRevision"
+              :initial-dataset="initialDataset"
+              @submit="submitRun"
+            />
+            <AnalysisRunList
+              :runs="scopedRuns"
+              :selected-id="selectedRun?.id ?? ''"
+              :comparison-id="comparisonRun?.id ?? ''"
+              :scope-label="runScopeLabel"
+              @select="selectRun"
+              @compare="selectComparison"
+              @clear-scope="clearRunScope"
+            />
+          </aside>
+          <div v-if="detailError" class="analysis-page-state analysis-page-state--error" role="alert">
+            <strong>{{ detailError }}</strong>
+            <button
+              v-if="selectedRun?.id"
+              class="button button--ghost"
+              type="button"
+              @click="loadRun(selectedRun.id)"
+            >重试</button>
+          </div>
+          <div v-else class="analysis-run-content">
+            <AnalysisRunCompare
+              v-if="selectedRun && comparisonRun"
+              ref="comparisonPanel"
+              :primary="selectedRun"
+              :comparison="comparisonRun"
+              :loading="comparisonLoading"
+              @close="closeComparison"
+            />
+            <AnalysisRunDetail :run="selectedRun" :loading="detailLoading" />
+          </div>
         </div>
-      </div>
+      </template>
 
       <footer class="analysis-runs-footer" aria-label="版本信息">
         v1 · 开发版

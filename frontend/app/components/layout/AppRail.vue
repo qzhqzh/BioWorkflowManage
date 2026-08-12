@@ -18,6 +18,7 @@ const primaryItems = [
   { id: 'tools', glyph: 'T', label: '工具库' },
   { id: 'packages', glyph: 'P', label: '工具包' },
   { id: 'resources', glyph: 'R', label: '资源库' },
+  { id: 'rawdata', glyph: 'D', label: '原始数据' },
   { id: 'runs', glyph: '▶', label: '运行分析' },
   { id: 'wdl', glyph: 'W', label: '历史 WDL' },
 ] as const

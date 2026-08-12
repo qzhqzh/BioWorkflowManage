@@ -94,7 +94,7 @@ async function mockWdlApi(page: Page, options: {
     body: JSON.stringify({
       user: {
         username: 'zhuqin', is_admin: true, role: 'admin',
-        allowed_sections: ['overview', 'edit', 'tools', 'packages', 'artifacts', 'runs', 'wdl', 'help'],
+        allowed_sections: ['overview', 'edit', 'tools', 'packages', 'artifacts', 'resources', 'rawdata', 'runs', 'wdl', 'help'],
       },
     }),
   }))
@@ -171,6 +171,9 @@ async function mockWdlApi(page: Page, options: {
     updated_at: '2026-07-29T10:00:00Z',
     revision_count: revisionVersion,
     file_count: 1,
+    maintenance_status: 'ready',
+    maintenance_counts: { errors: 0, warnings: 0 },
+    latest_activity: events[0],
     current_revision: currentRevision(),
     revisions: Array.from({ length: revisionVersion }, (_, index) => ({
       ...currentRevision(),
@@ -640,6 +643,9 @@ test('lists tagged historical assets and opens the WDL workbench', async ({ page
   await expect(page.getByRole('cell', { name: /实体瘤 WES hg38/ })).toBeVisible()
   await expect(page.getByRole('button', { name: /实体瘤 1/ })).toBeVisible()
   await expect(page.getByText('1 task · 1 workflow')).toBeVisible()
+  await expect(page.getByRole('columnheader', { name: '最近协作' })).toBeVisible()
+  await expect(page.getByText('local-user · 导入源码')).toBeVisible()
+  await expect(page.getByText('从生产目录导入', { exact: true }).first()).toBeVisible()
   await expect(page.getByRole('columnheader', { name: '状态' })).toHaveCount(0)
 
   await page.getByRole('link', { name: '打开工作台' }).click()

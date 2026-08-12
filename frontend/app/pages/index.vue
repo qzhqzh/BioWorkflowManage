@@ -2328,6 +2328,7 @@ function selectRail(section: AppSection, syncRoute = true) {
     section === 'overview'
     || section === 'packages'
     || section === 'resources'
+    || section === 'rawdata'
     || section === 'runs'
     || section === 'wdl'
   ) {
