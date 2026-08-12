@@ -55,7 +55,120 @@ WORKFLOW_PROFILES = {
         "mode": "paired",
         "description": "肿瘤与对照样本配对分析，包含体细胞变异和双样本质控。",
     },
+    "tumor-blood-single-production": {
+        "name": "血液肿瘤单样本正式流程",
+        "workflow_name": "TumorBloodSingle",
+        "mode": "single",
+        "description": "血液肿瘤单样本正式 WDL，包含完整本地依赖。",
+        "required_reference": "hg38",
+        "input_adapter": "pending",
+    },
+    "tumor-blood-pair-production": {
+        "name": "血液肿瘤配对样本正式流程",
+        "workflow_name": "TumorBloodPair",
+        "mode": "paired",
+        "description": "血液肿瘤肿瘤/对照配对正式 WDL，包含完整本地依赖。",
+        "required_reference": "hg38",
+        "input_adapter": "pending",
+    },
 }
+
+BLOOD_TUMOR_HG38_REQUIREMENTS = (
+    ("hg38/reference/Homo_sapiens_assembly38.fasta", "GRCh38 FASTA", "file"),
+    ("hg38/reference/Homo_sapiens_assembly38.fasta.fai", "GRCh38 FASTA 索引", "file"),
+    ("hg38/reference/Homo_sapiens_assembly38.dict", "GRCh38 sequence dictionary", "file"),
+    ("hg38/reference/Homo_sapiens_assembly38.fasta.64.amb", "BWA amb 索引", "file"),
+    ("hg38/reference/Homo_sapiens_assembly38.fasta.64.ann", "BWA ann 索引", "file"),
+    ("hg38/reference/Homo_sapiens_assembly38.fasta.64.bwt", "BWA bwt 索引", "file"),
+    ("hg38/reference/Homo_sapiens_assembly38.fasta.64.pac", "BWA pac 索引", "file"),
+    ("hg38/reference/Homo_sapiens_assembly38.fasta.64.sa", "BWA sa 索引", "file"),
+    ("hg38/reference/Homo_sapiens_assembly38.2bit", "GRCh38 2bit", "file"),
+    ("hg38/hla_reference", "HLA 参考库", "directory"),
+    ("hg38/blood_tumor/humandb", "血液肿瘤 ANNOVAR humandb", "directory"),
+    ("hg38/blood_tumor/humandb/hg38_refGeneWithVer.txt", "hg38 RefGeneWithVer 注释", "file"),
+    ("hg38/blood_tumor/bed/genome_windows.bed", "全基因组窗口 BED", "file"),
+    ("hg38/blood_tumor/bed/exons_hg38.bed", "GRCh38 外显子 BED", "file"),
+    ("hg38/blood_tumor/bed/kszy_84panel.hg38.gene.list", "84 Panel 基因列表", "file"),
+    ("hg38/blood_tumor/bed/kszy_BloodTumor_DNA_panel.624.gene.list", "624 Panel 基因列表", "file"),
+    ("hg38/blood_tumor/database/ref_annot.gtf", "血液肿瘤参考注释 GTF", "file"),
+    ("hg38/blood_tumor/resource/druggable.hg38.csv", "GRCh38 可用药区域", "file"),
+    ("hg38/blood_tumor/resource/genomic.gene.gff", "基因 GFF", "file"),
+    ("hg38/blood_tumor/resource/sorted.gene.tx.blood.txt", "血液肿瘤转录本映射", "file"),
+    ("hg38/blood_tumor/resource/624panel_anno_filter.xls", "624 Panel 注释过滤库", "file"),
+    ("hg38/blood_tumor/resource/84panel_filter.xls", "84 Panel 注释过滤库", "file"),
+    ("hg38/blood_tumor/resource/cnv_tumor_gene.2024-2.xlsx", "CNV 肿瘤基因库", "file"),
+    ("hg38/blood_tumor/resource/dosage_sensitivity_gene.xlsx", "剂量敏感基因库", "file"),
+    ("hg38/blood_tumor/resource/GRch38.repeats.coord_noseq.bed", "GRCh38 重复区域", "file"),
+    ("hg38/blood_tumor/resource/genomicSuperDups.bed", "Segmental duplication 区域", "file"),
+    ("hg38/blood_tumor/resource/panel_CNV_PreClass.xls", "Panel CNV 预分类库", "file"),
+    ("hg38/blood_tumor/resource/pre_class.xlsx", "变异预分类库", "file"),
+    ("hg38/blood_tumor/resource/special_region.xls", "特殊区域规则库", "file"),
+    ("hg38/blood_tumor/resource/20231220/rs.uniq-20231218.in", "化疗位点规则库", "file"),
+    ("hg38/blood_tumor/resource/20231220/chemo_efficacy_toxicity_database.sorted.txt", "化疗疗效与毒性数据库", "file"),
+    ("hg38/blood_tumor/resource/local_freq_blood/local_freq_blood.zip", "血液肿瘤本地频率库", "file"),
+    ("hg38/blood_tumor/resource/local_freq_blood/dna_fusion/84fusion.mutation_frequency.txt", "84 Panel 融合频率库", "file"),
+    ("hg38/blood_tumor/resource/local_freq_blood/dna_fusion/624fusion.mutation_frequency.txt", "624 Panel 融合频率库", "file"),
+    ("hg38/blood_tumor/cnvkit/84panel", "84 Panel CNVKit 基线", "directory"),
+    ("hg38/blood_tumor/cnvkit/396", "396 Panel CNVKit 基线", "directory"),
+    ("hg38/blood_tumor/cnvkit_new0919/624panel", "624 Panel CNVKit 基线", "directory"),
+    ("hg38/blood_tumor/cnvkit_new0919/624panel_with_100kb_backbone", "624 Panel 100kb backbone 基线", "directory"),
+    ("hg38/blood_tumor/cnvdb/84panel/baseline_zm_kz", "84 Panel CNV 数据库", "directory"),
+    ("hg38/blood_tumor/cnvdb/624panel_backbone/v2/baseline_624panel_zm_kz", "624 Panel CNV 数据库", "directory"),
+    ("hg38/blood_tumor/cnvdb/624panel_backbone/v2/baseline_backbone_zm_kz", "624 backbone CNV 数据库", "directory"),
+    ("hg38/annotation/ncbiRefSeqCurated.txt.gz", "RefSeq CNV 注释", "file"),
+    ("hg38/annotation/ncbiRefSeqCurated.txt.gz.tbi", "RefSeq CNV 注释索引", "file"),
+    ("hg38/annotation/DGV_20200225.txt.gz", "DGV CNV 库", "file"),
+    ("hg38/annotation/DGV_20200225.txt.gz.tbi", "DGV CNV 索引", "file"),
+    ("hg38/annotation/decipher_population_cnv_grch38.txt.gz", "DECIPHER CNV 库", "file"),
+    ("hg38/annotation/decipher_population_cnv_grch38.txt.gz.tbi", "DECIPHER CNV 索引", "file"),
+    ("hg38/annotation/variant_summary.txt.gz", "ClinVar CNV 库", "file"),
+    ("hg38/annotation/variant_summary.txt.gz.tbi", "ClinVar CNV 索引", "file"),
+    ("hg38/annotation/clingen_cnv.tsv.gz", "ClinGen CNV 库", "file"),
+    ("hg38/annotation/clingen_cnv.tsv.gz.tbi", "ClinGen CNV 索引", "file"),
+    ("hg38/annotation/cytoBandIdeo.txt.gz", "GRCh38 cytoband", "file"),
+    ("hg38/annotation/gene_id.txt", "CNV gene id", "file"),
+    ("hg38/annotation/representative_transcript.txt", "代表转录本", "file"),
+    ("common_db/local_frequency", "项目本地频率库根目录", "directory"),
+    ("hg19/resource/combine.tsv", "结果汇总规则", "file"),
+    ("hg19/resource/hotspot_gene-20230227.xls", "热点基因库", "file"),
+    ("hg19/resource/tumor-gene-20241016.xlsx", "肿瘤基因库", "file"),
+    ("hg19/resource/ensembltogenbank.xls", "Ensembl/GenBank 映射", "file"),
+    ("hg19/resource/chemo.rs.uniq.120.in", "实体瘤化疗位点规则", "file"),
+    ("hg19/resource/chemo.tab1.example", "化疗表一模板", "file"),
+    ("hg19/resource/chemo.tab2.example", "化疗表二模板", "file"),
+    ("hg19/resource/chemo_efficacy_toxicity_database.txt", "化疗疗效与毒性数据库", "file"),
+    ("hg19/resource/chemo_site.bed", "化疗位点 BED", "file"),
+    ("hg19/resource/sorted.gene.tx.txt", "基因转录本映射", "file"),
+    ("hg19/resource/msidb/microsatellites.list", "MSI 位点库", "file"),
+    ("hg19/resource/msidb/reference.list_baseline", "MSI 基线库", "file"),
+    ("hg19/database/genomic.gene.gff", "hg19 基因 GFF", "file"),
+    ("hg19/humandb/hg19_refGeneWithVer.txt", "hg19 RefGeneWithVer 注释", "file"),
+)
+
+
+def _blood_tumor_hg38_reference() -> dict[str, Any]:
+    return {
+        "id": "hg38",
+        "name": "hg38 / GRCh38（血液肿瘤正式流程）",
+        "ref_version": "hg38",
+        "required": [
+            {"path": path, "label": label, "kind": kind}
+            for path, label, kind in BLOOD_TUMOR_HG38_REQUIREMENTS
+        ],
+    }
+
+
+def _merge_reference_requirements(
+    reference: dict[str, Any], extra: dict[str, Any]
+) -> dict[str, Any]:
+    merged = dict(reference)
+    by_path = {
+        str(item.get("path")): item
+        for item in [*reference.get("required", []), *extra.get("required", [])]
+        if item.get("path")
+    }
+    merged["required"] = list(by_path.values())
+    return merged
 
 
 class AnalysisInputError(ValueError):
@@ -544,6 +657,7 @@ def _workflow_payload(
     profile: dict[str, str],
     *,
     revision_version: int | None = None,
+    available_references: set[str] | None = None,
 ) -> dict[str, Any]:
     asset = WDLAsset.objects.filter(slug=slug).first()
     latest_revision = asset.source_revisions.first() if asset else None
@@ -571,6 +685,15 @@ def _workflow_payload(
         ]
     else:
         blockers = []
+    required_reference = profile.get("required_reference")
+    if (
+        required_reference
+        and available_references is not None
+        and required_reference not in available_references
+    ):
+        blockers.append(f"数据库 catalog 尚未配置 {required_reference} 参考资源。")
+    if profile.get("input_adapter") == "pending":
+        blockers.append("正式流程的运行输入映射尚未配置。")
     return {
         "slug": workflow_slug,
         "source_slug": slug,
@@ -578,20 +701,29 @@ def _workflow_payload(
         "source_type": "wdl_asset",
         "requires_reference": True,
         "requires_panel": True,
+        "required_reference": profile.get("required_reference"),
         "asset_name": asset.name if asset else "",
         "revision": revision.version if revision else None,
         "digest": revision.digest if revision else "",
-        "ready": bool(asset and revision and not errors),
+        "ready": bool(asset and revision and not blockers),
         "diagnostic_count": len(errors),
         "blockers": blockers,
     }
 
 
 def _managed_wdl_workflows(
-    *, requested_slug: str = "", requested_revision: int | None = None
+    *,
+    requested_slug: str = "",
+    requested_revision: int | None = None,
+    available_references: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     results = [
-        _workflow_payload(slug, profile) for slug, profile in WORKFLOW_PROFILES.items()
+        _workflow_payload(
+            slug,
+            profile,
+            available_references=available_references,
+        )
+        for slug, profile in WORKFLOW_PROFILES.items()
     ]
     profile = WORKFLOW_PROFILES.get(requested_slug)
     if profile is not None and requested_revision is not None:
@@ -599,6 +731,7 @@ def _managed_wdl_workflows(
             requested_slug,
             profile,
             revision_version=requested_revision,
+            available_references=available_references,
         )
         if all(item["slug"] != requested["slug"] for item in results):
             results.append(requested)
@@ -1301,13 +1434,26 @@ def analysis_catalog(request):
     datasets = discover_fastq_datasets()
     try:
         catalog = load_database_catalog()
-        reference_entries = catalog["references"]
+        reference_entries = list(catalog["references"])
+        declared_reference_ids = {str(item.get("id")) for item in reference_entries}
+        blood_reference = _blood_tumor_hg38_reference()
+        hg38_index = next(
+            (index for index, item in enumerate(reference_entries) if item.get("id") == "hg38"),
+            None,
+        )
+        if hg38_index is None:
+            reference_entries.append(blood_reference)
+        else:
+            reference_entries[hg38_index] = _merge_reference_requirements(
+                reference_entries[hg38_index], blood_reference
+            )
         references = [_catalog_entry_payload(item) for item in reference_entries]
         panels = [_catalog_entry_payload(item) for item in catalog["panels"]]
         catalog_error = None
     except AnalysisInputError as error:
         references = []
         reference_entries = []
+        declared_reference_ids = set()
         panels = []
         catalog_error = {
             "code": error.code,
@@ -1325,6 +1471,7 @@ def analysis_catalog(request):
     workflows = _managed_wdl_workflows(
         requested_slug=requested_slug,
         requested_revision=requested_revision,
+        available_references=declared_reference_ids,
     ) + _published_workflows(
         reference_entries,
         requested_slug=requested_slug,

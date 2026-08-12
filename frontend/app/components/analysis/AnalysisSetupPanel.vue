@@ -126,6 +126,12 @@ watch(requiresControl, (required) => {
   if (!required) controlDatasetId.value = ''
 })
 
+watch(selectedWorkflow, (workflow) => {
+  if (workflow?.required_reference && references.value.some(item => item.id === workflow.required_reference)) {
+    referenceId.value = workflow.required_reference
+  }
+})
+
 function submit() {
   if (!canSubmit.value) return
   emit('submit', {

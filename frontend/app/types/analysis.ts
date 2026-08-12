@@ -42,6 +42,7 @@ export interface AnalysisWorkflow {
   source_type: 'wdl_asset' | 'workflow_version'
   requires_reference: boolean
   requires_panel: boolean
+  required_reference?: string
   reference_status?: Record<string, AnalysisDatabaseOption>
   graph_summary?: AnalysisWorkflowGraphSummary
 }

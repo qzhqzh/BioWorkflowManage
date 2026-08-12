@@ -20,6 +20,15 @@ class Command(BaseCommand):
             help="Optional directory containing SolidTumorWithMRD.wdl and BloodTumorWithMRD.wdl.",
         )
         parser.add_argument(
+            "--blood-wdl-source-dir",
+            help="Optional directory containing single/ and pair/ production blood-tumor WDL bundles.",
+        )
+        parser.add_argument(
+            "--blood-wdl-revision",
+            default="",
+            help="Optional production blood-tumor source revision; defaults to each bundle SHA-256.",
+        )
+        parser.add_argument(
             "--repository",
             default="test-fixture",
             help="Repository label recorded for an optional historical WDL import.",
@@ -51,9 +60,20 @@ class Command(BaseCommand):
                 actor=options["actor"],
             )
 
+        blood_source_dir = options.get("blood_wdl_source_dir")
+        if blood_source_dir:
+            call_command(
+                "import_blood_tumor_wdl",
+                source_dir=blood_source_dir,
+                repository=options["repository"],
+                revision=options["blood_wdl_revision"],
+                actor=options["actor"],
+            )
+
         self.stdout.write(
             self.style.SUCCESS(
                 "Test data ready: users and Phase 1 workflows initialized"
                 + ("; historical WDL bundle imported." if source_dir else ".")
+                + ("; production blood-tumor WDL imported." if blood_source_dir else "")
             )
         )

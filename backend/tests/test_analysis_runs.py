@@ -689,6 +689,71 @@ def test_catalog_discovers_fastq_pair_and_reports_managed_workflow(
     assert response.data["database"]["references"][0]["ready"] is True
 
 
+def test_catalog_lists_production_blood_workflows_with_explicit_blockers(
+    client, analysis_workspace
+):
+    _asset("tumor-blood-single-production", "TumorBloodSingle")
+    _asset("tumor-blood-pair-production", "TumorBloodPair")
+
+    response = client.get("/api/v1/analysis/catalog")
+
+    assert response.status_code == 200
+    workflows = {
+        item["slug"]: item
+        for item in response.data["workflows"]
+        if item["slug"].startswith("tumor-blood-")
+    }
+    assert set(workflows) == {
+        "tumor-blood-single-production",
+        "tumor-blood-pair-production",
+    }
+    assert workflows["tumor-blood-single-production"]["ready"] is False
+    assert workflows["tumor-blood-pair-production"]["mode"] == "paired"
+    for workflow in workflows.values():
+        assert "数据库 catalog 尚未配置 hg38 参考资源。" in workflow["blockers"]
+        assert "正式流程的运行输入映射尚未配置。" in workflow["blockers"]
+        assert workflow["required_reference"] == "hg38"
+    hg38 = next(
+        item for item in response.data["database"]["references"] if item["id"] == "hg38"
+    )
+    assert hg38["ready"] is False
+    assert len(hg38["missing"]) == len(hg38["requirements"])
+    assert len(hg38["missing"]) > 40
+    assert {
+        "hg38/reference/Homo_sapiens_assembly38.fasta",
+        "hg38/blood_tumor/humandb",
+        "hg38/annotation/clingen_cnv.tsv.gz",
+        "hg38/blood_tumor/resource/20231220/rs.uniq-20231218.in",
+        "hg19/resource/tumor-gene-20241016.xlsx",
+        "hg19/resource/ensembltogenbank.xls",
+    }.issubset({item["path"] for item in hg38["missing"]})
+
+
+def test_catalog_merges_blood_requirements_into_existing_hg38(
+    client, analysis_workspace
+):
+    _, databases, _, catalog = analysis_workspace
+    catalog["references"].append(
+        {
+            "id": "hg38",
+            "name": "Existing hg38",
+            "ref_version": "hg38",
+            "required": [
+                {"path": "hg38/reference", "kind": "directory", "label": "reference"}
+            ],
+        }
+    )
+    (databases / "catalog.json").write_text(json.dumps(catalog), encoding="utf-8")
+
+    response = client.get("/api/v1/analysis/catalog")
+
+    hg38 = next(item for item in response.data["database"]["references"] if item["id"] == "hg38")
+    paths = {item["path"] for item in hg38["requirements"]}
+    assert "hg38/reference" in paths
+    assert "hg38/blood_tumor/resource/20231220/rs.uniq-20231218.in" in paths
+    assert "hg19/resource/tumor-gene-20241016.xlsx" in paths
+
+
 def test_catalog_and_submit_support_latest_published_workflow(
     client, analysis_workspace
 ):
