@@ -44,14 +44,24 @@ export interface AnalysisWorkflow {
   requires_panel: boolean
   required_reference?: string
   reference_status?: Record<string, AnalysisDatabaseOption>
+  panel_status?: Record<string, AnalysisDatabaseOption>
+  input_adapter_status?: {
+    status: 'ready' | 'pending'
+    unresolved_inputs: string[]
+    external_resource_count: number
+    external_resource_examples: string[]
+  }
   graph_summary?: AnalysisWorkflowGraphSummary
 }
 
 export interface AnalysisRequirement {
   path: string
   label: string
-  kind: 'file' | 'directory'
+  kind: 'file' | 'directory' | 'configuration'
   present: boolean
+  binding?: string
+  reason?: 'missing' | 'unconfigured' | 'checksum_mismatch' | 'constraint_mismatch' | ''
+  expected?: string[]
 }
 
 export interface AnalysisDatabaseOption {
@@ -59,6 +69,7 @@ export interface AnalysisDatabaseOption {
   name: string
   reference?: string
   ref_version?: string
+  workflow_ids?: string[]
   ready: boolean
   requirements: AnalysisRequirement[]
   missing: AnalysisRequirement[]

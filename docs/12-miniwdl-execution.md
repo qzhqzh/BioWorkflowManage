@@ -23,7 +23,8 @@ docker compose --profile wdl-runtime up -d backend frontend gateway miniwdl-dock
 - 页面入口：`/runs`；
 - 原始数据：`workspace/rawdata`，自动识别完整的 gzip FASTQ R1/R2；
 - 参考数据库和 Panel：`workspace/databases`，清单见该目录的 `catalog.json` 和
-  `README.md`；
+  `README.md`；管理员也可以通过 `/resources` 统一维护 Reference、Panel、BED 和 CNV
+  基线，初始化命令见[分析资源中心](15-analysis-resource-catalog.md)；
 - 运行结果：`data/analysis-runs/<run UUID>`；
 - 每次运行固定到提交当时的历史 WDL revision 与工具包版本，之后修改流程不会影响
   已排队或已完成运行。

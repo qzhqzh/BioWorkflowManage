@@ -22,8 +22,16 @@ from .models import (
     AnalysisRun,
     AnalysisRunEvent,
     WDLAsset,
+    WDLSourceRevision,
     WorkflowDocument,
     WorkflowVersion,
+)
+from .resource_catalog import (
+    ResourceCatalogError,
+    catalog_resource_specs,
+    entry_binding,
+    entry_requirements,
+    load_active_catalog,
 )
 
 
@@ -73,6 +81,34 @@ WORKFLOW_PROFILES = {
     },
 }
 
+BLOOD_TUMOR_ADAPTER_INPUTS = (
+    "sample_info",
+    "sample_info_new",
+    "sample_info_list",
+    "sample_info_list_new",
+    "output_dir",
+)
+LEGACY_WORKFLOW_SLUGS = frozenset({"solidtumorsingle", "solidtumorpair"})
+LEGACY_REFERENCE_DIRECTORIES = (
+    ("reference", "参考基因组目录"),
+    ("humandb", "ANNOVAR 数据库目录"),
+    ("localdb", "本地注释数据库目录"),
+    ("resource", "流程资源目录"),
+    ("database", "结果数据库目录"),
+    ("cnvdb", "CNV 数据库目录"),
+)
+LEGACY_PANEL_BINDINGS = (
+    ("bed", "Panel BED", "file"),
+    ("gene_list", "Panel 基因列表", "file"),
+    ("tert_bed", "TERT 区域 BED", "file"),
+    ("p1q19_bed", "1p/19q 区域 BED", "file"),
+    ("druggable_region", "可用药区域", "file"),
+    ("cnvkit_db", "CNVKit 基线", "directory"),
+)
+EXTERNAL_RESOURCE_LITERAL = re.compile(
+    r'''["']((?:oss://|/easygene_data/)[^"']+)["']'''
+)
+
 BLOOD_TUMOR_HG38_REQUIREMENTS = (
     ("hg38/reference/Homo_sapiens_assembly38.fasta", "GRCh38 FASTA", "file"),
     ("hg38/reference/Homo_sapiens_assembly38.fasta.fai", "GRCh38 FASTA 索引", "file"),
@@ -107,7 +143,9 @@ BLOOD_TUMOR_HG38_REQUIREMENTS = (
     ("hg38/blood_tumor/resource/20231220/chemo_efficacy_toxicity_database.sorted.txt", "化疗疗效与毒性数据库", "file"),
     ("hg38/blood_tumor/resource/local_freq_blood/local_freq_blood.zip", "血液肿瘤本地频率库", "file"),
     ("hg38/blood_tumor/resource/local_freq_blood/dna_fusion/84fusion.mutation_frequency.txt", "84 Panel 融合频率库", "file"),
+    ("hg38/blood_tumor/resource/local_freq_blood/dna_fusion/84fusion.mutation_frequency.txt.idx", "84 Panel 融合频率库索引", "file"),
     ("hg38/blood_tumor/resource/local_freq_blood/dna_fusion/624fusion.mutation_frequency.txt", "624 Panel 融合频率库", "file"),
+    ("hg38/blood_tumor/resource/local_freq_blood/dna_fusion/624fusion.mutation_frequency.txt.idx", "624 Panel 融合频率库索引", "file"),
     ("hg38/blood_tumor/cnvkit/84panel", "84 Panel CNVKit 基线", "directory"),
     ("hg38/blood_tumor/cnvkit/396", "396 Panel CNVKit 基线", "directory"),
     ("hg38/blood_tumor/cnvkit_new0919/624panel", "624 Panel CNVKit 基线", "directory"),
@@ -128,10 +166,16 @@ BLOOD_TUMOR_HG38_REQUIREMENTS = (
     ("hg38/annotation/cytoBandIdeo.txt.gz", "GRCh38 cytoband", "file"),
     ("hg38/annotation/gene_id.txt", "CNV gene id", "file"),
     ("hg38/annotation/representative_transcript.txt", "代表转录本", "file"),
+    ("hg38/blood_tumor/annotation-local/local_blood_backbone_cnv_freq.sorted.txt.gz", "血液肿瘤 backbone CNV 本地频率库", "file"),
+    ("hg38/blood_tumor/annotation-local/local_blood_backbone_cnv_freq.sorted.txt.gz.tbi", "血液肿瘤 backbone CNV 本地频率索引", "file"),
+    ("hg38/blood_tumor/annotation-local/local_blood_panel_cnv_freq.sorted.txt.gz", "血液肿瘤 Panel CNV 本地频率库", "file"),
+    ("hg38/blood_tumor/annotation-local/local_blood_panel_cnv_freq.sorted.txt.gz.tbi", "血液肿瘤 Panel CNV 本地频率索引", "file"),
+    ("hg38/blood_tumor/resource/chemo_site.bed", "血液肿瘤化疗位点 BED", "file"),
     ("common_db/local_frequency", "项目本地频率库根目录", "directory"),
     ("hg19/resource/combine.tsv", "结果汇总规则", "file"),
     ("hg19/resource/hotspot_gene-20230227.xls", "热点基因库", "file"),
     ("hg19/resource/tumor-gene-20241016.xlsx", "肿瘤基因库", "file"),
+    ("hg19/resource/tumor-gene-20230216.xlsx", "历史肿瘤基因库", "file"),
     ("hg19/resource/ensembltogenbank.xls", "Ensembl/GenBank 映射", "file"),
     ("hg19/resource/chemo.rs.uniq.120.in", "实体瘤化疗位点规则", "file"),
     ("hg19/resource/chemo.tab1.example", "化疗表一模板", "file"),
@@ -145,6 +189,20 @@ BLOOD_TUMOR_HG38_REQUIREMENTS = (
     ("hg19/humandb/hg19_refGeneWithVer.txt", "hg19 RefGeneWithVer 注释", "file"),
 )
 
+BLOOD_TUMOR_PANEL_REQUIREMENT_PATHS = frozenset(
+    {
+        "hg38/blood_tumor/resource/local_freq_blood/dna_fusion/84fusion.mutation_frequency.txt",
+        "hg38/blood_tumor/resource/local_freq_blood/dna_fusion/84fusion.mutation_frequency.txt.idx",
+        "hg38/blood_tumor/resource/local_freq_blood/dna_fusion/624fusion.mutation_frequency.txt",
+        "hg38/blood_tumor/resource/local_freq_blood/dna_fusion/624fusion.mutation_frequency.txt.idx",
+        "hg38/blood_tumor/cnvkit/84panel",
+        "hg38/blood_tumor/cnvkit/396",
+        "hg38/blood_tumor/cnvkit_new0919/624panel",
+        "hg38/blood_tumor/cnvdb/84panel/baseline_zm_kz",
+        "hg38/blood_tumor/cnvdb/624panel_backbone/v2/baseline_624panel_zm_kz",
+    }
+)
+
 
 def _blood_tumor_hg38_reference() -> dict[str, Any]:
     return {
@@ -154,6 +212,7 @@ def _blood_tumor_hg38_reference() -> dict[str, Any]:
         "required": [
             {"path": path, "label": label, "kind": kind}
             for path, label, kind in BLOOD_TUMOR_HG38_REQUIREMENTS
+            if path not in BLOOD_TUMOR_PANEL_REQUIREMENT_PATHS
         ],
     }
 
@@ -164,7 +223,7 @@ def _merge_reference_requirements(
     merged = dict(reference)
     by_path = {
         str(item.get("path")): item
-        for item in [*reference.get("required", []), *extra.get("required", [])]
+        for item in [*extra.get("required", []), *reference.get("required", [])]
         if item.get("path")
     }
     merged["required"] = list(by_path.values())
@@ -502,65 +561,14 @@ def _validate_dataset(dataset: dict[str, Any]) -> tuple[Path, Path]:
 
 
 def load_database_catalog() -> dict[str, Any]:
-    path = Path(settings.ANALYSIS_DATABASE_CATALOG)
-    if not path.is_file():
-        raise AnalysisInputError(
-            "ANALYSIS_DATABASE_CATALOG_MISSING",
-            "数据库 catalog.json 尚未就绪。",
-            details={"path": "workspace/databases/catalog.json"},
-        )
     try:
-        document = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise AnalysisInputError(
-            "ANALYSIS_DATABASE_CATALOG_INVALID",
-            f"数据库 catalog.json 无法读取：{error}",
-        ) from error
-    if (
-        not isinstance(document, dict)
-        or document.get("schema_version") != 1
-        or not isinstance(document.get("references"), list)
-        or not isinstance(document.get("panels"), list)
-    ):
-        raise AnalysisInputError(
-            "ANALYSIS_DATABASE_CATALOG_INVALID",
-            "数据库 catalog.json 必须符合 schema_version 1。",
-        )
-    return document
+        return load_active_catalog()
+    except ResourceCatalogError as error:
+        raise AnalysisInputError(error.code, str(error), details=error.details) from error
 
 
 def _requirements(entry: dict[str, Any]) -> list[dict[str, Any]]:
-    root = Path(settings.ANALYSIS_DATABASE_ROOT)
-    results = []
-    for item in entry.get("required", []):
-        if not isinstance(item, dict):
-            continue
-        relative_path = str(item.get("path") or "")
-        kind = str(item.get("kind") or "file")
-        alternative_paths = item.get("alternatives", [])
-        if not isinstance(alternative_paths, list):
-            alternative_paths = []
-        candidates = [relative_path, *(str(path) for path in alternative_paths)]
-        present = False
-        for candidate_path in candidates:
-            try:
-                candidate = _safe_path(root, candidate_path)
-                present = (
-                    candidate.is_dir() if kind == "directory" else candidate.is_file()
-                )
-            except AnalysisInputError:
-                present = False
-            if present:
-                break
-        results.append(
-            {
-                "path": relative_path,
-                "label": str(item.get("label") or relative_path),
-                "kind": kind,
-                "present": present,
-            }
-        )
-    return results
+    return entry_requirements(entry)
 
 
 def _dataset_manifest(dataset: dict[str, Any]) -> dict[str, Any]:
@@ -582,7 +590,7 @@ def _dataset_manifest(dataset: dict[str, Any]) -> dict[str, Any]:
 def _catalog_resource_manifest(entry: dict[str, Any]) -> dict[str, Any]:
     root = Path(settings.ANALYSIS_DATABASE_ROOT)
     resources = []
-    for item in entry.get("required", []):
+    for item in catalog_resource_specs(entry):
         if not isinstance(item, dict):
             continue
         candidates = [
@@ -629,8 +637,44 @@ def _catalog_resource_manifest(entry: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _catalog_entry_payload(entry: dict[str, Any]) -> dict[str, Any]:
-    requirements = _requirements(entry)
+def _configuration_requirement(binding: str, label: str) -> dict[str, Any]:
+    return {
+        "path": "",
+        "binding": binding,
+        "label": label,
+        "kind": "configuration",
+        "present": False,
+        "reason": "unconfigured",
+    }
+
+
+def _merge_requirement_statuses(
+    *groups: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged: dict[tuple[str, str], dict[str, Any]] = {}
+    for group in groups:
+        for item in group:
+            identifier = str(item.get("path") or item.get("binding") or "")
+            key = (identifier, str(item.get("kind") or "file"))
+            current = merged.get(key)
+            if current is None or (current.get("present") and not item.get("present")):
+                merged[key] = item
+    return list(merged.values())
+
+
+def _catalog_entry_payload(
+    entry: dict[str, Any],
+    *,
+    additional_requirements: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    requirements = _merge_requirement_statuses(
+        entry_requirements(entry), additional_requirements or []
+    )
+    resource_status = {
+        "ready": all(item["present"] for item in requirements),
+        "requirements": requirements,
+        "missing": [item for item in requirements if not item["present"]],
+    }
     return {
         key: value
         for key, value in entry.items()
@@ -646,18 +690,127 @@ def _catalog_entry_payload(entry: dict[str, Any]) -> dict[str, Any]:
             "cnvkit_db",
         }
     } | {
-        "ready": all(item["present"] for item in requirements),
-        "requirements": requirements,
-        "missing": [item for item in requirements if not item["present"]],
+        **resource_status,
+    }
+
+
+def _legacy_reference_requirements(reference: dict[str, Any]) -> list[dict[str, Any]]:
+    directories = reference.get("directories")
+    if not isinstance(directories, dict):
+        directories = {}
+    checks: list[dict[str, Any]] = []
+    declared = []
+    for key, label in LEGACY_REFERENCE_DIRECTORIES:
+        path = str(directories.get(key) or "")
+        if not path:
+            checks.append(_configuration_requirement(f"directories.{key}", label))
+            continue
+        declared.append({"path": path, "label": label, "kind": "directory"})
+    ref_version = str(reference.get("ref_version") or "").strip()
+    reference_directory = str(directories.get("reference") or "").rstrip("/")
+    if not ref_version:
+        checks.append(_configuration_requirement("ref_version", "WDL ref_version"))
+    elif reference_directory:
+        declared.extend(
+            [
+                {
+                    "path": f"{reference_directory}/{ref_version}.simp.fa",
+                    "label": "流程参考 FASTA",
+                    "kind": "file",
+                },
+                {
+                    "path": f"{reference_directory}/{ref_version}.simp.fa.fai",
+                    "label": "流程参考 FASTA 索引",
+                    "kind": "file",
+                },
+            ]
+        )
+    if declared:
+        checks.extend(entry_requirements({"required": declared}))
+    return checks
+
+
+def _legacy_panel_requirements(panel: dict[str, Any]) -> list[dict[str, Any]]:
+    return entry_requirements(
+        {
+            "required": [],
+            "bindings": panel.get("bindings") or {},
+            "required_bindings": [
+                {"key": key, "label": label, "kind": kind}
+                for key, label, kind in LEGACY_PANEL_BINDINGS
+            ],
+            **{
+                key: panel.get(key)
+                for key, _label, _kind in LEGACY_PANEL_BINDINGS
+                if key in panel
+            },
+        }
+    )
+
+
+def _managed_resource_statuses(
+    workflow_slug: str,
+    references: list[dict[str, Any]],
+    panels: list[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if workflow_slug not in LEGACY_WORKFLOW_SLUGS:
+        return {}, {}
+    reference_status = {
+        str(reference.get("id") or ""): _catalog_entry_payload(
+            reference,
+            additional_requirements=_legacy_reference_requirements(reference),
+        )
+        for reference in references
+    }
+    panel_status = {
+        str(panel.get("id") or ""): _catalog_entry_payload(
+            panel,
+            additional_requirements=_legacy_panel_requirements(panel),
+        )
+        for panel in panels
+    }
+    return reference_status, panel_status
+
+
+def _input_adapter_status(
+    revision: WDLSourceRevision | None,
+    profile: dict[str, Any],
+) -> dict[str, Any]:
+    if profile.get("input_adapter") != "pending":
+        return {
+            "status": "ready",
+            "unresolved_inputs": [],
+            "external_resource_count": 0,
+            "external_resource_examples": [],
+        }
+    contents = []
+    if revision is not None:
+        contents = list(revision.files.values_list("content", flat=True))
+        if not contents:
+            contents = [revision.content]
+    external_resources = sorted(
+        {
+            match
+            for content in contents
+            for match in EXTERNAL_RESOURCE_LITERAL.findall(content)
+        }
+    )
+    return {
+        "status": "pending",
+        "unresolved_inputs": list(BLOOD_TUMOR_ADAPTER_INPUTS),
+        "external_resource_count": len(external_resources),
+        "external_resource_examples": external_resources[:20],
     }
 
 
 def _workflow_payload(
     slug: str,
-    profile: dict[str, str],
+    profile: dict[str, Any],
     *,
     revision_version: int | None = None,
     available_references: set[str] | None = None,
+    reference_entries: list[dict[str, Any]] | None = None,
+    panel_entries: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     asset = WDLAsset.objects.filter(slug=slug).first()
     latest_revision = asset.source_revisions.first() if asset else None
@@ -692,8 +845,24 @@ def _workflow_payload(
         and required_reference not in available_references
     ):
         blockers.append(f"数据库 catalog 尚未配置 {required_reference} 参考资源。")
-    if profile.get("input_adapter") == "pending":
+    adapter_status = _input_adapter_status(revision, profile)
+    if adapter_status["status"] == "pending":
         blockers.append("正式流程的运行输入映射尚未配置。")
+        blockers.append(
+            "业务样本信息尚未定义生成规则："
+            + "、".join(adapter_status["unresolved_inputs"])
+            + "。"
+        )
+        if adapter_status["external_resource_count"]:
+            blockers.append(
+                f"WDL 仍有 {adapter_status['external_resource_count']} 个 OSS/历史绝对资源引用，"
+                "需迁移到资源中心或建立执行映射。"
+            )
+    reference_status, panel_status = _managed_resource_statuses(
+        slug,
+        reference_entries or [],
+        panel_entries or [],
+    )
     return {
         "slug": workflow_slug,
         "source_slug": slug,
@@ -708,6 +877,9 @@ def _workflow_payload(
         "ready": bool(asset and revision and not blockers),
         "diagnostic_count": len(errors),
         "blockers": blockers,
+        "input_adapter_status": adapter_status,
+        "reference_status": reference_status,
+        "panel_status": panel_status,
     }
 
 
@@ -716,12 +888,16 @@ def _managed_wdl_workflows(
     requested_slug: str = "",
     requested_revision: int | None = None,
     available_references: set[str] | None = None,
+    reference_entries: list[dict[str, Any]] | None = None,
+    panel_entries: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     results = [
         _workflow_payload(
             slug,
             profile,
             available_references=available_references,
+            reference_entries=reference_entries,
+            panel_entries=panel_entries,
         )
         for slug, profile in WORKFLOW_PROFILES.items()
     ]
@@ -732,6 +908,8 @@ def _managed_wdl_workflows(
             profile,
             revision_version=requested_revision,
             available_references=available_references,
+            reference_entries=reference_entries,
+            panel_entries=panel_entries,
         )
         if all(item["slug"] != requested["slug"] for item in results):
             results.append(requested)
@@ -1240,7 +1418,7 @@ def _build_inputs(
     resolved_panel = {
         name: _resource(
             database_root,
-            str(panel.get(name) or ""),
+            str(entry_binding(panel, name) or ""),
             directory=name == "cnvkit_db",
             execution_root=database_execution_root,
         )
@@ -1435,24 +1613,15 @@ def analysis_catalog(request):
     try:
         catalog = load_database_catalog()
         reference_entries = list(catalog["references"])
+        panel_entries = list(catalog["panels"])
         declared_reference_ids = {str(item.get("id")) for item in reference_entries}
-        blood_reference = _blood_tumor_hg38_reference()
-        hg38_index = next(
-            (index for index, item in enumerate(reference_entries) if item.get("id") == "hg38"),
-            None,
-        )
-        if hg38_index is None:
-            reference_entries.append(blood_reference)
-        else:
-            reference_entries[hg38_index] = _merge_reference_requirements(
-                reference_entries[hg38_index], blood_reference
-            )
         references = [_catalog_entry_payload(item) for item in reference_entries]
-        panels = [_catalog_entry_payload(item) for item in catalog["panels"]]
+        panels = [_catalog_entry_payload(item) for item in panel_entries]
         catalog_error = None
     except AnalysisInputError as error:
         references = []
         reference_entries = []
+        panel_entries = []
         declared_reference_ids = set()
         panels = []
         catalog_error = {
@@ -1472,6 +1641,8 @@ def analysis_catalog(request):
         requested_slug=requested_slug,
         requested_revision=requested_revision,
         available_references=declared_reference_ids,
+        reference_entries=reference_entries,
+        panel_entries=panel_entries,
     ) + _published_workflows(
         reference_entries,
         requested_slug=requested_slug,
@@ -1601,6 +1772,11 @@ def analysis_runs(request):
                 "ANALYSIS_WORKFLOW_UNSUPPORTED",
                 "当前运行页只允许已配置的受管 WDL。",
             )
+        if profile.get("input_adapter") == "pending":
+            raise AnalysisInputError(
+                "ANALYSIS_WORKFLOW_INPUT_ADAPTER_PENDING",
+                "正式流程的运行输入映射尚未完成，当前禁止投递。",
+            )
         asset = WDLAsset.objects.filter(slug=asset_slug).first()
         revision = (
             asset.source_revisions.filter(version=requested_asset_revision).first()
@@ -1655,9 +1831,28 @@ def analysis_runs(request):
             str(request.data.get("panel") or ""),
             "Panel",
         )
+        if str(panel.get("reference") or "") not in {"", str(reference["id"])}:
+            raise AnalysisInputError(
+                "ANALYSIS_PANEL_REFERENCE_MISMATCH",
+                "所选 Panel 与参考版本不匹配。",
+            )
+        workflow_ids = panel.get("workflow_ids") or []
+        if workflow_ids and asset_slug not in workflow_ids:
+            raise AnalysisInputError(
+                "ANALYSIS_PANEL_WORKFLOW_MISMATCH",
+                "所选 Panel 不适用于当前流程。",
+            )
+        adapter_missing = [
+            *_legacy_reference_requirements(reference),
+            *_legacy_panel_requirements(panel),
+        ]
         missing = [
             item
-            for item in [*_requirements(reference), *_requirements(panel)]
+            for item in [
+                *_requirements(reference),
+                *_requirements(panel),
+                *adapter_missing,
+            ]
             if not item["present"]
         ]
         if missing:

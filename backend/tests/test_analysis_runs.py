@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 from django.contrib.auth import get_user_model
+from django.core.management import call_command
 from django.utils import timezone
 
 from compiler_core import canonical_digest, compile_workflow
@@ -757,7 +758,49 @@ def test_catalog_discovers_fastq_pair_and_reports_managed_workflow(
         if item["slug"] == "solidtumorsingle"
     )
     assert workflow["ready"] is True
+    assert workflow["reference_status"]["hg19"]["ready"] is True
+    assert workflow["panel_status"]["panel"]["ready"] is True
     assert response.data["database"]["references"][0]["ready"] is True
+
+
+def test_catalog_scopes_resource_readiness_to_legacy_input_adapter(
+    client, analysis_workspace
+):
+    _asset("solidtumorsingle", "SolidTumorSingle")
+    _, databases, _, catalog = analysis_workspace
+    catalog["panels"].append(
+        {
+            "id": "generic-panel",
+            "name": "只有通用文件的 Panel",
+            "required": [],
+        }
+    )
+    (databases / "catalog.json").write_text(json.dumps(catalog), encoding="utf-8")
+
+    response = client.get("/api/v1/analysis/catalog")
+
+    assert response.status_code == 200
+    generic = next(
+        item
+        for item in response.data["database"]["panels"]
+        if item["id"] == "generic-panel"
+    )
+    assert generic["ready"] is True
+    workflow = next(
+        item
+        for item in response.data["workflows"]
+        if item["slug"] == "solidtumorsingle"
+    )
+    scoped = workflow["panel_status"]["generic-panel"]
+    assert scoped["ready"] is False
+    assert {item["binding"] for item in scoped["missing"]} == {
+        "bed",
+        "gene_list",
+        "tert_bed",
+        "p1q19_bed",
+        "druggable_region",
+        "cnvkit_db",
+    }
 
 
 def test_catalog_lists_production_blood_workflows_with_explicit_blockers(
@@ -784,23 +827,43 @@ def test_catalog_lists_production_blood_workflows_with_explicit_blockers(
         assert "数据库 catalog 尚未配置 hg38 参考资源。" in workflow["blockers"]
         assert "正式流程的运行输入映射尚未配置。" in workflow["blockers"]
         assert workflow["required_reference"] == "hg38"
-    hg38 = next(
-        item for item in response.data["database"]["references"] if item["id"] == "hg38"
+        assert workflow["input_adapter_status"] == {
+            "status": "pending",
+            "unresolved_inputs": [
+                "sample_info",
+                "sample_info_new",
+                "sample_info_list",
+                "sample_info_list_new",
+                "output_dir",
+            ],
+            "external_resource_count": 0,
+            "external_resource_examples": [],
+        }
+    assert not any(
+        item["id"] == "hg38" for item in response.data["database"]["references"]
     )
-    assert hg38["ready"] is False
-    assert len(hg38["missing"]) == len(hg38["requirements"])
-    assert len(hg38["missing"]) > 40
-    assert {
-        "hg38/reference/Homo_sapiens_assembly38.fasta",
-        "hg38/blood_tumor/humandb",
-        "hg38/annotation/clingen_cnv.tsv.gz",
-        "hg38/blood_tumor/resource/20231220/rs.uniq-20231218.in",
-        "hg19/resource/tumor-gene-20241016.xlsx",
-        "hg19/resource/ensembltogenbank.xls",
-    }.issubset({item["path"] for item in hg38["missing"]})
 
 
-def test_catalog_merges_blood_requirements_into_existing_hg38(
+def test_catalog_reports_external_resources_in_pending_blood_adapter(
+    client, analysis_workspace
+):
+    asset, revision = _asset("tumor-blood-single-production", "TumorBloodSingle")
+    content = revision.content + '\nString legacy = "/easygene_data/db/a.txt"\nString remote = "oss://bucket/b.txt"\n'
+    WDLSourceRevision.objects.filter(pk=revision.pk).update(content=content)
+    source_file = revision.files.get(is_entry=True)
+    WDLSourceFile.objects.filter(pk=source_file.pk).update(content=content)
+
+    workflow = next(
+        item
+        for item in client.get("/api/v1/analysis/catalog").data["workflows"]
+        if item["slug"] == asset.slug
+    )
+
+    assert workflow["input_adapter_status"]["external_resource_count"] == 2
+    assert any("2 个 OSS/历史绝对资源引用" in item for item in workflow["blockers"])
+
+
+def test_resource_migration_merges_blood_requirements_into_existing_hg38(
     client, analysis_workspace
 ):
     _, databases, _, catalog = analysis_workspace
@@ -815,6 +878,7 @@ def test_catalog_merges_blood_requirements_into_existing_hg38(
         }
     )
     (databases / "catalog.json").write_text(json.dumps(catalog), encoding="utf-8")
+    call_command("migrate_resource_catalog", actor="pytest")
 
     response = client.get("/api/v1/analysis/catalog")
 
@@ -823,6 +887,12 @@ def test_catalog_merges_blood_requirements_into_existing_hg38(
     assert "hg38/reference" in paths
     assert "hg38/blood_tumor/resource/20231220/rs.uniq-20231218.in" in paths
     assert "hg19/resource/tumor-gene-20241016.xlsx" in paths
+    panels = {item["id"]: item for item in response.data["database"]["panels"]}
+    assert set(panels) >= {"blood-84", "blood-396", "blood-624"}
+    assert any(
+        item.get("binding") == "bed" and item["reason"] == "unconfigured"
+        for item in panels["blood-84"]["missing"]
+    )
 
 
 def test_catalog_and_submit_support_latest_published_workflow(

@@ -37,14 +37,18 @@ const sampleId = ref('')
 const sampleName = ref('')
 const sampleType = ref('tissue')
 const sampleGender = ref('女')
+const auth = useAuth()
 
 const datasets = computed<AnalysisDataset[]>(() => props.catalog?.datasets ?? [])
 const workflows = computed<AnalysisWorkflow[]>(() => props.catalog?.workflows ?? [])
 const references = computed<AnalysisDatabaseOption[]>(() => props.catalog?.database.references ?? [])
-const panels = computed<AnalysisDatabaseOption[]>(() => (
-  props.catalog?.database.panels.filter(item => !item.reference || item.reference === referenceId.value) ?? []
-))
 const selectedWorkflow = computed(() => workflows.value.find(item => item.slug === workflowSlug.value))
+const panels = computed<AnalysisDatabaseOption[]>(() => (
+  props.catalog?.database.panels.filter(item => (
+    (!item.reference || item.reference === referenceId.value)
+    && (!item.workflow_ids?.length || item.workflow_ids.includes(selectedWorkflow.value?.source_slug ?? selectedWorkflow.value?.slug ?? ''))
+  )) ?? []
+))
 const selectedGraphSummary = computed(() => selectedWorkflow.value?.graph_summary)
 const selectedWorkflowLink = computed(() => {
   const workflow = selectedWorkflow.value
@@ -61,20 +65,27 @@ const selectedReference = computed(() => references.value.find(item => item.id =
 const referenceStatus = (reference: AnalysisDatabaseOption) => (
   selectedWorkflow.value?.reference_status?.[reference.id] ?? reference
 )
+const panelStatus = (panel: AnalysisDatabaseOption) => (
+  selectedWorkflow.value?.panel_status?.[panel.id] ?? panel
+)
 const selectedReferenceStatus = computed(() => (
   selectedReference.value ? referenceStatus(selectedReference.value) : undefined
 ))
 const selectedPanel = computed(() => panels.value.find(item => item.id === panelId.value))
+const selectedPanelStatus = computed(() => (
+  selectedPanel.value ? panelStatus(selectedPanel.value) : undefined
+))
 const missingResources = computed(() => [
   ...(selectedReferenceStatus.value?.missing ?? []),
-  ...(selectedPanel.value?.missing ?? []),
+  ...(selectedPanelStatus.value?.missing ?? []),
 ])
 const requiresControl = computed(() => selectedWorkflow.value?.mode === 'paired')
+const canManageResources = computed(() => auth.user.value?.allowed_sections.includes('resources'))
 const canSubmit = computed(() => Boolean(
   selectedWorkflow.value?.ready
   && selectedDataset.value
   && (!requiresReference.value || selectedReferenceStatus.value?.ready)
-  && (!requiresPanel.value || selectedPanel.value?.ready)
+  && (!requiresPanel.value || selectedPanelStatus.value?.ready)
   && sampleId.value.trim()
   && sampleName.value.trim()
   && (!requiresControl.value || (controlDatasetId.value && controlDatasetId.value !== datasetId.value)),
@@ -95,10 +106,7 @@ watch(
     }
     datasetId.value ||= catalog.datasets[0]?.id ?? ''
     referenceId.value ||= catalog.database.references[0]?.id ?? ''
-    const availablePanels = catalog.database.panels.filter(
-      item => !item.reference || item.reference === referenceId.value,
-    )
-    panelId.value ||= availablePanels[0]?.id ?? ''
+    panelId.value ||= panels.value[0]?.id ?? ''
     if (!sampleId.value && catalog.datasets[0]) {
       sampleId.value = catalog.datasets[0].name
       sampleName.value = catalog.datasets[0].name
@@ -130,7 +138,19 @@ watch(selectedWorkflow, (workflow) => {
   if (workflow?.required_reference && references.value.some(item => item.id === workflow.required_reference)) {
     referenceId.value = workflow.required_reference
   }
+  if (!panels.value.some(item => item.id === panelId.value)) {
+    panelId.value = panels.value[0]?.id ?? ''
+  }
 })
+
+function missingResourceHint(item: AnalysisDatabaseOption['missing'][number]) {
+  if (item.reason === 'checksum_mismatch') return 'SHA-256 与目录声明不一致'
+  if (item.reason === 'constraint_mismatch') {
+    return `文件名需包含 ${item.expected?.join(' / ') || '指定标识'}`
+  }
+  if (item.reason === 'unconfigured') return `未配置 ${item.binding}`
+  return item.path
+}
 
 function submit() {
   if (!canSubmit.value) return
@@ -223,9 +243,12 @@ function submit() {
             <i :class="workflow.ready ? 'is-ready' : 'is-blocked'">{{ workflow.ready ? '就绪' : '阻塞' }}</i>
           </label>
         </div>
-        <p v-if="selectedWorkflow?.blockers.length" class="analysis-inline-note analysis-inline-note--warning">
-          {{ selectedWorkflow.blockers[0] }}
-        </p>
+        <details v-if="selectedWorkflow?.blockers.length" open class="analysis-workflow-blockers">
+          <summary>{{ selectedWorkflow.blockers[0] }}</summary>
+          <ul v-if="selectedWorkflow.blockers.length > 1">
+            <li v-for="blocker in selectedWorkflow.blockers.slice(1)" :key="blocker">{{ blocker }}</li>
+          </ul>
+        </details>
         <p v-else-if="initialWorkflow && !selectedWorkflow" class="analysis-inline-note analysis-inline-note--warning">
           请求的流程版本当前不在可运行目录中，请重新选择。
         </p>
@@ -281,7 +304,7 @@ function submit() {
             <span>Panel</span>
             <select v-model="panelId" aria-label="Panel">
               <option v-for="panel in panels" :key="panel.id" :value="panel.id">
-                {{ panel.name }}{{ panel.ready ? '' : ` · 缺 ${panel.missing.length} 项` }}
+                {{ panel.name }}{{ panelStatus(panel).ready ? '' : ` · 缺 ${panelStatus(panel).missing.length} 项` }}
               </option>
             </select>
           </label>
@@ -289,12 +312,16 @@ function submit() {
         <details v-if="missingResources.length" open class="analysis-missing-resources">
           <summary>数据库还缺 {{ missingResources.length }} 项</summary>
           <ul>
-            <li v-for="item in missingResources" :key="item.path">
-              <span>{{ item.label }}</span><code>{{ item.path }}</code>
+            <li v-for="item in missingResources" :key="`${item.binding}-${item.path}-${item.label}`">
+              <span>{{ item.label }}</span><code>{{ missingResourceHint(item) }}</code>
             </li>
           </ul>
         </details>
-        <p v-else-if="selectedReferenceStatus?.ready && (!requiresPanel || selectedPanel?.ready)" class="analysis-inline-note analysis-inline-note--ready">
+        <p v-else-if="requiresPanel && !panels.length" class="analysis-inline-note analysis-inline-note--warning">
+          当前流程和参考版本还没有可用的 Panel。请在资源中心配置 BED、gene BED 与 CNV 基线。
+          <NuxtLink v-if="canManageResources" to="/resources">打开资源中心</NuxtLink>
+        </p>
+        <p v-else-if="selectedReferenceStatus?.ready && (!requiresPanel || selectedPanelStatus?.ready)" class="analysis-inline-note analysis-inline-note--ready">
           数据库检查通过。
         </p>
       </section>
