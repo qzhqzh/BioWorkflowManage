@@ -133,6 +133,7 @@ def test_workflow_maintainer_can_collaborate_on_assets_and_run_analysis(
             "artifacts",
             "packages",
             "tools",
+            "resources",
             "runs",
             "wdl",
             "help",

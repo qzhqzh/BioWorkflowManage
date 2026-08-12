@@ -200,6 +200,46 @@ class SoftwareAuditEvent(ImmutableSnapshot):
         ordering = ["-created_at", "-id"]
 
 
+class AnalysisResourceCatalog(models.Model):
+    """Mutable pointer to the current portable analysis resource catalog."""
+
+    key = models.SlugField(max_length=64, unique=True, default="default")
+    document = models.JSONField(default=dict)
+    version = models.PositiveIntegerField(default=1)
+    digest = models.CharField(max_length=80)
+    created_by = models.CharField(max_length=256, default="local-user")
+    updated_by = models.CharField(max_length=256, default="local-user")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["key"]
+
+
+class AnalysisResourceCatalogRevision(ImmutableSnapshot):
+    catalog = models.ForeignKey(
+        AnalysisResourceCatalog,
+        on_delete=models.PROTECT,
+        related_name="revisions",
+    )
+    version = models.PositiveIntegerField()
+    digest = models.CharField(max_length=80)
+    document = models.JSONField(default=dict)
+    actor = models.CharField(max_length=256, default="local-user")
+    note = models.TextField(blank=True)
+    changes = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-version"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["catalog", "version"],
+                name="unique_analysis_resource_catalog_revision",
+            )
+        ]
+
+
 class ServiceAccount(models.Model):
     """Machine identity used by external analysis clients and MCP agents."""
 

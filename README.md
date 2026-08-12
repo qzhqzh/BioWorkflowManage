@@ -92,6 +92,8 @@ BioWorkflowManage 是面向生物信息学流程工程化的可视化 Workflow �
 [`docs/12-miniwdl-execution.md`](docs/12-miniwdl-execution.md)。
 第三方报告系统和 AI Agent 接入见
 [`docs/14-integration-api-and-mcp.md`](docs/14-integration-api-and-mcp.md)。
+Reference、Panel、BED 与 CNV 基线的统一配置见
+[`docs/15-analysis-resource-catalog.md`](docs/15-analysis-resource-catalog.md)。
 
 ## Phase 1: Workflow Compiler Foundation
 

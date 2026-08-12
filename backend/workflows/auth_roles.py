@@ -10,6 +10,7 @@ ALL_SECTIONS = (
     "artifacts",
     "packages",
     "tools",
+    "resources",
     "runs",
     "wdl",
     "help",

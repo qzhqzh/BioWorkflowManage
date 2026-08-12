@@ -6,6 +6,7 @@ from . import (
     api_overrides,
     auth_views,
     integration_api,
+    resource_catalog_api,
     software_library,
     tool_runs,
     views,
@@ -101,6 +102,7 @@ urlpatterns = [
     path("integration/tools", integration_api.integration_tools),
     path("integration/software", integration_api.integration_software),
     path("analysis/catalog", analysis_runs.analysis_catalog),
+    path("resource-catalog", resource_catalog_api.resource_catalog),
     path("analysis-runs", analysis_runs.analysis_runs),
     path("analysis-runs/<uuid:run_id>", analysis_runs.analysis_run_detail),
     path(
