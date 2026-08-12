@@ -107,6 +107,39 @@ DJANGO_SEED_ALLOW_DEFAULT_PASSWORDS=1 docker compose run --rm \
 `ANALYSIS_DATABASE_HOST_PATH` 设置为 NAS 上的数据库目录即可，例如
 `/mnt/nas/databases`；未设置时仍使用 `./workspace/databases`。
 
+### 初始化正式血液肿瘤 WDL
+
+仓库 `test/血液肿瘤最新流程` 内包含两个正式流程及各自的本地依赖：
+
+- `single/TumorBloodSingle.wdl`：血液肿瘤单样本流程；
+- `pair/TumorBloodPair.wdl`：血液肿瘤配对样本流程。
+
+新环境拉取仓库并完成数据库迁移后，可重复执行以下命令。内容未变化时不会新增版本；内容变化时会形成新的 WDL 修订和审计记录：
+
+```bash
+docker compose run --rm \
+  -v "$PWD/backend:/app/backend:ro" \
+  -v "$PWD/test/血液肿瘤最新流程:/mnt/blood-tumor-wdl:ro" \
+  backend python backend/manage.py import_blood_tumor_wdl \
+  --source-dir /mnt/blood-tumor-wdl \
+  --repository github.com/qzhqzh/BioWorkflowManage \
+  --actor zhuqin
+```
+
+未指定 `--revision` 时，命令自动以每个 WDL 依赖包的 SHA-256 作为来源版本。
+
+也可将正式流程和其他测试数据一次初始化：
+
+```bash
+DJANGO_SEED_ALLOW_DEFAULT_PASSWORDS=1 docker compose run --rm \
+  -v "$PWD/backend:/app/backend:ro" \
+  -v "$PWD/test/血液肿瘤最新流程:/mnt/blood-tumor-wdl:ro" \
+  backend python backend/manage.py seed_test_data \
+  --blood-wdl-source-dir /mnt/blood-tumor-wdl \
+  --repository github.com/qzhqzh/BioWorkflowManage \
+  --actor zhuqin
+```
+
 运行 `prepare` 后补入以下文件：
 
 ```text
