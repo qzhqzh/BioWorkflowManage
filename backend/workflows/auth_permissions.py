@@ -4,7 +4,7 @@ from django.conf import settings
 from rest_framework.authentication import SessionAuthentication
 from rest_framework.permissions import BasePermission
 
-from .auth_roles import is_admin, is_analysis_operator
+from .auth_roles import is_admin, is_analysis_operator, is_workflow_maintainer
 
 
 class SessionAuthenticationWithHeader(SessionAuthentication):
@@ -26,7 +26,7 @@ class AuthenticationRequiredPermission(BasePermission):
         if user is None or not user.is_authenticated:
             self.message = "Authentication credentials are required."
             return False
-        if is_admin(user):
+        if is_admin(user) or is_workflow_maintainer(user):
             return True
         allowed = bool(
             getattr(view, "analysis_operator_allowed", False)

@@ -28,6 +28,7 @@ def test_seed_test_data_is_idempotent(monkeypatch, capsys):
     call_command("seed_test_data")
 
     assert WorkflowDocument.objects.count() == 3
+    assert set(WorkflowDocument.objects.values_list("created_by", flat=True)) == {"zhuqin"}
     assert ToolDocument.objects.count() == 2
     assert WDLRevision.objects.count() == 3
     assert CompilationRecord.objects.count() == 3

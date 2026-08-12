@@ -101,6 +101,83 @@ POST /validations/workflow-graph or /compilations
 
 后端返回的 Graph 也必须通过 `workflowGraphToEditor()`，不允许组件直接假设 API 对象含有 Vue Flow 字段。
 
+### 4.4 画布并发保存契约
+
+迁移 `0015_workflow_document_concurrency` 启用后，新版客户端更新已有画布时必须把 GET
+响应中的 `document_version`、`document_digest` 分别作为 `base_document_version`、
+`base_document_digest` 随 PUT 提交，并发送 `X-Workflow-Concurrency: required`。严格模式
+缺少基线返回 428，基线已过期返回 409，并附带远端最新画布；客户端必须保留本地草稿
+并停止自动保存，不得自动覆盖或自动合并图结构。
+
+画布 API 当前保留一个受控兼容期：没有严格模式请求头且完全不带基线字段的旧调用仍可
+写入，但响应包含 `Deprecation: true` 与 HTTP `Warning`，且不具备并发保护。调用方应先
+升级为“先 GET、再携带基线 PUT”；完成调用方盘点并取得破坏性升级批准后，再关闭兼容
+窗口。WDL 资产 PATCH/revision POST 不在此兼容期内，仍按其既有契约强制返回 428。
+
+仓库内画布会先下载本地草稿，再允许用户载入远端版本。外部脚本升级时也必须遵循
+“先 GET、再携带基线 PUT”的顺序；收到 409 后应由用户确认如何处理两份图，而不是读取
+最新基线后直接重试旧内容。创建一个尚不存在的画布仍可使用不带基线的 PUT。
+
+发布 `WorkflowVersion` 同样必须把刚保存成功后返回的 `document_version`、
+`document_digest` 作为 `base_document_version`、`base_document_digest` 随 POST 提交。
+缺少基线返回 428，保存与发布之间画布又被修改则返回 409；编译指定的
+`workflow_version` 也必须与请求中的 Graph 语义摘要和 ToolSpec 完全一致，避免把任意输入
+错误关联到不可变版本；Graph 的 `layout`、`metadata` 不参与该检查，因此只调整画布位置后
+复用已有语义版本仍可正常编译，实际编译内容始终取不可变快照。
+
+### 4.5 WorkflowVersion 与 WDL 派生物
+
+运行分析始终绑定已经发布的 `WorkflowVersion` 及其 `compiled_bundle`，不会直接执行
+`WDLRevision`。编译产生的系统 WDL 是该版本的只读快照；从快照手工修改得到的内容是
+不可运行的派生稿，只用于比较和试验，也不会反向修改画布、工具或已发布版本。
+运行页默认目录只列每个流程的最新发布版；从发布快照进入时会把精确 slug/version 传给
+目录接口，使历史版本只在该次深链中出现并可运行，不会因新版本发布而失效。
+
+用户手工修改编译 WDL 时必须明确选择保存位置：留在流程库中作为派生稿，或转为独立的
+历史 WDL 资产并进入 WDL 工作台维护。后者记录来源流程和来源版本，但与原
+`WorkflowVersion` 分开演进。WDL 不会在保存时直接反向覆盖画布；用户可对派生稿生成
+变更提案，分项确认后写入新的画布草稿。
+
+派生稿同时记录创建人、父 WDL 修订和备注，并继承父修订绑定的 `WorkflowVersion`；不能
+用当前侧栏选择的其他编译版本覆盖该来源。读取修订正文期间禁止编辑或转资产，过期响应
+必须丢弃。历史资产的来源链接优先精确回到 `wdlVersion`，而不是只打开对应编译快照。
+
+### 4.6 WDL 反向同步采用变更提案
+
+WDL 回到画布时，不允许在保存文本的同时静默覆盖 Graph。系统先解析 WDL，
+生成一份可审查的变更提案，再由用户确认写入新的画布草稿：
+
+```text
+WDL revision
+  -> parse + resolve imports
+  -> compare with base WorkflowVersion / ToolVersion
+  -> classify graph, tool and instance changes
+  -> review proposal
+  -> apply with WorkflowDocument concurrency precondition
+```
+
+变更边界固定如下：
+
+- workflow input/output、call、依赖和连线变化属于 Graph 变更；
+- task 的 command、container、输入输出契约、task 类型或注释配置 Schema 变化，必须创建
+  新的 Tool 草稿；确认提案后可编辑画布会指向该待发布版本，但在对应 `ToolVersion`
+  以相同 digest 发布前，服务端拒绝发布 `WorkflowVersion`，避免把草稿工具固化进流程；
+- 节点参数值、注释项选择和画布布局属于实例配置，可以留在 WorkflowDocument，不产生
+  新 `ToolVersion`；
+- ToolSpec 中定义的参数名、类型、默认值和可选范围属于版本内容；节点只能填写已发布
+  版本允许的值，不能在实例层增加未知参数；
+- 一份 WDL 同时修改 Graph 和 task 时，提案必须分别展示两类变化，并允许用户放弃其中
+  任一类，不得把新 task 内容伪装成旧 ToolVersion。
+
+提案应用后只更新可编辑的 WorkflowDocument；重新验证、发布后才会产生新的不可变
+`WorkflowVersion`。解析失败、来源版本已变化或工具映射不唯一时保持原画布不变，并要求
+用户先解决歧义。
+
+工具草稿更新和发布采用同一组并发前置条件：调用方先从 GET 或保存响应取得
+`draft_version`、`draft_digest`，再分别作为 `base_draft_version`、
+`base_draft_digest` 提交。更新或发布缺少基线返回 428，基线过期返回 409；发布检查在
+数据库锁内完成，避免“保存后被他人修改、随后误发布他人内容”。
+
 ## 5. 推荐目录
 
 ```text

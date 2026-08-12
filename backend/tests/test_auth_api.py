@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from importlib import import_module
+
 import pytest
+from django.apps import apps
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.core.management import call_command
@@ -23,9 +26,9 @@ def seeded_users(db, monkeypatch):
     monkeypatch.setenv("DJANGO_SEED_ALLOW_DEFAULT_PASSWORDS", "1")
     call_command("seed_users", verbosity=0)
     user_model = get_user_model()
-    return user_model.objects.filter(
-        username__in=DEFAULT_USERNAMES
-    ).order_by("username")
+    return user_model.objects.filter(username__in=DEFAULT_USERNAMES).order_by(
+        "username"
+    )
 
 
 @pytest.mark.django_db
@@ -68,6 +71,7 @@ def test_protected_api_requires_login_and_login_me_logout_round_trip(
     assert logged_in.status_code == 200
     assert logged_in.data["user"]["username"] == "zhuqin"
     assert logged_in.data["user"]["role"] == "admin"
+    assert "overview" in logged_in.data["user"]["allowed_sections"]
     assert "wdl" in logged_in.data["user"]["allowed_sections"]
 
     current = client.get("/api/v1/auth/me")
@@ -102,6 +106,57 @@ def test_analysis_operator_can_only_access_analysis_api(settings, seeded_users):
     assert client.get("/api/v1/analysis/catalog").status_code == 200
     assert client.get("/api/v1/analysis-runs").status_code == 200
     assert client.get("/api/v1/wdl-assets").status_code == 403
+
+
+@pytest.mark.django_db
+def test_workflow_maintainer_can_collaborate_on_assets_and_run_analysis(
+    settings, seeded_users
+):
+    settings.AUTH_REQUIRED = True
+    client = APIClient()
+
+    logged_in = client.post(
+        "/api/v1/auth/login",
+        {"username": "zhangrusong", "password": "zhangrusong"},
+        format="json",
+    )
+
+    assert logged_in.status_code == 200
+    assert logged_in.data["user"] == {
+        "id": seeded_users.get(username="zhangrusong").pk,
+        "username": "zhangrusong",
+        "is_admin": False,
+        "role": "workflow_maintainer",
+        "allowed_sections": [
+            "overview",
+            "edit",
+            "artifacts",
+            "packages",
+            "tools",
+            "runs",
+            "wdl",
+            "help",
+        ],
+    }
+    assert client.get("/api/v1/wdl-assets").status_code == 200
+    assert client.get("/api/v1/wdl-packages").status_code == 200
+    assert client.get("/api/v1/tools").status_code == 200
+    assert client.get("/api/v1/editor/workflows").status_code == 200
+    assert client.get("/api/v1/analysis/catalog").status_code == 200
+    assert client.get("/api/v1/analysis-runs").status_code == 200
+    created = client.post(
+        "/api/v1/wdl-assets",
+        {
+            "name": "协作权限审计",
+            "filename": "maintainer-audit.wdl",
+            "content": "version 1.0\n\ntask hello {\n  command <<<\n    echo hello\n  >>>\n}\n",
+            "note": "workflow maintainer 创建",
+        },
+        format="json",
+    )
+    assert created.status_code == 201
+    assert created.data["created_by"] == "zhangrusong"
+    assert created.data["audit_events"][0]["actor"] == "zhangrusong"
 
 
 @pytest.mark.django_db
@@ -194,11 +249,14 @@ def test_seed_users_is_idempotent_and_derives_passwords_from_usernames(monkeypat
             assert not user.is_staff
             assert not user.is_superuser
             assert user.groups.filter(name="analysis-operators").exists()
+            assert not user.groups.filter(name="workflow-maintainers").exists()
         else:
             assert not user.is_staff
             assert not user.is_superuser
             assert not user.groups.filter(name="analysis-operators").exists()
+            assert user.groups.filter(name="workflow-maintainers").exists()
     assert Group.objects.filter(name="analysis-operators").exists()
+    assert Group.objects.filter(name="workflow-maintainers").exists()
 
 
 @pytest.mark.django_db
@@ -215,6 +273,26 @@ def test_seed_users_does_not_reactivate_disabled_user(monkeypatch):
 
     user.refresh_from_db()
     assert not user.is_active
+
+
+@pytest.mark.django_db
+def test_workflow_maintainer_data_migration_assigns_existing_default_users():
+    migration = import_module("workflows.migrations.0019_workflow_maintainer_role")
+    user_model = get_user_model()
+    operator_group, _ = Group.objects.get_or_create(name="analysis-operators")
+    users = [
+        user_model.objects.create_user(username=username, password=None)
+        for username in ("zhangrusong", "hejingjing", "zhuying", "hangzhili")
+    ]
+    for user in users:
+        user.groups.add(operator_group)
+
+    migration.assign_existing_maintainers(apps, None)
+    migration.assign_existing_maintainers(apps, None)
+
+    for user in users:
+        assert user.groups.filter(name="workflow-maintainers").exists()
+        assert not user.groups.filter(name="analysis-operators").exists()
 
 
 @pytest.mark.django_db

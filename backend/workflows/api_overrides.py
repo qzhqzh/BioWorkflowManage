@@ -4,6 +4,8 @@ from django.db.models import Count, OuterRef, Subquery
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 
+from compiler_core import canonical_digest
+
 from .models import ToolDocument, ToolVersion
 from .request_ids import request_id, with_request_id
 
@@ -49,6 +51,8 @@ def tools(request):
                 "draft_status": (
                     draft.validation.get("status", "unknown") if draft else None
                 ),
+                "draft_version": draft_spec.get("tool_version") if draft else None,
+                "draft_digest": canonical_digest(draft_spec) if draft else None,
                 "draft_updated_at": draft.updated_at.isoformat() if draft else None,
                 "description": draft_spec.get("description", ""),
                 "category": draft_spec.get("category"),

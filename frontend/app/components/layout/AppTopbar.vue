@@ -36,7 +36,9 @@ async function logout() {
 
     <slot name="status" />
     <div class="topbar__actions">
-      <slot name="actions" />
+      <ClientOnly>
+        <slot name="actions" />
+      </ClientOnly>
       <ClientOnly>
         <span v-if="auth.user.value" class="topbar__user">{{ auth.user.value.username }}</span>
         <button v-if="auth.user.value" class="topbar__logout" type="button" @click="logout">退出</button>

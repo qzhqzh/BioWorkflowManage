@@ -154,6 +154,7 @@ export interface WdlAsset {
   metadata_version: number
   tags: string[]
   created_by: string
+  is_mine?: boolean
   created_at: string
   updated_at: string
   revision_count: number
@@ -199,6 +200,7 @@ export interface WdlToolPackage {
   lifecycle: 'active' | 'archived'
   tags: string[]
   created_by: string
+  is_mine?: boolean
   created_at: string
   updated_at: string
   version_count: number

@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import hashlib
+import re
 import shutil
 import uuid
 from pathlib import Path
 
-from django.db import connection, transaction
+from django.db import IntegrityError, connection, transaction
 from django.db.models import Max
 from rest_framework import status
 from rest_framework.decorators import api_view
@@ -20,6 +21,7 @@ from compiler_core import (
 )
 from compiler_core.validation import semantic_digest
 from compiler_core.compiler import validate_wdl
+from .workflow_document_state import workflow_document_digest
 from .models import (
     CompilationRecord,
     ToolDocument,
@@ -38,6 +40,14 @@ CONTRACTS = {
     "validation-report": ("validation-report.schema.json", "1.0.0"),
     "error-catalog": ("error-catalog.json", "1.0.0"),
 }
+WDL_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+
+
+def _actor(request) -> str:
+    user = getattr(request, "user", None)
+    if user is not None and getattr(user, "is_authenticated", False):
+        return user.get_username()
+    return "local-user"
 
 
 def _dependency_validation(graph: dict, errors: list[dict]) -> dict:
@@ -47,7 +57,11 @@ def _dependency_validation(graph: dict, errors: list[dict]) -> dict:
             "stage": "resolution",
             "severity": "error",
             "message": item["message"],
-            **({"location": {"node_id": item["node_id"]}} if item.get("node_id") else {}),
+            **(
+                {"location": {"node_id": item["node_id"]}}
+                if item.get("node_id")
+                else {}
+            ),
         }
         for item in errors
     ]
@@ -132,7 +146,9 @@ def _resolve_subworkflow_specs(graph: dict) -> tuple[list[dict], list[dict]]:
                 }
             )
             return
-        wdl = next(item["content"] for item in artifacts if item["name"] == "workflow.wdl")
+        wdl = next(
+            item["content"] for item in artifacts if item["name"] == "workflow.wdl"
+        )
         resolved[key] = {
             "slug": slug,
             "version": version,
@@ -199,11 +215,23 @@ def contracts(request, contract_name: str | None = None):
         )
     elif contract_name not in CONTRACTS:
         response = Response(
-            {"error": {"code": "CONTRACT_NOT_FOUND", "message": "Unknown contract.", "request_id": request_id}},
+            {
+                "error": {
+                    "code": "CONTRACT_NOT_FOUND",
+                    "message": "Unknown contract.",
+                    "request_id": request_id,
+                }
+            },
             status=status.HTTP_404_NOT_FOUND,
         )
     else:
-        response = Response(json.loads((ROOT / "schemas" / CONTRACTS[contract_name][0]).read_text(encoding="utf-8")))
+        response = Response(
+            json.loads(
+                (ROOT / "schemas" / CONTRACTS[contract_name][0]).read_text(
+                    encoding="utf-8"
+                )
+            )
+        )
     return _with_request_id(response, request_id)
 
 
@@ -214,14 +242,26 @@ def validate_tool(request):
     if not isinstance(tool, dict):
         return _with_request_id(
             Response(
-                {"error": {"code": "REQUEST_INVALID", "message": "tool_spec is required.", "request_id": request_id}},
+                {
+                    "error": {
+                        "code": "REQUEST_INVALID",
+                        "message": "tool_spec is required.",
+                        "request_id": request_id,
+                    }
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             ),
             request_id,
         )
     validation = validate_tool_spec(tool)
     return _with_request_id(
-        Response({"status": "completed", "validation": validation, "normalized": {"digest": canonical_digest(tool)}}),
+        Response(
+            {
+                "status": "completed",
+                "validation": validation,
+                "normalized": {"digest": canonical_digest(tool)},
+            }
+        ),
         request_id,
     )
 
@@ -234,7 +274,13 @@ def validate_graph(request):
     if not isinstance(graph, dict) or not isinstance(tools, list):
         return _with_request_id(
             Response(
-                {"error": {"code": "REQUEST_INVALID", "message": "workflow_graph and tool_specs are required.", "request_id": request_id}},
+                {
+                    "error": {
+                        "code": "REQUEST_INVALID",
+                        "message": "workflow_graph and tool_specs are required.",
+                        "request_id": request_id,
+                    }
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             ),
             request_id,
@@ -246,7 +292,16 @@ def validate_graph(request):
     else:
         validation, order = validate_workflow_graph(graph, tools, subworkflows)
     return _with_request_id(
-        Response({"status": "completed", "validation": validation, "normalized": {"semantic_digest": validation.get("source", {}).get("digest"), "topological_calls": order}}),
+        Response(
+            {
+                "status": "completed",
+                "validation": validation,
+                "normalized": {
+                    "semantic_digest": validation.get("source", {}).get("digest"),
+                    "topological_calls": order,
+                },
+            }
+        ),
         request_id,
     )
 
@@ -259,11 +314,75 @@ def compile_graph(request):
     if not isinstance(graph, dict) or not isinstance(tools, list):
         return _with_request_id(
             Response(
-                {"error": {"code": "REQUEST_INVALID", "message": "workflow_graph and tool_specs are required.", "request_id": request_id}},
+                {
+                    "error": {
+                        "code": "REQUEST_INVALID",
+                        "message": "workflow_graph and tool_specs are required.",
+                        "request_id": request_id,
+                    }
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             ),
             request_id,
         )
+    workflow = WorkflowDocument.objects.filter(slug=graph.get("id", "")).first()
+    workflow_version = None
+    requested_version = request.data.get("workflow_version")
+    if requested_version is not None:
+        if workflow is None:
+            return _with_request_id(
+                Response(
+                    {
+                        "error": {
+                            "code": "WORKFLOW_VERSION_NOT_FOUND",
+                            "message": "The requested workflow version does not exist.",
+                            "request_id": request_id,
+                        }
+                    },
+                    status=status.HTTP_404_NOT_FOUND,
+                ),
+                request_id,
+            )
+        try:
+            workflow_version = workflow.versions.filter(
+                version=int(requested_version)
+            ).first()
+        except (TypeError, ValueError):
+            workflow_version = None
+        if workflow_version is None:
+            return _with_request_id(
+                Response(
+                    {
+                        "error": {
+                            "code": "WORKFLOW_VERSION_NOT_FOUND",
+                            "message": "The requested workflow version does not exist.",
+                            "request_id": request_id,
+                        }
+                    },
+                    status=status.HTTP_404_NOT_FOUND,
+                ),
+                request_id,
+            )
+        if (
+            semantic_digest(graph) != workflow_version.semantic_digest
+            or canonical_digest(tools)
+            != canonical_digest(workflow_version.tool_specs)
+        ):
+            return _with_request_id(
+                Response(
+                    {
+                        "error": {
+                            "code": "WORKFLOW_VERSION_INPUT_MISMATCH",
+                            "message": "Compile inputs do not match the immutable workflow version semantics.",
+                            "request_id": request_id,
+                        }
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                ),
+                request_id,
+            )
+        graph = workflow_version.workflow_graph
+        tools = workflow_version.tool_specs
     subworkflows, dependency_errors = _resolve_subworkflow_specs(graph)
     if dependency_errors:
         validation = _dependency_validation(graph, dependency_errors)
@@ -271,20 +390,10 @@ def compile_graph(request):
     else:
         validation, artifacts = compile_workflow(graph, tools, subworkflows)
     succeeded = validation["status"] == "valid"
-    workflow = WorkflowDocument.objects.filter(slug=graph.get("id", "")).first()
-    workflow_version = None
-    if workflow:
-        requested_version = request.data.get("workflow_version")
-        versions = workflow.versions.all()
-        if requested_version is not None:
-            try:
-                workflow_version = versions.filter(version=int(requested_version)).first()
-            except (TypeError, ValueError):
-                workflow_version = None
-        else:
-            workflow_version = versions.filter(
-                semantic_digest=validation.get("source", {}).get("digest", "")
-            ).first()
+    if workflow and requested_version is None:
+        workflow_version = workflow.versions.filter(
+            semantic_digest=validation.get("source", {}).get("digest", "")
+        ).first()
     CompilationRecord.objects.create(
         workflow=workflow,
         workflow_version=workflow_version,
@@ -295,7 +404,7 @@ def compile_graph(request):
         artifacts=artifacts,
     )
     wdl_revision = None
-    if succeeded and workflow:
+    if succeeded and workflow and workflow_version:
         wdl_artifact = next(
             (item for item in artifacts if item.get("name") == "workflow.wdl"),
             None,
@@ -307,6 +416,8 @@ def compile_graph(request):
                 source=WDLRevision.Source.SYSTEM,
                 content=wdl_artifact["content"],
                 validation={"status": "valid", "diagnostics": []},
+                actor=_actor(request),
+                note=f"由 WorkflowVersion v{workflow_version.version} 编译生成。",
             )
     response = Response(
         {
@@ -318,12 +429,14 @@ def compile_graph(request):
                 _wdl_revision_payload(wdl_revision) if wdl_revision else None
             ),
         },
-        status=status.HTTP_201_CREATED if succeeded else status.HTTP_422_UNPROCESSABLE_ENTITY,
+        status=status.HTTP_201_CREATED
+        if succeeded
+        else status.HTTP_422_UNPROCESSABLE_ENTITY,
     )
     return _with_request_id(response, request_id)
 
 
-def _document_payload(document: WorkflowDocument) -> dict:
+def _document_payload(document: WorkflowDocument, *, actor: str | None = None) -> dict:
     return {
         "slug": document.slug,
         "name": document.name,
@@ -333,6 +446,11 @@ def _document_payload(document: WorkflowDocument) -> dict:
         "editor_document": document.editor_document,
         "tool_specs": document.tool_specs,
         "subworkflow_references": document.subworkflow_references,
+        "created_by": document.created_by,
+        "updated_by": document.updated_by,
+        "document_version": document.document_version,
+        "document_digest": workflow_document_digest(document),
+        "is_mine": actor is not None and document.created_by == actor,
         "latest_version": document.versions.aggregate(value=Max("version"))["value"],
         "updated_at": document.updated_at.isoformat(),
     }
@@ -345,20 +463,92 @@ def workflow_document(request, slug: str):
         document = WorkflowDocument.objects.filter(slug=slug).first()
         if not document:
             return _with_request_id(
-                Response({"error": {"code": "WORKFLOW_NOT_FOUND", "message": "Workflow not found.", "request_id": request_id}}, status=404),
+                Response(
+                    {
+                        "error": {
+                            "code": "WORKFLOW_NOT_FOUND",
+                            "message": "Workflow not found.",
+                            "request_id": request_id,
+                        }
+                    },
+                    status=404,
+                ),
                 request_id,
             )
-        return _with_request_id(Response(_document_payload(document)), request_id)
+        return _with_request_id(
+            Response(_document_payload(document, actor=_actor(request))), request_id
+        )
 
     graph = request.data.get("workflow_graph")
     tools = request.data.get("tool_specs")
     editor = request.data.get("editor_document", {})
-    if not isinstance(graph, dict) or not isinstance(tools, list) or not isinstance(editor, dict):
+    if (
+        not isinstance(graph, dict)
+        or not isinstance(tools, list)
+        or not isinstance(editor, dict)
+    ):
         return _with_request_id(
-            Response({"error": {"code": "REQUEST_INVALID", "message": "Invalid workflow document.", "request_id": request_id}}, status=400),
+            Response(
+                {
+                    "error": {
+                        "code": "REQUEST_INVALID",
+                        "message": "Invalid workflow document.",
+                        "request_id": request_id,
+                    }
+                },
+                status=400,
+            ),
             request_id,
         )
     existing = WorkflowDocument.objects.filter(slug=slug).first()
+    base_document_version = request.data.get("base_document_version")
+    base_document_digest = request.data.get("base_document_digest")
+    strict_preconditions = (
+        request.headers.get("X-Workflow-Concurrency", "").lower() == "required"
+    )
+    preconditions_supplied = (
+        base_document_version is not None or base_document_digest is not None
+    )
+    preconditions_complete = base_document_version is not None and bool(
+        base_document_digest
+    )
+    if existing and strict_preconditions and not preconditions_complete:
+        return _with_request_id(
+            Response(
+                {
+                    "error": {
+                        "code": "WORKFLOW_PRECONDITION_REQUIRED",
+                        "message": "保存流程必须携带当前文档版本和摘要，请刷新后重试。",
+                        "request_id": request_id,
+                    }
+                },
+                status=428,
+            ),
+            request_id,
+        )
+    if (
+        existing
+        and preconditions_supplied
+        and (
+            not preconditions_complete
+            or not isinstance(base_document_version, int)
+            or base_document_version < 1
+            or not isinstance(base_document_digest, str)
+        )
+    ):
+        return _with_request_id(
+            Response(
+                {
+                    "error": {
+                        "code": "WORKFLOW_PRECONDITION_INVALID",
+                        "message": "流程文档版本或摘要格式无效。",
+                        "request_id": request_id,
+                    }
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            ),
+            request_id,
+        )
     kind = request.data.get(
         "kind",
         existing.kind if existing else WorkflowDocument.Kind.WORKFLOW,
@@ -412,21 +602,108 @@ def workflow_document(request, slug: str):
             ),
             request_id,
         )
-    document, _ = WorkflowDocument.objects.update_or_create(
-        slug=slug,
-        defaults={
-            "name": request.data.get("name") or graph.get("name") or slug,
-            "description": request.data.get(
-                "description", existing.description if existing else ""
-            ),
-            "kind": kind,
-            "workflow_graph": graph,
-            "editor_document": editor,
-            "tool_specs": tools,
-            "subworkflow_references": references,
-        },
+    actor = _actor(request)
+    legacy_write = bool(existing and not preconditions_complete)
+    if existing:
+        with transaction.atomic():
+            document = WorkflowDocument.objects.select_for_update().get(slug=slug)
+            current_digest = workflow_document_digest(document)
+            if preconditions_complete and (
+                document.document_version != base_document_version
+                or current_digest != base_document_digest
+            ):
+                return _with_request_id(
+                    Response(
+                        {
+                            "error": {
+                                "code": "WORKFLOW_DOCUMENT_CONFLICT",
+                                "message": "该流程已被其他会话修改，本地草稿尚未覆盖远端内容。",
+                                "details": {
+                                    "base_document_version": base_document_version,
+                                    "current_document_version": document.document_version,
+                                    "base_document_digest": base_document_digest,
+                                    "current_document_digest": current_digest,
+                                    "current": _document_payload(document, actor=actor),
+                                },
+                                "request_id": request_id,
+                            }
+                        },
+                        status=status.HTTP_409_CONFLICT,
+                    ),
+                    request_id,
+                )
+            next_name = request.data.get("name") or graph.get("name") or slug
+            next_description = request.data.get("description", document.description)
+            next_digest = canonical_digest(
+                {
+                    "name": next_name,
+                    "description": next_description,
+                    "kind": kind,
+                    "workflow_graph": graph,
+                    "editor_document": editor,
+                    "tool_specs": tools,
+                    "subworkflow_references": references,
+                }
+            )
+            if next_digest == current_digest:
+                response = _with_request_id(
+                    Response(_document_payload(document, actor=actor)), request_id
+                )
+                if legacy_write:
+                    response["Deprecation"] = "true"
+                    response["Warning"] = (
+                        '299 BioWorkflowManage "Workflow PUT without optimistic '
+                        'concurrency fields is deprecated"'
+                    )
+                return response
+            document.name = next_name
+            document.description = next_description
+            document.kind = kind
+            document.workflow_graph = graph
+            document.editor_document = editor
+            document.tool_specs = tools
+            document.subworkflow_references = references
+            document.updated_by = actor
+            document.document_version += 1
+            document.save()
+    else:
+        try:
+            document = WorkflowDocument.objects.create(
+                slug=slug,
+                name=request.data.get("name") or graph.get("name") or slug,
+                description=request.data.get("description", ""),
+                kind=kind,
+                workflow_graph=graph,
+                editor_document=editor,
+                tool_specs=tools,
+                subworkflow_references=references,
+                created_by=actor,
+                updated_by=actor,
+            )
+        except IntegrityError:
+            return _with_request_id(
+                Response(
+                    {
+                        "error": {
+                            "code": "WORKFLOW_CREATE_CONFLICT",
+                            "message": "该流程刚刚被其他会话创建，请刷新后重试。",
+                            "request_id": request_id,
+                        }
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                ),
+                request_id,
+            )
+    response = _with_request_id(
+        Response(_document_payload(document, actor=_actor(request))), request_id
     )
-    return _with_request_id(Response(_document_payload(document)), request_id)
+    if legacy_write:
+        response["Deprecation"] = "true"
+        response["Warning"] = (
+            '299 BioWorkflowManage "Workflow PUT without optimistic concurrency '
+            'fields is deprecated"'
+        )
+    return response
 
 
 @api_view(["GET"])
@@ -473,6 +750,8 @@ def _tool_document_payload(document: ToolDocument) -> dict:
         "tool_id": document.tool_id,
         "draft_spec": document.draft_spec,
         "validation": document.validation,
+        "draft_version": document.draft_version,
+        "draft_digest": canonical_digest(document.draft_spec),
         "updated_at": document.updated_at.isoformat(),
     }
 
@@ -509,7 +788,10 @@ def tools(request):
             {
                 "tool_id": tool_id,
                 "name": (
-                    (draft.draft_spec.get("display_name") or draft.draft_spec.get("name"))
+                    (
+                        draft.draft_spec.get("display_name")
+                        or draft.draft_spec.get("name")
+                    )
                     if draft
                     else latest.name
                 ),
@@ -563,10 +845,79 @@ def tool_document(request, tool_id: str):
             request_id,
         )
     validation = _validate_tool_draft(tool_id, tool_spec)
-    document, _ = ToolDocument.objects.update_or_create(
-        tool_id=tool_id,
-        defaults={"draft_spec": tool_spec, "validation": validation},
-    )
+    with transaction.atomic():
+        document = (
+            ToolDocument.objects.select_for_update().filter(tool_id=tool_id).first()
+        )
+        if document:
+            base_version = request.data.get("base_draft_version")
+            base_digest = request.data.get("base_draft_digest")
+            if base_version is None or not base_digest:
+                return _with_request_id(
+                    Response(
+                        {
+                            "error": {
+                                "code": "TOOL_DRAFT_PRECONDITION_REQUIRED",
+                                "message": "Updating an existing tool draft requires its version and digest.",
+                                "request_id": request_id,
+                            }
+                        },
+                        status=428,
+                    ),
+                    request_id,
+                )
+            current_digest = canonical_digest(document.draft_spec)
+            if base_version != document.draft_version or base_digest != current_digest:
+                return _with_request_id(
+                    Response(
+                        {
+                            "error": {
+                                "code": "TOOL_DRAFT_CONFLICT",
+                                "message": "Tool draft changed after it was loaded. Reload before saving.",
+                                "request_id": request_id,
+                                "details": {
+                                    "current_draft_version": document.draft_version,
+                                    "current_draft_digest": current_digest,
+                                },
+                            }
+                        },
+                        status=status.HTTP_409_CONFLICT,
+                    ),
+                    request_id,
+                )
+            document.draft_spec = tool_spec
+            document.validation = validation
+            document.draft_version += 1
+            document.save(
+                update_fields=[
+                    "draft_spec",
+                    "validation",
+                    "draft_version",
+                    "updated_at",
+                ]
+            )
+        else:
+            try:
+                with transaction.atomic():
+                    document = ToolDocument.objects.create(
+                        tool_id=tool_id,
+                        draft_spec=tool_spec,
+                        validation=validation,
+                    )
+            except IntegrityError:
+                return _with_request_id(
+                    Response(
+                        {
+                            "error": {
+                                "code": "TOOL_DRAFT_CONFLICT",
+                                "message": "Tool draft was created concurrently. Reload before saving.",
+                                "request_id": request_id,
+                            }
+                        },
+                        status=status.HTTP_409_CONFLICT,
+                    ),
+                    request_id,
+                )
     return _with_request_id(Response(_tool_document_payload(document)), request_id)
 
 
@@ -635,22 +986,62 @@ def _publish_tool_spec(tool_id: str, tool_spec: dict, request_id: str) -> Respon
 @api_view(["POST"])
 def publish_tool_document(request, tool_id: str):
     request_id = _request_id(request)
-    document = ToolDocument.objects.filter(tool_id=tool_id).first()
-    if not document:
-        return _with_request_id(
-            Response(
-                {
-                    "error": {
-                        "code": "TOOL_DRAFT_NOT_FOUND",
-                        "message": "Tool draft not found.",
-                        "request_id": request_id,
-                    }
-                },
-                status=status.HTTP_404_NOT_FOUND,
-            ),
-            request_id,
+    with transaction.atomic():
+        document = (
+            ToolDocument.objects.select_for_update()
+            .filter(tool_id=tool_id)
+            .first()
         )
-    return _publish_tool_spec(tool_id, document.draft_spec, request_id)
+        if not document:
+            return _with_request_id(
+                Response(
+                    {
+                        "error": {
+                            "code": "TOOL_DRAFT_NOT_FOUND",
+                            "message": "Tool draft not found.",
+                            "request_id": request_id,
+                        }
+                    },
+                    status=status.HTTP_404_NOT_FOUND,
+                ),
+                request_id,
+            )
+        base_version = request.data.get("base_draft_version")
+        base_digest = request.data.get("base_draft_digest")
+        if base_version is None or not base_digest:
+            return _with_request_id(
+                Response(
+                    {
+                        "error": {
+                            "code": "TOOL_DRAFT_PRECONDITION_REQUIRED",
+                            "message": "Publishing a tool draft requires its version and digest.",
+                            "request_id": request_id,
+                        }
+                    },
+                    status=428,
+                ),
+                request_id,
+            )
+        current_digest = canonical_digest(document.draft_spec)
+        if base_version != document.draft_version or base_digest != current_digest:
+            return _with_request_id(
+                Response(
+                    {
+                        "error": {
+                            "code": "TOOL_DRAFT_CONFLICT",
+                            "message": "Tool draft changed after it was loaded. Reload before publishing.",
+                            "request_id": request_id,
+                            "details": {
+                                "current_draft_version": document.draft_version,
+                                "current_draft_digest": current_digest,
+                            },
+                        }
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                ),
+                request_id,
+            )
+        return _publish_tool_spec(tool_id, document.draft_spec, request_id)
 
 
 @api_view(["GET", "POST"])
@@ -662,9 +1053,7 @@ def tool_versions(request, tool_id: str):
             Response(
                 {
                     "tool_id": tool_id,
-                    "results": [
-                        _tool_version_payload(item) for item in versions
-                    ],
+                    "results": [_tool_version_payload(item) for item in versions],
                 }
             ),
             request_id,
@@ -711,9 +1100,126 @@ def tool_version_detail(request, tool_id: str, version: str):
     )
 
 
-@api_view(["GET"])
+@api_view(["GET", "POST"])
 def workflow_documents(request):
     request_id = _request_id(request)
+    actor = _actor(request)
+    if request.method == "POST":
+        slug = str(request.data.get("slug") or "").strip()
+        name = str(request.data.get("name") or "").strip()
+        description = str(request.data.get("description") or "").strip()
+        kind = str(request.data.get("kind") or WorkflowDocument.Kind.WORKFLOW)
+        if not WDL_IDENTIFIER_PATTERN.fullmatch(slug):
+            return _with_request_id(
+                Response(
+                    {
+                        "error": {
+                            "code": "WORKFLOW_SLUG_INVALID",
+                            "message": "流程 ID 必须是合法的 WDL identifier。",
+                            "request_id": request_id,
+                        }
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                ),
+                request_id,
+            )
+        if not name or len(name) > 256 or len(description) > 4096:
+            return _with_request_id(
+                Response(
+                    {
+                        "error": {
+                            "code": "WORKFLOW_METADATA_INVALID",
+                            "message": "请填写流程名称，并检查名称和说明长度。",
+                            "request_id": request_id,
+                        }
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                ),
+                request_id,
+            )
+        if kind not in WorkflowDocument.Kind.values:
+            return _with_request_id(
+                Response(
+                    {
+                        "error": {
+                            "code": "WORKFLOW_KIND_INVALID",
+                            "message": "kind must be workflow or subworkflow.",
+                            "request_id": request_id,
+                        }
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                ),
+                request_id,
+            )
+        graph = {
+            "schema_version": "1.0.0",
+            "id": slug,
+            "name": name,
+            "description": description,
+            "target": {
+                "language": "wdl",
+                "version": "1.0",
+                "profile": "miniwdl-compatible",
+            },
+            "nodes": [
+                {
+                    "id": "input_file",
+                    "type": "workflow_input",
+                    "label": "输入文件",
+                    "port": {
+                        "name": "value",
+                        "wdl_type": "File",
+                        "semantic_type": "core.file.any",
+                        "required": True,
+                    },
+                }
+            ],
+            "edges": [],
+            "layout": {
+                "nodes": {"input_file": {"x": 80, "y": 120}},
+                "viewport": {"x": 0, "y": 0, "zoom": 1},
+            },
+        }
+        editor_document = {
+            "nodes": [{"id": "input_file", "position": {"x": 80, "y": 120}}],
+            "viewport": {"x": 0, "y": 0, "zoom": 1},
+        }
+        try:
+            with transaction.atomic():
+                document = WorkflowDocument.objects.create(
+                    slug=slug,
+                    name=name,
+                    description=description,
+                    kind=kind,
+                    workflow_graph=graph,
+                    editor_document=editor_document,
+                    tool_specs=[],
+                    subworkflow_references=[],
+                    created_by=actor,
+                    updated_by=actor,
+                )
+        except IntegrityError:
+            return _with_request_id(
+                Response(
+                    {
+                        "error": {
+                            "code": "WORKFLOW_ALREADY_EXISTS",
+                            "message": f"流程 ID {slug} 已存在。",
+                            "request_id": request_id,
+                        }
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                ),
+                request_id,
+            )
+        return _with_request_id(
+            Response(
+                _document_payload(document, actor=actor),
+                status=status.HTTP_201_CREATED,
+            ),
+            request_id,
+        )
+
     documents = WorkflowDocument.objects.all()
     return _with_request_id(
         Response(
@@ -724,9 +1230,13 @@ def workflow_documents(request):
                         "name": item.name,
                         "description": item.description,
                         "kind": item.kind,
-                        "latest_version": item.versions.aggregate(
-                            value=Max("version")
-                        )["value"],
+                        "created_by": item.created_by,
+                        "updated_by": item.updated_by,
+                        "document_version": item.document_version,
+                        "is_mine": item.created_by == actor,
+                        "latest_version": item.versions.aggregate(value=Max("version"))[
+                            "value"
+                        ],
                         "updated_at": item.updated_at.isoformat(),
                     }
                     for item in documents
@@ -757,9 +1267,44 @@ def _workflow_version_payload(
                 "workflow_graph": workflow_version.workflow_graph,
                 "editor_document": workflow_version.editor_document,
                 "tool_specs": workflow_version.tool_specs,
+                "compiled_bundle": workflow_version.compiled_bundle,
+                "compiled_digest": workflow_version.compiled_digest,
+                "compiler_profile": workflow_version.compiler_profile,
             }
         )
     return payload
+
+
+def _unpublished_wdl_tool_drafts(document: WorkflowDocument) -> list[dict]:
+    specs_by_digest = {
+        canonical_digest(spec): spec for spec in document.tool_specs
+    }
+    unresolved = []
+    for node in document.workflow_graph.get("nodes", []):
+        if node.get("type") != "tool":
+            continue
+        reference = node.get("tool_ref", {})
+        digest = str(reference.get("digest") or "")
+        spec = specs_by_digest.get(digest)
+        if not spec or not spec.get("metadata", {}).get("source_wdl"):
+            continue
+        tool_id = str(reference.get("id") or "")
+        version = str(reference.get("tool_version") or "")
+        if ToolVersion.objects.filter(
+            tool_id=tool_id,
+            version=version,
+            digest=digest,
+        ).exists():
+            continue
+        unresolved.append(
+            {
+                "node_id": node.get("id"),
+                "tool_id": tool_id,
+                "version": version,
+                "digest": digest,
+            }
+        )
+    return unresolved
 
 
 @api_view(["GET", "POST"])
@@ -794,13 +1339,83 @@ def workflow_versions(request, slug: str):
             request_id,
         )
 
+    base_document_version = request.data.get("base_document_version")
+    base_document_digest = request.data.get("base_document_digest")
+    if base_document_version is None or not base_document_digest:
+        return _with_request_id(
+            Response(
+                {
+                    "error": {
+                        "code": "WORKFLOW_PUBLISH_PRECONDITION_REQUIRED",
+                        "message": "发布流程必须携带当前文档版本和摘要，请刷新后重试。",
+                        "request_id": request_id,
+                    }
+                },
+                status=428,
+            ),
+            request_id,
+        )
+    if (
+        not isinstance(base_document_version, int)
+        or base_document_version < 1
+        or not isinstance(base_document_digest, str)
+    ):
+        return _with_request_id(
+            Response(
+                {
+                    "error": {
+                        "code": "WORKFLOW_PUBLISH_PRECONDITION_INVALID",
+                        "message": "流程文档版本或摘要格式无效。",
+                        "request_id": request_id,
+                    }
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            ),
+            request_id,
+        )
+    current_document_digest = workflow_document_digest(document)
+    if (
+        document.document_version != base_document_version
+        or current_document_digest != base_document_digest
+    ):
+        return _with_request_id(
+            Response(
+                {
+                    "error": {
+                        "code": "WORKFLOW_PUBLISH_CONFLICT",
+                        "message": "该流程已被其他会话修改，请重新载入后发布。",
+                        "details": {"current": _document_payload(document)},
+                        "request_id": request_id,
+                    }
+                },
+                status=status.HTTP_409_CONFLICT,
+            ),
+            request_id,
+        )
+
+    unpublished_tool_drafts = _unpublished_wdl_tool_drafts(document)
+    if unpublished_tool_drafts:
+        return _with_request_id(
+            Response(
+                {
+                    "status": "rejected",
+                    "error": {
+                        "code": "WORKFLOW_TOOL_VERSION_UNPUBLISHED",
+                        "message": "请先发布 WDL 提案生成的工具版本，再发布流程。",
+                        "details": unpublished_tool_drafts,
+                        "request_id": request_id,
+                    },
+                },
+                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            ),
+            request_id,
+        )
+
     subworkflows, dependency_errors = _resolve_subworkflow_specs(
         document.workflow_graph
     )
     if dependency_errors:
-        validation = _dependency_validation(
-            document.workflow_graph, dependency_errors
-        )
+        validation = _dependency_validation(document.workflow_graph, dependency_errors)
     else:
         validation, artifacts = compile_workflow(
             document.workflow_graph, document.tool_specs, subworkflows
@@ -813,9 +1428,7 @@ def workflow_versions(request, slug: str):
             ),
             request_id,
         )
-    reference_errors = _validate_subworkflow_references(
-        document.subworkflow_references
-    )
+    reference_errors = _validate_subworkflow_references(document.subworkflow_references)
     if reference_errors:
         return _with_request_id(
             Response(
@@ -852,7 +1465,9 @@ def workflow_versions(request, slug: str):
     with transaction.atomic():
         locked = WorkflowDocument.objects.select_for_update().get(pk=document.pk)
         if (
-            locked.updated_at != document.updated_at
+            locked.document_version != base_document_version
+            or workflow_document_digest(locked) != base_document_digest
+            or locked.updated_at != document.updated_at
             or locked.workflow_graph != document.workflow_graph
             or locked.tool_specs != document.tool_specs
             or locked.subworkflow_references != document.subworkflow_references
@@ -880,8 +1495,7 @@ def workflow_versions(request, slug: str):
             and latest_item.name == locked.name
             and latest_item.description == locked.description
             and latest_item.kind == locked.kind
-            and latest_item.subworkflow_references
-            == locked.subworkflow_references
+            and latest_item.subworkflow_references == locked.subworkflow_references
             and latest_item.compiled_digest == compiled_digest
         ):
             item = latest_item
@@ -900,9 +1514,7 @@ def workflow_versions(request, slug: str):
                 compiled_bundle=compiled_bundle,
                 compiled_digest=compiled_digest,
                 compiler_profile="compiler-core-v1",
-                interface_contract=_extract_interface_contract(
-                    locked.workflow_graph
-                ),
+                interface_contract=_extract_interface_contract(locked.workflow_graph),
                 subworkflow_references=locked.subworkflow_references,
             )
     payload = _workflow_version_payload(item, include_snapshot=True)
@@ -910,11 +1522,7 @@ def workflow_versions(request, slug: str):
     return _with_request_id(
         Response(
             payload,
-            status=(
-                status.HTTP_200_OK
-                if reused
-                else status.HTTP_201_CREATED
-            ),
+            status=(status.HTTP_200_OK if reused else status.HTTP_201_CREATED),
         ),
         request_id,
     )
@@ -923,9 +1531,7 @@ def workflow_versions(request, slug: str):
 @api_view(["GET"])
 def workflow_version_detail(request, slug: str, version: int):
     request_id = _request_id(request)
-    item = WorkflowVersion.objects.filter(
-        workflow__slug=slug, version=version
-    ).first()
+    item = WorkflowVersion.objects.filter(workflow__slug=slug, version=version).first()
     if not item:
         return _with_request_id(
             Response(
@@ -961,9 +1567,7 @@ def _extract_interface_contract(graph: dict) -> dict:
     return {
         "contract_version": "1.0.0",
         "inputs": [
-            port_payload(node)
-            for node in nodes
-            if node.get("type") == "workflow_input"
+            port_payload(node) for node in nodes if node.get("type") == "workflow_input"
         ],
         "outputs": [
             port_payload(node)
@@ -993,7 +1597,12 @@ def _validate_subworkflow_references(references: list) -> list[dict]:
         ).first()
         if not target:
             errors.append(
-                {"index": index, "slug": slug, "version": version, "reason": "not found"}
+                {
+                    "index": index,
+                    "slug": slug,
+                    "version": version,
+                    "reason": "not found",
+                }
             )
         elif digest != target.semantic_digest:
             errors.append(
@@ -1009,15 +1618,44 @@ def _validate_subworkflow_references(references: list) -> list[dict]:
 
 
 def _wdl_revision_payload(item: WDLRevision, *, include_content=False) -> dict:
+    workflow_version = item.workflow_version if item.workflow_version_id else None
+    is_compiled_snapshot = (
+        item.source == WDLRevision.Source.SYSTEM and workflow_version is not None
+    )
     payload = {
         "id": item.id,
         "workflow_slug": item.workflow.slug,
         "version": item.version,
         "source": item.source,
-        "digest": item.digest,
-        "workflow_version": (
-            item.workflow_version.version if item.workflow_version_id else None
+        "artifact_role": (
+            "compiled_snapshot" if is_compiled_snapshot else "derived_draft"
         ),
+        "executable": False,
+        "digest": item.digest,
+        "workflow_version": workflow_version.version if workflow_version else None,
+        "base_workflow_version": (
+            {
+                "version": workflow_version.version,
+                "semantic_digest": workflow_version.semantic_digest,
+                "compiler_profile": workflow_version.compiler_profile,
+            }
+            if workflow_version
+            else None
+        ),
+        "run_source": (
+            {
+                "type": "workflow_version",
+                "version": workflow_version.version,
+                "semantic_digest": workflow_version.semantic_digest,
+            }
+            if is_compiled_snapshot
+            else None
+        ),
+        "base_wdl_revision": (
+            item.base_revision.version if item.base_revision_id else None
+        ),
+        "created_by": item.created_by,
+        "note": item.note,
         "validation": item.validation,
         "created_at": item.created_at.isoformat(),
     }
@@ -1033,6 +1671,9 @@ def _create_wdl_revision(
     source: str,
     content: str,
     validation: dict,
+    actor: str,
+    base_revision: WDLRevision | None = None,
+    note: str = "",
 ) -> WDLRevision:
     with transaction.atomic():
         locked = WorkflowDocument.objects.select_for_update().get(pk=workflow.pk)
@@ -1045,6 +1686,9 @@ def _create_wdl_revision(
             content=content,
             digest="sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest(),
             validation=validation,
+            created_by=actor,
+            base_revision=base_revision,
+            note=note,
         )
 
 
@@ -1123,7 +1767,60 @@ def wdl_revisions(request, slug: str):
             ),
             request_id,
         )
-    workflow_version = None
+    base_revision = None
+    requested_base_revision = request.data.get("base_wdl_version")
+    requested_base_digest = request.data.get("base_wdl_digest")
+    if (requested_base_revision is None) != (requested_base_digest is None):
+        return _with_request_id(
+            Response(
+                {
+                    "error": {
+                        "code": "WDL_PRECONDITION_REQUIRED",
+                        "message": "base_wdl_version and base_wdl_digest must be provided together.",
+                        "request_id": request_id,
+                    }
+                },
+                status=428,
+            ),
+            request_id,
+        )
+    if requested_base_revision is not None:
+        try:
+            base_revision = workflow.wdl_revisions.filter(
+                version=int(requested_base_revision)
+            ).first()
+        except (TypeError, ValueError):
+            base_revision = None
+        if not base_revision:
+            return _with_request_id(
+                Response(
+                    {
+                        "error": {
+                            "code": "WDL_BASE_REVISION_NOT_FOUND",
+                            "message": "The requested base WDL revision does not exist.",
+                            "request_id": request_id,
+                        }
+                    },
+                    status=status.HTTP_404_NOT_FOUND,
+                ),
+                request_id,
+            )
+        if requested_base_digest != base_revision.digest:
+            return _with_request_id(
+                Response(
+                    {
+                        "error": {
+                            "code": "WDL_BASE_REVISION_CONFLICT",
+                            "message": "The WDL base revision digest does not match.",
+                            "request_id": request_id,
+                            "current_base_digest": base_revision.digest,
+                        }
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                ),
+                request_id,
+            )
+    workflow_version = base_revision.workflow_version if base_revision else None
     requested_version = request.data.get("workflow_version")
     if requested_version is not None:
         try:
@@ -1146,12 +1843,32 @@ def wdl_revisions(request, slug: str):
                 ),
                 request_id,
             )
+        if base_revision and base_revision.workflow_version_id != workflow_version.id:
+            return _with_request_id(
+                Response(
+                    {
+                        "error": {
+                            "code": "WDL_BASE_VERSION_MISMATCH",
+                            "message": "The WDL base revision belongs to another workflow version.",
+                            "request_id": request_id,
+                        }
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                ),
+                request_id,
+            )
+    note = request.data.get("note", "")
+    if not isinstance(note, str):
+        note = ""
     item = _create_wdl_revision(
         workflow=workflow,
         workflow_version=workflow_version,
         source=WDLRevision.Source.MANUAL,
         content=content,
         validation=validation,
+        actor=_actor(request),
+        base_revision=base_revision,
+        note=note.strip(),
     )
     return _with_request_id(
         Response(
@@ -1165,9 +1882,7 @@ def wdl_revisions(request, slug: str):
 @api_view(["GET"])
 def wdl_revision_detail(request, slug: str, version: int):
     request_id = _request_id(request)
-    item = WDLRevision.objects.filter(
-        workflow__slug=slug, version=version
-    ).first()
+    item = WDLRevision.objects.filter(workflow__slug=slug, version=version).first()
     if not item:
         return _with_request_id(
             Response(

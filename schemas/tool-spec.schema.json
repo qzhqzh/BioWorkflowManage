@@ -465,10 +465,12 @@
           "required": ["file_path", "task_name", "source_digest"],
           "oneOf": [
             { "required": ["asset_slug", "revision"] },
-            { "required": ["package_slug", "package_version"] }
+            { "required": ["package_slug", "package_version"] },
+            { "required": ["workflow_slug", "revision"] }
           ],
           "properties": {
             "asset_slug": { "type": "string", "maxLength": 128 },
+            "workflow_slug": { "type": "string", "maxLength": 128 },
             "revision": { "type": "integer", "minimum": 1 },
             "package_slug": { "type": "string", "maxLength": 128 },
             "package_version": { "type": "string", "minLength": 1, "maxLength": 64 },

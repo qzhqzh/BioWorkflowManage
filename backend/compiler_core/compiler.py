@@ -46,6 +46,49 @@ def _command_segments(template: str) -> list[dict[str, str]]:
     return segments
 
 
+def _lower_tool_task(tool: dict[str, Any], digest: str) -> dict[str, Any]:
+    task_inputs = []
+    for port in sorted(tool["inputs"], key=lambda item: item["name"]):
+        item: dict[str, Any] = {"name": port["name"], "type": _type(port)}
+        if "default" in port:
+            item["default"] = _literal(port["default"], port["wdl_type"])
+        task_inputs.append(item)
+    return {
+        "name": tool["id"],
+        "source_tool": {
+            "id": tool["id"],
+            "tool_version": tool["tool_version"],
+            "spec_version": tool["schema_version"],
+            "digest": digest,
+        },
+        "inputs": task_inputs,
+        "command": {
+            "shell": tool["command"]["shell"],
+            "strict_mode": tool["command"].get("strict_mode", True),
+            "segments": _command_segments(tool["command"]["template"]),
+        },
+        "outputs": [
+            {
+                "name": port["name"],
+                "type": _type(port),
+                "expression": {
+                    "kind": port["capture"]["mode"],
+                    "value": port["capture"]["value"],
+                },
+            }
+            for port in sorted(tool["outputs"], key=lambda item: item["name"])
+        ],
+        "runtime": {
+            "docker": tool["container"]["image"],
+            **{
+                key: value
+                for key, value in tool.get("runtime", {}).items()
+                if key in {"cpu", "memory_gb", "disk_gb"}
+            },
+        },
+    }
+
+
 def lower_to_ir(
     graph: dict[str, Any],
     tool_specs: list[dict[str, Any]],
@@ -65,50 +108,10 @@ def lower_to_ir(
         for item in (subworkflow_specs or [])
     }
 
-    tasks = []
-    for digest, tool in sorted(used_tools.items(), key=lambda item: item[1]["id"]):
-        task_inputs = []
-        for port in sorted(tool["inputs"], key=lambda item: item["name"]):
-            item: dict[str, Any] = {"name": port["name"], "type": _type(port)}
-            if "default" in port:
-                item["default"] = _literal(port["default"], port["wdl_type"])
-            task_inputs.append(item)
-        tasks.append(
-            {
-                "name": tool["id"],
-                "source_tool": {
-                    "id": tool["id"],
-                    "tool_version": tool["tool_version"],
-                    "spec_version": tool["schema_version"],
-                    "digest": digest,
-                },
-                "inputs": task_inputs,
-                "command": {
-                    "shell": tool["command"]["shell"],
-                    "strict_mode": tool["command"].get("strict_mode", True),
-                    "segments": _command_segments(tool["command"]["template"]),
-                },
-                "outputs": [
-                    {
-                        "name": port["name"],
-                        "type": _type(port),
-                        "expression": {
-                            "kind": port["capture"]["mode"],
-                            "value": port["capture"]["value"],
-                        },
-                    }
-                    for port in sorted(tool["outputs"], key=lambda item: item["name"])
-                ],
-                "runtime": {
-                    "docker": tool["container"]["image"],
-                    **{
-                        key: value
-                        for key, value in tool.get("runtime", {}).items()
-                        if key in {"cpu", "memory_gb", "disk_gb"}
-                    },
-                },
-            }
-        )
+    tasks = [
+        _lower_tool_task(tool, digest)
+        for digest, tool in sorted(used_tools.items(), key=lambda item: item[1]["id"])
+    ]
 
     workflow_inputs = [
         {"name": node["id"], "type": _type(node["port"])}
@@ -228,10 +231,12 @@ def _wdl_literal(value: Any) -> str:
         return str(value).lower()
     if isinstance(value, str):
         return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, list):
+        return "[" + ", ".join(_wdl_literal(item) for item in value) + "]"
     return str(value)
 
 
-def render_wdl(ir: dict[str, Any]) -> str:
+def render_wdl(ir: dict[str, Any], *, include_workflow: bool = True) -> str:
     lines = [f"version {ir['target']['version']}", ""]
     for item in ir.get("imports", []):
         lines.append(f'import "{item["path"]}" as {item["namespace"]}')
@@ -269,6 +274,9 @@ def render_wdl(ir: dict[str, Any]) -> str:
             lines.append(f"    memory: {_wdl_literal(str(task['runtime']['memory_gb']) + ' GB')}")
         lines += ["  }", "}", ""]
 
+    if not include_workflow:
+        return "\n".join(lines)
+
     workflow = ir["workflow"]
     lines += [f"workflow {workflow['name']} {{", "  input {"]
     for item in workflow["inputs"]:
@@ -298,6 +306,19 @@ def render_wdl(ir: dict[str, Any]) -> str:
         lines.append(f"    {_wdl_type(item)} {item['name']} = {value}")
     lines += ["  }", "}", ""]
     return "\n".join(lines)
+
+
+def render_tool_wdl(tool: dict[str, Any]) -> str:
+    uses_directory = any(
+        port.get("wdl_type") == "Directory"
+        for port in [*tool.get("inputs", []), *tool.get("outputs", [])]
+    )
+    ir = {
+        "target": {"version": "development" if uses_directory else "1.0"},
+        "imports": [],
+        "tasks": [_lower_tool_task(tool, canonical_digest(tool))],
+    }
+    return render_wdl(ir, include_workflow=False)
 
 
 def _artifact(name: str, media_type: str, content: str) -> dict[str, str]:

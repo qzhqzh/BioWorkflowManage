@@ -7,6 +7,7 @@ from . import (
     auth_views,
     views,
     wdl_assets,
+    wdl_graph_proposals,
     wdl_tool_packages,
 )
 from .request_ids import request_id, with_request_id
@@ -59,6 +60,7 @@ urlpatterns = [
     ),
     path("tools/<str:tool_id>", views.tool_document),
     path("wdl-packages", wdl_tool_packages.wdl_tool_packages),
+    path("wdl-packages/preview", wdl_tool_packages.preview_wdl_tool_package),
     path("wdl-packages/tags", wdl_tool_packages.wdl_tool_package_tags),
     path(
         "wdl-packages/<slug:slug>/versions",
@@ -96,6 +98,10 @@ urlpatterns = [
     path("wdl-assets/<slug:slug>/export", wdl_assets.export_wdl_asset),
     path("wdl-assets/<slug:slug>/tasks/import", wdl_assets.import_wdl_task),
     path("editor/workflows", views.workflow_documents),
+    path(
+        "editor/workflows/<slug:slug>/tool-package-source",
+        wdl_tool_packages.workflow_tool_package_source,
+    ),
     path("editor/workflows/<slug:slug>", views.workflow_document),
     path("editor/workflows/<slug:slug>/versions", views.workflow_versions),
     path(
@@ -107,6 +113,14 @@ urlpatterns = [
     path(
         "editor/workflows/<slug:slug>/wdl-versions/<int:version>",
         views.wdl_revision_detail,
+    ),
+    path(
+        "editor/workflows/<slug:slug>/wdl-versions/<int:version>/graph-proposals",
+        wdl_graph_proposals.wdl_graph_proposals,
+    ),
+    path(
+        "editor/workflows/<slug:slug>/wdl-graph-proposals/<int:proposal_id>/apply",
+        wdl_graph_proposals.apply_wdl_graph_proposal,
     ),
     # Compatibility alias retained for clients built against the phase-2 preview.
     path("editor/workflows/<slug:slug>/wdl-revisions", views.wdl_revisions),

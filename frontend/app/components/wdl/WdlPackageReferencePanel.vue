@@ -28,6 +28,7 @@ const mountPrefix = ref('')
 const selectedPaths = ref<string[]>([])
 const expanded = ref(false)
 const loading = ref(false)
+const packagesLoaded = ref(false)
 const errorMessage = ref('')
 
 async function loadPackages() {
@@ -38,6 +39,8 @@ async function loadPackages() {
     packages.value = response.results
   } catch {
     errorMessage.value = '工具包读取失败。'
+  } finally {
+    packagesLoaded.value = true
   }
 }
 
@@ -133,7 +136,7 @@ onMounted(() => void loadPackages())
       v-for="reference in references"
       :key="`${reference.package_slug}:${reference.version}:${reference.mount_prefix}`"
       class="wdl-package-reference"
-      :to="`/wdl-packages/${reference.package_slug}`"
+      :to="`/wdl-packages/${reference.package_slug}?version=${encodeURIComponent(reference.version)}`"
     >
       <span>
         <strong>{{ reference.package_name }}</strong>
@@ -143,6 +146,10 @@ onMounted(() => void loadPackages())
     </NuxtLink>
 
     <div v-if="expanded && !readOnly" class="wdl-package-reference-picker">
+      <div v-if="packagesLoaded && !packages.length" class="wdl-package-reference-picker__empty">
+        <span>还没有可引用的工具包。</span>
+        <NuxtLink to="/wdl-packages">创建 WDL 工具包</NuxtLink>
+      </div>
       <label>
         <span>工具包</span>
         <select v-model="packageSlug" @change="selectPackage">
@@ -255,6 +262,21 @@ onMounted(() => void loadPackages())
   gap: 4px;
   color: var(--color-muted);
   font-size: 11px;
+}
+
+.wdl-package-reference-picker__empty {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  color: var(--color-muted);
+  font-size: 11px;
+}
+
+.wdl-package-reference-picker__empty a {
+  color: var(--color-primary);
+  font-weight: 650;
+  text-decoration: none;
 }
 
 .wdl-package-reference-picker select,

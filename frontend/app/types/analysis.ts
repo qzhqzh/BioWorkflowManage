@@ -15,8 +15,20 @@ export interface AnalysisDataset {
   total_size_label: string
 }
 
+export interface AnalysisWorkflowGraphSummary {
+  node_count: number
+  edge_count: number
+  input_count: number
+  tool_count: number
+  subworkflow_count: number
+  output_count: number
+  tools: Array<{ id: string; name: string; version: string }>
+  subworkflows: Array<{ slug: string; name: string; version: number | null }>
+}
+
 export interface AnalysisWorkflow {
   slug: string
+  source_slug?: string
   name: string
   workflow_name: string
   mode: 'single' | 'paired'
@@ -31,6 +43,7 @@ export interface AnalysisWorkflow {
   requires_reference: boolean
   requires_panel: boolean
   reference_status?: Record<string, AnalysisDatabaseOption>
+  graph_summary?: AnalysisWorkflowGraphSummary
 }
 
 export interface AnalysisRequirement {
@@ -112,6 +125,7 @@ export interface AnalysisRun {
     revision: number
     digest: string
     source_type: 'wdl_asset' | 'workflow_version'
+    graph_summary?: AnalysisWorkflowGraphSummary
   }
   sample_id: string
   sample_name: string
@@ -122,10 +136,10 @@ export interface AnalysisRun {
   request: {
     dataset_name: string
     control_dataset_name?: string | null
-    reference_name: string
-    panel_name: string
-    sample_type: string
-    sample_gender: string
+    reference_name?: string | null
+    panel_name?: string | null
+    sample_type?: string
+    sample_gender?: string
   }
   error: string
   outputs: AnalysisRunOutput[]

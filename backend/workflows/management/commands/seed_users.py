@@ -6,7 +6,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.core.management.base import BaseCommand, CommandError
 
-from workflows.auth_roles import ANALYSIS_OPERATOR_GROUP
+from workflows.auth_roles import ANALYSIS_OPERATOR_GROUP, WORKFLOW_MAINTAINER_GROUP
 
 
 DEFAULT_USERNAMES = (
@@ -20,6 +20,11 @@ DEFAULT_USERNAMES = (
 
 ADMIN_USERNAME = "zhuqin"
 OPERATOR_USERNAME = "chaohuaiyu"
+MAINTAINER_USERNAMES = tuple(
+    username
+    for username in DEFAULT_USERNAMES
+    if username not in {ADMIN_USERNAME, OPERATOR_USERNAME}
+)
 
 
 class Command(BaseCommand):
@@ -38,9 +43,12 @@ class Command(BaseCommand):
         created_count = 0
         updated_count = 0
         operator_group, _ = Group.objects.get_or_create(name=ANALYSIS_OPERATOR_GROUP)
-        allow_default_passwords = os.environ.get(
-            "DJANGO_SEED_ALLOW_DEFAULT_PASSWORDS", "0"
-        ) == "1"
+        maintainer_group, _ = Group.objects.get_or_create(
+            name=WORKFLOW_MAINTAINER_GROUP
+        )
+        allow_default_passwords = (
+            os.environ.get("DJANGO_SEED_ALLOW_DEFAULT_PASSWORDS", "0") == "1"
+        )
 
         for username in DEFAULT_USERNAMES:
             user, created = user_model.objects.get_or_create(
@@ -75,8 +83,13 @@ class Command(BaseCommand):
                 created_count += 1
             if username == ADMIN_USERNAME:
                 user.groups.remove(operator_group)
+                user.groups.remove(maintainer_group)
             elif username == OPERATOR_USERNAME:
                 user.groups.add(operator_group)
+                user.groups.remove(maintainer_group)
+            elif username in MAINTAINER_USERNAMES:
+                user.groups.add(maintainer_group)
+                user.groups.remove(operator_group)
 
         self.stdout.write(
             self.style.SUCCESS(

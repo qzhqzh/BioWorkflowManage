@@ -35,6 +35,7 @@ SAFE_SAMPLE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 SAFE_DISPLAY_VALUE = re.compile(r"^[\w\u4e00-\u9fff .()_-]{1,128}$", re.UNICODE)
 MAX_DISCOVERED_FASTQ = 2000
 PUBLISHED_WORKFLOW_PREFIX = "published:"
+WDL_ASSET_WORKFLOW_PREFIX = "wdl-asset:"
 SUPPORTED_PUBLISHED_INPUTS = {
     "bio.fastq.gz.r1",
     "bio.fastq.gz.r2",
@@ -162,7 +163,9 @@ def _parse_miniwdl_timing(
                 event = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            timestamp_value = event.get("timestamp") if isinstance(event, dict) else None
+            timestamp_value = (
+                event.get("timestamp") if isinstance(event, dict) else None
+            )
             if not isinstance(timestamp_value, (int, float)):
                 continue
             timestamp = float(timestamp_value)
@@ -183,7 +186,9 @@ def _parse_miniwdl_timing(
                 if task is None:
                     tasks[source] = {
                         "id": source,
-                        "name": str(event.get("name") or call_name.removeprefix("call-")),
+                        "name": str(
+                            event.get("name") or call_name.removeprefix("call-")
+                        ),
                         "call": call_name,
                         "started_at": timestamp,
                         "finished_at": None,
@@ -200,7 +205,10 @@ def _parse_miniwdl_timing(
             elif message in {"failed", "interrupted"} or message.endswith(" failed"):
                 task["finished_at"] = timestamp
                 task["status"] = "failed"
-            elif message == "docker task exit" and event.get("exit_code") not in (None, 0):
+            elif message == "docker task exit" and event.get("exit_code") not in (
+                None,
+                0,
+            ):
                 task["finished_at"] = timestamp
                 task["status"] = "failed"
 
@@ -223,7 +231,9 @@ def _parse_miniwdl_timing(
         )
     return {
         "execution_seconds": _seconds(observed_end - workflow_start),
-        "task_seconds": _seconds(sum(item["duration_seconds"] for item in payload_tasks)),
+        "task_seconds": _seconds(
+            sum(item["duration_seconds"] for item in payload_tasks)
+        ),
         "cached_tasks": sum(1 for item in payload_tasks if item["cached"]),
         "tasks": payload_tasks,
     }
@@ -422,7 +432,9 @@ def _requirements(entry: dict[str, Any]) -> list[dict[str, Any]]:
         for candidate_path in candidates:
             try:
                 candidate = _safe_path(root, candidate_path)
-                present = candidate.is_dir() if kind == "directory" else candidate.is_file()
+                present = (
+                    candidate.is_dir() if kind == "directory" else candidate.is_file()
+                )
             except AnalysisInputError:
                 present = False
             if present:
@@ -462,7 +474,11 @@ def _catalog_resource_manifest(entry: dict[str, Any]) -> dict[str, Any]:
             continue
         candidates = [
             str(item.get("path") or ""),
-            *[str(path) for path in item.get("alternatives", []) if isinstance(path, str)],
+            *[
+                str(path)
+                for path in item.get("alternatives", [])
+                if isinstance(path, str)
+            ],
         ]
         for relative_path in candidates:
             try:
@@ -505,7 +521,17 @@ def _catalog_entry_payload(entry: dict[str, Any]) -> dict[str, Any]:
     return {
         key: value
         for key, value in entry.items()
-        if key not in {"directories", "required", "bed", "gene_list", "tert_bed", "p1q19_bed", "druggable_region", "cnvkit_db"}
+        if key
+        not in {
+            "directories",
+            "required",
+            "bed",
+            "gene_list",
+            "tert_bed",
+            "p1q19_bed",
+            "druggable_region",
+            "cnvkit_db",
+        }
     } | {
         "ready": all(item["present"] for item in requirements),
         "requirements": requirements,
@@ -513,13 +539,41 @@ def _catalog_entry_payload(entry: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _workflow_payload(slug: str, profile: dict[str, str]) -> dict[str, Any]:
+def _workflow_payload(
+    slug: str,
+    profile: dict[str, str],
+    *,
+    revision_version: int | None = None,
+) -> dict[str, Any]:
     asset = WDLAsset.objects.filter(slug=slug).first()
-    revision = asset.source_revisions.first() if asset else None
+    latest_revision = asset.source_revisions.first() if asset else None
+    revision = (
+        asset.source_revisions.filter(version=revision_version).first()
+        if asset and revision_version is not None
+        else latest_revision
+    )
     diagnostics = revision.analysis.get("diagnostics", []) if revision else []
     errors = [item for item in diagnostics if item.get("severity") == "error"]
+    historical = bool(
+        revision_version is not None
+        and (latest_revision is None or revision_version != latest_revision.version)
+    )
+    workflow_slug = (
+        f"{WDL_ASSET_WORKFLOW_PREFIX}{slug}:{revision_version}" if historical else slug
+    )
+    if asset is None:
+        blockers = ["历史 WDL 资产尚未导入。"]
+    elif revision is None:
+        blockers = [f"WDL revision v{revision_version} 不存在。"]
+    elif errors:
+        blockers = [
+            f"WDL v{revision.version} 有 {len(errors)} 个静态错误，请先在工作台修复。"
+        ]
+    else:
+        blockers = []
     return {
-        "slug": slug,
+        "slug": workflow_slug,
+        "source_slug": slug,
         **profile,
         "source_type": "wdl_asset",
         "requires_reference": True,
@@ -529,12 +583,44 @@ def _workflow_payload(slug: str, profile: dict[str, str]) -> dict[str, Any]:
         "digest": revision.digest if revision else "",
         "ready": bool(asset and revision and not errors),
         "diagnostic_count": len(errors),
-        "blockers": (
-            [f"WDL 当前有 {len(errors)} 个静态错误，请先在工作台修复。"]
-            if errors
-            else ([] if asset else ["历史 WDL 资产尚未导入。"])
-        ),
+        "blockers": blockers,
     }
+
+
+def _managed_wdl_workflows(
+    *, requested_slug: str = "", requested_revision: int | None = None
+) -> list[dict[str, Any]]:
+    results = [
+        _workflow_payload(slug, profile) for slug, profile in WORKFLOW_PROFILES.items()
+    ]
+    profile = WORKFLOW_PROFILES.get(requested_slug)
+    if profile is not None and requested_revision is not None:
+        requested = _workflow_payload(
+            requested_slug,
+            profile,
+            revision_version=requested_revision,
+        )
+        if all(item["slug"] != requested["slug"] for item in results):
+            results.append(requested)
+    return results
+
+
+def _parse_wdl_asset_workflow(value: str) -> tuple[str, int | None]:
+    if not value.startswith(WDL_ASSET_WORKFLOW_PREFIX):
+        return value, None
+    try:
+        slug, version_value = value.removeprefix(WDL_ASSET_WORKFLOW_PREFIX).rsplit(
+            ":", 1
+        )
+        version = int(version_value)
+        if not slug or version < 1:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise AnalysisInputError(
+            "ANALYSIS_WORKFLOW_UNSUPPORTED",
+            "历史 WDL 运行标识无效。",
+        ) from None
+    return slug, version
 
 
 def _workflow_interface(version: WorkflowVersion) -> list[dict[str, Any]]:
@@ -550,6 +636,60 @@ def _workflow_interface(version: WorkflowVersion) -> list[dict[str, Any]]:
         for node in version.workflow_graph.get("nodes", [])
         if node.get("type") == "workflow_input"
     ]
+
+
+def _workflow_graph_summary(version: WorkflowVersion) -> dict[str, Any]:
+    nodes = version.workflow_graph.get("nodes")
+    edges = version.workflow_graph.get("edges")
+    if not isinstance(nodes, list):
+        nodes = []
+    if not isinstance(edges, list):
+        edges = []
+
+    tools = []
+    subworkflows = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        if node.get("type") == "tool":
+            reference = node.get("tool_ref") or {}
+            tools.append(
+                {
+                    "id": reference.get("id") or node.get("id"),
+                    "name": node.get("label") or reference.get("id") or node.get("id"),
+                    "version": reference.get("tool_version") or "",
+                }
+            )
+        elif node.get("type") == "subworkflow":
+            reference = node.get("subworkflow_ref") or {}
+            subworkflows.append(
+                {
+                    "slug": reference.get("slug") or node.get("id"),
+                    "name": node.get("label")
+                    or reference.get("slug")
+                    or node.get("id"),
+                    "version": reference.get("version"),
+                }
+            )
+
+    return {
+        "node_count": len(nodes),
+        "edge_count": len(edges),
+        "input_count": sum(
+            node.get("type") == "workflow_input"
+            for node in nodes
+            if isinstance(node, dict)
+        ),
+        "tool_count": len(tools),
+        "subworkflow_count": len(subworkflows),
+        "output_count": sum(
+            node.get("type") == "workflow_output"
+            for node in nodes
+            if isinstance(node, dict)
+        ),
+        "tools": tools,
+        "subworkflows": subworkflows,
+    }
 
 
 def _published_workflow_payload(
@@ -581,7 +721,9 @@ def _published_workflow_payload(
     if unsupported:
         blockers.append(
             "运行页还不能自动构造输入："
-            + "、".join(str(item.get("label") or item.get("name")) for item in unsupported)
+            + "、".join(
+                str(item.get("label") or item.get("name")) for item in unsupported
+            )
         )
     semantics = {item.get("semantic_type") for item in interface}
     if not {"bio.fastq.gz.r1", "bio.fastq.gz.r2"}.issubset(semantics):
@@ -624,16 +766,18 @@ def _published_workflow_payload(
         "ready": not blockers,
         "diagnostic_count": len(blockers),
         "blockers": blockers,
-        "requires_reference": bool(
-            "bio.annotation.database_dir" in semantics
-        ),
+        "requires_reference": bool("bio.annotation.database_dir" in semantics),
         "requires_panel": False,
         "reference_status": reference_status,
+        "graph_summary": _workflow_graph_summary(version),
     }
 
 
 def _published_workflows(
     references: list[dict[str, Any]] | None = None,
+    *,
+    requested_slug: str = "",
+    requested_revision: int | None = None,
 ) -> list[dict[str, Any]]:
     latest_ids = []
     for document in WorkflowDocument.objects.filter(
@@ -642,29 +786,50 @@ def _published_workflows(
         version = document.versions.order_by("-version").first()
         if version is not None:
             latest_ids.append(version.pk)
+    if requested_slug and requested_revision is not None:
+        requested_id = (
+            WorkflowVersion.objects.filter(
+                workflow__slug=requested_slug,
+                workflow__kind=WorkflowDocument.Kind.WORKFLOW,
+                version=requested_revision,
+            )
+            .values_list("pk", flat=True)
+            .first()
+        )
+        if requested_id is not None and requested_id not in latest_ids:
+            latest_ids.append(requested_id)
     versions = WorkflowVersion.objects.select_related("workflow").filter(
         pk__in=latest_ids
     )
     return [
         _published_workflow_payload(version, references)
-        for version in sorted(versions, key=lambda item: item.workflow.slug)
+        for version in sorted(
+            versions,
+            key=lambda item: (item.workflow.slug, item.version),
+        )
     ]
 
 
 def _parse_published_workflow(value: str) -> WorkflowVersion:
     try:
-        slug, version_value = value.removeprefix(PUBLISHED_WORKFLOW_PREFIX).rsplit(":", 1)
+        slug, version_value = value.removeprefix(PUBLISHED_WORKFLOW_PREFIX).rsplit(
+            ":", 1
+        )
         version = int(version_value)
     except (TypeError, ValueError):
         raise AnalysisInputError(
             "ANALYSIS_WORKFLOW_UNSUPPORTED",
             "已发布 Workflow 标识无效。",
         ) from None
-    item = WorkflowVersion.objects.select_related("workflow").filter(
-        workflow__slug=slug,
-        version=version,
-        kind=WorkflowDocument.Kind.WORKFLOW,
-    ).first()
+    item = (
+        WorkflowVersion.objects.select_related("workflow")
+        .filter(
+            workflow__slug=slug,
+            version=version,
+            kind=WorkflowDocument.Kind.WORKFLOW,
+        )
+        .first()
+    )
     if item is None:
         raise AnalysisInputError(
             "ANALYSIS_WORKFLOW_MISSING",
@@ -682,7 +847,10 @@ def _parse_published_workflow(value: str) -> WorkflowVersion:
 
 def _compile_published_workflow(version: WorkflowVersion) -> tuple[dict[str, Any], str]:
     bundle = version.compiled_bundle
-    if not isinstance(bundle, dict) or _canonical_digest(bundle) != version.compiled_digest:
+    if (
+        not isinstance(bundle, dict)
+        or _canonical_digest(bundle) != version.compiled_digest
+    ):
         raise AnalysisInputError(
             "ANALYSIS_WORKFLOW_INVALID",
             "已发布 Workflow 的固定编译产物校验失败。",
@@ -757,7 +925,9 @@ def _validate_annotation_reference(
         tool_ref = node.get("tool_ref") or {}
         if tool_ref.get("id") not in annotation_tool_ids:
             continue
-        configured_build = str((node.get("parameter_values") or {}).get("ref_version") or "")
+        configured_build = str(
+            (node.get("parameter_values") or {}).get("ref_version") or ""
+        )
         if configured_build != selected_build:
             raise AnalysisInputError(
                 "ANALYSIS_REFERENCE_MISMATCH",
@@ -839,7 +1009,9 @@ def _annotation_reference_entry(
     return {**reference, "required": scoped_required}
 
 
-def _find_by_id(entries: list[dict[str, Any]], entry_id: str, label: str) -> dict[str, Any]:
+def _find_by_id(
+    entries: list[dict[str, Any]], entry_id: str, label: str
+) -> dict[str, Any]:
     entry = next((item for item in entries if item.get("id") == entry_id), None)
     if entry is None:
         raise AnalysisInputError(
@@ -1069,7 +1241,9 @@ def _output_payload(run: AnalysisRun) -> list[dict[str, Any]]:
     return payload
 
 
-def analysis_run_payload(run: AnalysisRun, *, include_events: bool = False) -> dict[str, Any]:
+def analysis_run_payload(
+    run: AnalysisRun, *, include_events: bool = False
+) -> dict[str, Any]:
     if run.workflow_version_id:
         workflow_payload = {
             "slug": run.workflow_version.workflow.slug,
@@ -1078,6 +1252,7 @@ def analysis_run_payload(run: AnalysisRun, *, include_events: bool = False) -> d
             "revision": run.workflow_version.version,
             "digest": run.source_digest,
             "source_type": "workflow_version",
+            "graph_summary": _workflow_graph_summary(run.workflow_version),
         }
     else:
         workflow_payload = {
@@ -1127,21 +1302,34 @@ def analysis_catalog(request):
     try:
         catalog = load_database_catalog()
         reference_entries = catalog["references"]
-        references = [
-            _catalog_entry_payload(item) for item in reference_entries
-        ]
+        references = [_catalog_entry_payload(item) for item in reference_entries]
         panels = [_catalog_entry_payload(item) for item in catalog["panels"]]
         catalog_error = None
     except AnalysisInputError as error:
         references = []
         reference_entries = []
         panels = []
-        catalog_error = {"code": error.code, "message": str(error), "details": error.details}
+        catalog_error = {
+            "code": error.code,
+            "message": str(error),
+            "details": error.details,
+        }
         catalog = {"schema_version": 1}
-    workflows = [
-        _workflow_payload(slug, profile)
-        for slug, profile in WORKFLOW_PROFILES.items()
-    ] + _published_workflows(reference_entries)
+    requested_slug = str(request.query_params.get("workflow") or "")
+    try:
+        requested_revision = int(request.query_params.get("revision"))
+    except (TypeError, ValueError):
+        requested_revision = None
+    if requested_revision is not None and requested_revision < 1:
+        requested_revision = None
+    workflows = _managed_wdl_workflows(
+        requested_slug=requested_slug,
+        requested_revision=requested_revision,
+    ) + _published_workflows(
+        reference_entries,
+        requested_slug=requested_slug,
+        requested_revision=requested_revision,
+    )
     return Response(
         {
             "rawdata_directory": "workspace/rawdata",
@@ -1183,11 +1371,10 @@ def analysis_runs(request):
         )
         if workflow_slug.startswith(PUBLISHED_WORKFLOW_PREFIX):
             workflow_version = _parse_published_workflow(workflow_slug)
-            source_bundle, source_digest = _compile_published_workflow(
-                workflow_version
-            )
+            source_bundle, source_digest = _compile_published_workflow(workflow_version)
             interface_semantics = {
-                item.get("semantic_type") for item in _workflow_interface(workflow_version)
+                item.get("semantic_type")
+                for item in _workflow_interface(workflow_version)
             }
             reference = None
             if "bio.annotation.database_dir" in interface_semantics:
@@ -1205,15 +1392,17 @@ def analysis_runs(request):
                     raise AnalysisInputError(
                         "ANALYSIS_DATABASE_INCOMPLETE",
                         "所选参考版本的数据库尚未就绪。",
-                        details={"missing": [item for item in requirements if not item["present"]]},
+                        details={
+                            "missing": [
+                                item for item in requirements if not item["present"]
+                            ]
+                        },
                     )
                 _validate_annotation_reference(workflow_version, reference)
             input_values = _published_inputs(workflow_version, dataset, reference)
             input_manifest = _dataset_manifest(dataset)
             database_manifest = (
-                _catalog_resource_manifest(annotation_reference)
-                if reference
-                else None
+                _catalog_resource_manifest(annotation_reference) if reference else None
             )
             run = AnalysisRun.objects.create(
                 workflow_version=workflow_version,
@@ -1234,12 +1423,21 @@ def analysis_runs(request):
                     "input_digest": _canonical_digest(input_manifest),
                     "input_resource_manifest": input_manifest,
                     "database_digest": (
-                        _canonical_digest(database_manifest) if database_manifest else None
+                        _canonical_digest(database_manifest)
+                        if database_manifest
+                        else None
                     ),
                     "database_resource_manifest": database_manifest,
                     "dataset": dataset["id"],
                     "dataset_name": dataset["name"],
+                    "control_dataset_name": None,
                     "reference": reference["id"] if reference else None,
+                    "reference_name": (
+                        reference.get("name", reference["id"]) if reference else None
+                    ),
+                    "panel_name": None,
+                    "sample_type": str(request.data.get("sample_type") or ""),
+                    "sample_gender": str(request.data.get("sample_gender") or ""),
                 },
                 input_values=input_values,
             )
@@ -1249,18 +1447,30 @@ def analysis_runs(request):
                 status=status.HTTP_201_CREATED,
             )
 
-        profile = WORKFLOW_PROFILES.get(workflow_slug)
+        asset_slug, requested_asset_revision = _parse_wdl_asset_workflow(workflow_slug)
+        profile = WORKFLOW_PROFILES.get(asset_slug)
         if profile is None:
             raise AnalysisInputError(
                 "ANALYSIS_WORKFLOW_UNSUPPORTED",
                 "当前运行页只允许已配置的受管 WDL。",
             )
-        asset = WDLAsset.objects.filter(slug=workflow_slug).first()
-        revision = asset.source_revisions.first() if asset else None
-        if asset is None or revision is None:
+        asset = WDLAsset.objects.filter(slug=asset_slug).first()
+        revision = (
+            asset.source_revisions.filter(version=requested_asset_revision).first()
+            if asset and requested_asset_revision is not None
+            else asset.source_revisions.first()
+            if asset
+            else None
+        )
+        if asset is None:
             raise AnalysisInputError(
                 "ANALYSIS_WORKFLOW_MISSING",
                 "所选历史 WDL 尚未导入。",
+            )
+        if revision is None:
+            raise AnalysisInputError(
+                "ANALYSIS_WORKFLOW_MISSING",
+                f"所选 WDL revision v{requested_asset_revision} 不存在。",
             )
         errors = [
             item
@@ -1333,7 +1543,9 @@ def analysis_runs(request):
             },
         )
     except AnalysisInputError as error:
-        return _error(error.code, str(error), status.HTTP_400_BAD_REQUEST, details=error.details)
+        return _error(
+            error.code, str(error), status.HTTP_400_BAD_REQUEST, details=error.details
+        )
 
     input_manifest = {
         "primary": _dataset_manifest(dataset),
@@ -1351,6 +1563,8 @@ def analysis_runs(request):
         submitted_by=_actor_user(request),
         request_payload={
             "workflow": workflow_slug,
+            "wdl_revision": revision.version,
+            "wdl_revision_digest": revision.digest,
             "dataset": dataset["id"],
             "dataset_name": dataset["name"],
             "control_dataset": control["id"] if control else None,
@@ -1372,7 +1586,9 @@ def analysis_runs(request):
         input_values=input_values,
     )
     AnalysisRunEvent.objects.create(run=run, message="运行已进入队列。")
-    return Response(analysis_run_payload(run, include_events=True), status=status.HTTP_201_CREATED)
+    return Response(
+        analysis_run_payload(run, include_events=True), status=status.HTTP_201_CREATED
+    )
 
 
 @api_view(["GET"])

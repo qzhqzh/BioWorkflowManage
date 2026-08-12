@@ -7,8 +7,9 @@ from dataclasses import dataclass
 from typing import Any
 
 import WDL
+from django.db import IntegrityError, transaction
 
-from compiler_core import validate_tool_spec
+from compiler_core import canonical_digest, validate_tool_spec
 
 from .models import (
     ToolDocument,
@@ -346,6 +347,8 @@ def import_package_task_as_tool_draft(
     task_name: str,
     actor: str,
     replace: bool = False,
+    base_draft_version: int | None = None,
+    base_draft_digest: str = "",
 ) -> tuple[ToolDocument, bool, list[str]]:
     tool_spec, warnings = build_package_task_draft(
         package_version=package_version,
@@ -353,25 +356,25 @@ def import_package_task_as_tool_draft(
         task_name=task_name,
         actor=actor,
     )
-    existing = ToolDocument.objects.filter(tool_id=tool_spec["id"]).first()
-    if existing is not None and not replace:
+    def same_source(existing: ToolDocument) -> bool:
         source = existing.draft_spec.get("metadata", {}).get("source_wdl", {})
         incoming = tool_spec["metadata"]["source_wdl"]
-        if all(
+        return all(
             source.get(key) == incoming.get(key)
             for key in ("package_slug", "package_version", "file_path", "task_name", "source_digest")
-        ):
-            return existing, False, source.get("migration_warnings", [])
-        raise WDLTaskImportError(
-            "TOOL_DRAFT_EXISTS",
-            f"Tool draft {tool_spec['id']} already exists; review it before replacing the source.",
         )
-    validation = validate_tool_spec(tool_spec)
-    document, created = ToolDocument.objects.update_or_create(
-        tool_id=tool_spec["id"],
-        defaults={"draft_spec": tool_spec, "validation": validation},
+
+    return _persist_imported_tool_draft(
+        tool_spec=tool_spec,
+        warnings=warnings,
+        replace=replace,
+        base_draft_version=base_draft_version,
+        base_draft_digest=base_draft_digest,
+        same_source=same_source,
+        exists_message=(
+            f"Tool draft {tool_spec['id']} already exists; review it before replacing the source."
+        ),
     )
-    return document, created, warnings
 
 
 def import_task_as_tool_draft(
@@ -383,6 +386,8 @@ def import_task_as_tool_draft(
     actor: str,
     tool_id: str = "",
     replace: bool = False,
+    base_draft_version: int | None = None,
+    base_draft_digest: str = "",
 ) -> tuple[ToolDocument, bool, list[str]]:
     tool_spec, warnings = build_tool_draft(
         asset=asset,
@@ -392,22 +397,90 @@ def import_task_as_tool_draft(
         actor=actor,
         tool_id=tool_id,
     )
-    existing = ToolDocument.objects.filter(tool_id=tool_spec["id"]).first()
-    if existing is not None and not replace:
+    def same_source(existing: ToolDocument) -> bool:
         source = existing.draft_spec.get("metadata", {}).get("source_wdl", {})
-        if (
+        return (
             source.get("file_path") == source_file.path
             and source.get("task_name") == task_name
             and source.get("source_digest") == digest(source_file.content)
-        ):
-            return existing, False, source.get("migration_warnings", [])
-        raise WDLTaskImportError(
-            "TOOL_DRAFT_EXISTS",
-            f"Tool draft {tool_spec['id']} already exists; choose another tool ID.",
         )
-    validation = validate_tool_spec(tool_spec)
-    document, created = ToolDocument.objects.update_or_create(
-        tool_id=tool_spec["id"],
-        defaults={"draft_spec": tool_spec, "validation": validation},
+
+    return _persist_imported_tool_draft(
+        tool_spec=tool_spec,
+        warnings=warnings,
+        replace=replace,
+        base_draft_version=base_draft_version,
+        base_draft_digest=base_draft_digest,
+        same_source=same_source,
+        exists_message=(
+            f"Tool draft {tool_spec['id']} already exists; choose another tool ID."
+        ),
     )
-    return document, created, warnings
+
+
+def _persist_imported_tool_draft(
+    *,
+    tool_spec: dict,
+    warnings: list[str],
+    replace: bool,
+    base_draft_version: int | None,
+    base_draft_digest: str,
+    same_source,
+    exists_message: str,
+) -> tuple[ToolDocument, bool, list[str]]:
+    validation = validate_tool_spec(tool_spec)
+
+    def update_existing(document: ToolDocument):
+        if not replace:
+            if same_source(document):
+                source = document.draft_spec.get("metadata", {}).get("source_wdl", {})
+                return document, False, source.get("migration_warnings", [])
+            raise WDLTaskImportError("TOOL_DRAFT_EXISTS", exists_message)
+        if base_draft_version is None or not base_draft_digest:
+            raise WDLTaskImportError(
+                "TOOL_DRAFT_PRECONDITION_REQUIRED",
+                "Replacing a tool draft requires its current version and digest.",
+            )
+        current_digest = canonical_digest(document.draft_spec)
+        if (
+            base_draft_version != document.draft_version
+            or base_draft_digest != current_digest
+        ):
+            raise WDLTaskImportError(
+                "TOOL_DRAFT_CONFLICT",
+                "Tool draft changed after it was loaded. Reload before replacing it.",
+            )
+        document.draft_spec = tool_spec
+        document.validation = validation
+        document.draft_version += 1
+        document.save(
+            update_fields=[
+                "draft_spec",
+                "validation",
+                "draft_version",
+                "updated_at",
+            ]
+        )
+        return document, False, warnings
+
+    with transaction.atomic():
+        existing = (
+            ToolDocument.objects.select_for_update()
+            .filter(tool_id=tool_spec["id"])
+            .first()
+        )
+        if existing is not None:
+            return update_existing(existing)
+        try:
+            with transaction.atomic():
+                document = ToolDocument.objects.create(
+                    tool_id=tool_spec["id"],
+                    draft_spec=tool_spec,
+                    validation=validation,
+                )
+        except IntegrityError:
+            existing = ToolDocument.objects.select_for_update().get(
+                tool_id=tool_spec["id"]
+            )
+            return update_existing(existing)
+        return document, True, warnings

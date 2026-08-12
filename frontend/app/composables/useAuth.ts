@@ -1,19 +1,20 @@
-export type AppSection = 'edit' | 'tools' | 'packages' | 'artifacts' | 'runs' | 'wdl' | 'help'
+export type AppSection = 'overview' | 'edit' | 'tools' | 'packages' | 'artifacts' | 'runs' | 'wdl' | 'help'
 
 export type AuthUser = {
   username: string
   first_name?: string
   last_name?: string
   is_admin: boolean
-  role: 'admin' | 'analysis_operator' | 'restricted'
+  role: 'admin' | 'workflow_maintainer' | 'analysis_operator' | 'restricted'
   allowed_sections: AppSection[]
 }
 
 export function defaultRouteForUser(user: AuthUser): string {
-  return user.allowed_sections.includes('wdl') ? '/wdl' : '/runs'
+  return user.allowed_sections.includes('overview') ? '/overview' : '/runs'
 }
 
 export function routeSection(path: string, section?: unknown): AppSection {
+  if (path.startsWith('/overview')) return 'overview'
   if (path.startsWith('/runs')) return 'runs'
   if (path.startsWith('/wdl-packages')) return 'packages'
   if (path.startsWith('/wdl')) return 'wdl'

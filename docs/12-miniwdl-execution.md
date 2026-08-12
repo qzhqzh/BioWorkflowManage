@@ -88,6 +88,11 @@ DJANGO_SEED_ALLOW_DEFAULT_PASSWORDS=1 docker compose run --rm \
 
 该命令幂等地创建默认测试用户和 3 个 Phase 1 示例流程。若同时需要导入历史实体瘤/血液肿瘤 WDL，先把 WDL 源码目录挂载到新环境，再执行：
 
+默认角色分工为：`zhuqin` 是管理员；`chaohuaiyu` 是只能使用运行分析的
+`analysis_operator`；其余默认用户是可维护 WDL、工具包、工具和流程的
+`workflow_maintainer`。数据库迁移会为已存在的默认用户补齐该分组，
+`seed_users` 会在重复执行时保持这些默认分组。
+
 ```bash
 DJANGO_SEED_ALLOW_DEFAULT_PASSWORDS=1 docker compose run --rm \
   -v /path/to/tumor_wdl:/mnt/tumor_wdl:ro \

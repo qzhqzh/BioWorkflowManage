@@ -31,13 +31,15 @@ import WorkflowInspectorPanel from '~/components/editor/WorkflowInspectorPanel.v
 import HelpWorkspace from '~/components/libraries/HelpWorkspace.vue'
 import ToolLibraryWorkspace from '~/components/libraries/ToolLibraryWorkspace.vue'
 import WorkflowLibraryWorkspace from '~/components/libraries/WorkflowLibraryWorkspace.vue'
+import type { AppSection } from '~/composables/useAuth'
 
 const { $api: $fetch } = useNuxtApp()
+const { navigateSection } = useAppNavigation()
 
 type CompileState = 'idle' | 'running' | 'success' | 'error'
 type LibraryTab = 'tools' | 'subworkflows' | 'inputs' | 'outputs'
 type LayoutState = 'idle' | 'running' | 'success' | 'error'
-type RailSection = 'edit' | 'tools' | 'packages' | 'artifacts' | 'runs' | 'wdl' | 'help'
+type RailSection = 'edit' | 'tools' | 'artifacts' | 'help'
 type SaveState = 'loading' | 'saved' | 'saving' | 'error'
 
 interface Diagnostic {
@@ -62,6 +64,8 @@ interface ToolRegistryEntry {
   latest_digest: string | null
   version_count: number
   draft_status?: string | null
+  draft_version?: string | null
+  draft_digest?: string | null
   draft_updated_at?: string | null
   description?: string
   source_wdl?: {
@@ -93,6 +97,8 @@ interface WorkflowLibraryEntry {
   kind?: 'workflow' | 'subworkflow'
   latest_version: number | null
   updated_at: string
+  created_by?: string
+  is_mine?: boolean
 }
 interface WorkflowInterfacePort {
   name: string
@@ -115,6 +121,17 @@ interface WorkflowVersionEntry {
   semantic_digest: string
   interface_contract: WorkflowInterfaceContract
 }
+interface WorkflowVersionSnapshot extends WorkflowVersionEntry {
+  workflow_graph: Record<string, any>
+  tool_specs: Record<string, any>[]
+  editor_document: WorkflowDocumentPayload['editor_document']
+  compiled_bundle: {
+    entrypoint?: string
+    files?: Record<string, string>
+  }
+  compiled_digest: string
+  compiler_profile: string
+}
 interface WorkflowDocumentPayload {
   slug: string
   name: string
@@ -122,10 +139,18 @@ interface WorkflowDocumentPayload {
   kind: 'workflow' | 'subworkflow'
   workflow_graph: Record<string, any>
   tool_specs: Record<string, any>[]
+  updated_by: string
+  updated_at: string
+  document_version: number
+  document_digest: string
   editor_document: {
     nodes?: Array<{ id: string; position: XYPosition }>
     viewport?: { x: number; y: number; zoom: number }
   }
+}
+interface WorkflowDocumentConflict {
+  remote: WorkflowDocumentPayload
+  baseVersion: number
 }
 interface CompilationHistoryRecord {
   id: number
@@ -138,14 +163,65 @@ interface WdlRevision {
   id?: number
   version: number
   source: 'system' | 'manual'
-  content: string
+  artifact_role?: 'compiled_snapshot' | 'derived_draft'
+  executable?: boolean
+  digest?: string
+  content?: string
   workflow_version?: number | null
+  base_workflow_version?: {
+    version: number
+    semantic_digest: string
+    compiler_profile: string
+  } | null
+  run_source?: {
+    type: 'workflow_version'
+    version: number
+    semantic_digest: string
+  } | null
+  base_wdl_revision?: number | null
+  created_by?: string
+  note?: string
   validation?: { status?: string; diagnostics?: Diagnostic[] }
   created_at: string
+}
+interface WdlGraphProposalChange {
+  kind: string
+  subject: string
+  detail: string
+}
+interface WdlGraphProposalToolDraft {
+  tool_id: string
+  base_version: string | null
+  proposed_version: string
+  changed_fields: string[]
+  field_diffs?: Array<{
+    field: string
+    label: string
+    before: unknown
+    after: unknown
+  }>
+}
+interface WdlGraphProposal {
+  id: number
+  status: 'ready' | 'blocked' | 'applied'
+  proposal_digest: string
+  base_document_version: number
+  base_document_digest: string
+  summary: {
+    workflow_change_count: number
+    tool_draft_count: number
+    instance_change_count: number
+  }
+  changes: Record<string, WdlGraphProposalChange[]>
+  required_confirmations: string[]
+  warnings: string[]
+  blocking_issues: string[]
+  tool_drafts: WdlGraphProposalToolDraft[]
 }
 interface CompilationVersion {
   id: string
   version: string
+  workflowVersion?: number | null
   createdAt: string
   status: 'succeeded' | 'failed'
   artifacts: Artifact[]
@@ -204,6 +280,19 @@ interface NodeBounds {
 }
 
 const route = useRoute()
+const requestedWorkflowOwner = computed(() => (
+  route.query.owner === 'mine' || route.query.owner === 'shared'
+    ? route.query.owner
+    : 'all'
+))
+const requestedWorkflowKind = computed(() => (
+  route.query.kind === 'workflow' || route.query.kind === 'subworkflow'
+    ? route.query.kind
+    : 'all'
+))
+const requestedToolInspectorView = computed<'version' | 'draft'>(() =>
+  route.query.toolDraft === '1' ? 'draft' : 'version',
+)
 const activeLibrary = ref<LibraryTab>('tools')
 const activeRail = ref<RailSection>('edit')
 const searchQuery = ref('')
@@ -222,15 +311,23 @@ const registryTools = ref<ToolRegistryEntry[]>([])
 const toolRegistryLoaded = ref(false)
 const selectedToolId = ref('')
 const selectedToolVersions = ref<ToolVersionEntry[]>([])
+const selectedToolVersion = ref('')
 const selectedToolSpec = ref<Record<string, any>>()
 const toolDraft = ref<Record<string, any>>()
+const toolDraftBaseVersion = ref<number>()
+const toolDraftBaseDigest = ref<string>()
 const toolDraftState = ref<'idle' | 'saving' | 'saved' | 'publishing' | 'published' | 'error'>('idle')
 const toolDraftValidationStatus = ref<string>()
 const toolOperationError = ref<ToolOperationError>()
 const creatingTool = ref(false)
 const newToolId = ref('')
 const toolCreateState = ref<'idle' | 'saving' | 'error'>('idle')
+const workflowCreateState = ref<'idle' | 'saving' | 'success' | 'error'>('idle')
+const workflowCreateError = ref('')
+const workflowCreateRequest = ref<'workflow' | 'subworkflow'>()
 const workflowDocuments = ref<WorkflowLibraryEntry[]>([])
+const workflowLibraryState = ref<'loading' | 'ready' | 'error'>('loading')
+const workflowLibraryError = ref('')
 const subworkflowVersions = ref<WorkflowVersionEntry[]>([])
 const subworkflowUpgradeTargetVersion = ref<number>()
 const subworkflowUpgradeState = ref<'idle' | 'saving' | 'success' | 'warning' | 'error'>('idle')
@@ -241,12 +338,27 @@ const workflowSwitchState = ref<'idle' | 'loading' | 'error'>('idle')
 const switchingWorkflowSlug = ref('')
 const workflowDescription = ref('')
 const workflowKind = ref<'workflow' | 'subworkflow'>('workflow')
+const workflowNavigationStack = ref<Array<{ slug: string; name: string }>>([])
+const selectedWorkflowVersionSnapshot = ref<WorkflowVersionSnapshot>()
+const workflowDocumentVersion = ref(0)
+const workflowDocumentDigest = ref('')
+const workflowSavedSnapshot = ref('')
+const workflowConflict = ref<WorkflowDocumentConflict>()
+const workflowConflictDraftDownloaded = ref(false)
 const editingWorkflowMetadata = ref(false)
 const wdlRevisions = ref<WdlRevision[]>([])
 const selectedWdlVersion = ref<number>()
+const wdlRevisionLoadState = ref<'idle' | 'loading' | 'error'>('idle')
 const editingWdl = ref(false)
 const wdlDraft = ref('')
+const wdlEditBaseRevision = ref<WdlRevision>()
 const wdlSaveState = ref<'idle' | 'saving' | 'error'>('idle')
+const wdlAssetCreateState = ref<'idle' | 'saving' | 'error'>('idle')
+const wdlAssetCreateError = ref('')
+const wdlGraphProposal = ref<WdlGraphProposal>()
+const wdlGraphProposalState = ref<'idle' | 'loading' | 'applying' | 'error'>('idle')
+const wdlGraphProposalError = ref('')
+const wdlGraphConfirmations = ref<string[]>([])
 const previewDrawerArtifact = ref<Artifact>()
 const lastSavedAt = ref<Date>()
 const workflowGraph = ref<Record<string, any>>()
@@ -272,6 +384,7 @@ let layoutFeedbackTimer: number | undefined
 let positionSaveTimer: number | undefined
 let autosaveTimer: number | undefined
 let workflowLoadSequence = 0
+let wdlRevisionLoadSequence = 0
 
 const workflowInputs = [
   { id: 'file', name: 'File', description: '文件或对象存储路径' },
@@ -303,6 +416,7 @@ const visibleTools = computed(() => registryTools.value.map((tool) => ({
       ? '有效草稿'
       : '草稿待修正',
   isDraftOnly: !tool.latest_version,
+  versionCount: tool.version_count,
 })))
 
 const filteredTools = computed(() => {
@@ -332,6 +446,25 @@ const currentWorkflowName = computed(() =>
   ?? workflowDocuments.value.find((item) => item.slug === selectedWorkflowSlug.value)?.name
   ?? selectedWorkflowSlug.value,
 )
+const currentWorkflowDocument = computed(() =>
+  workflowDocuments.value.find(item => item.slug === selectedWorkflowSlug.value),
+)
+const currentWorkflowPublished = computed(() => Boolean(currentWorkflowDocument.value?.latest_version))
+const subworkflowGuide = computed(() => {
+  const inputIds = new Set(nodes.value.filter(node => node.data?.kind === 'input').map(node => node.id))
+  const implementationIds = new Set(
+    nodes.value.filter(node => node.data?.kind === 'tool' || node.data?.kind === 'subworkflow').map(node => node.id),
+  )
+  const outputIds = new Set(nodes.value.filter(node => node.data?.kind === 'output').map(node => node.id))
+  const hasInputConnection = edges.value.some(edge => inputIds.has(edge.source) && implementationIds.has(edge.target))
+  const hasOutputConnection = edges.value.some(edge => implementationIds.has(edge.source) && outputIds.has(edge.target))
+  return {
+    inputReady: inputIds.size > 0,
+    implementationReady: implementationIds.size > 0,
+    outputReady: outputIds.size > 0,
+    connected: hasInputConnection && hasOutputConnection,
+  }
+})
 const isWorkflowSwitching = computed(() => workflowSwitchState.value === 'loading')
 
 const nodes = shallowRef<Node<WorkflowNodeData>[]>([
@@ -502,14 +635,54 @@ const selectedCompilation = computed(() =>
 const previewArtifact = computed(() =>
   (selectedCompilation.value?.artifacts ?? artifacts.value).find((item) => item.name.endsWith('.wdl')),
 )
-const selectedWdlRevision = computed(() =>
-  wdlRevisions.value.find((revision) => revision.version === selectedWdlVersion.value)
-    ?? wdlRevisions.value[0],
-)
-const activeWdlContent = computed(() =>
-  selectedWdlRevision.value?.content ?? previewArtifact.value?.content ?? '',
-)
+const selectedWdlRevision = computed(() => {
+  if (selectedWdlVersion.value !== undefined) {
+    return wdlRevisions.value.find(
+      revision => revision.version === selectedWdlVersion.value,
+    )
+  }
+  return wdlRevisions.value[0]
+})
+const activeWdlContent = computed(() => {
+  const snapshot = selectedWorkflowVersionSnapshot.value
+  if (snapshot) {
+    const entrypoint = snapshot.compiled_bundle?.entrypoint ?? 'workflow.wdl'
+    return snapshot.compiled_bundle?.files?.[entrypoint] ?? ''
+  }
+  if (selectedWdlVersion.value !== undefined) {
+    return selectedWdlRevision.value?.content ?? ''
+  }
+  return previewArtifact.value?.content ?? ''
+})
 const previewLines = computed(() => activeWdlContent.value.split('\n'))
+const workflowConflictSummary = computed(() => {
+  const conflict = workflowConflict.value
+  if (!conflict) return undefined
+  const localGraph = graphWithCurrentLayout()
+  const remoteGraph = conflict.remote.workflow_graph ?? {}
+  const localNodes = new Map(
+    (localGraph.nodes ?? []).map((node: Record<string, any>) => [node.id, node]),
+  )
+  const remoteNodes = new Map(
+    (remoteGraph.nodes ?? []).map((node: Record<string, any>) => [node.id, node]),
+  )
+  const localOnly = [...localNodes.keys()].filter(id => !remoteNodes.has(id))
+  const remoteOnly = [...remoteNodes.keys()].filter(id => !localNodes.has(id))
+  const changed = [...localNodes.keys()].filter(id =>
+    remoteNodes.has(id)
+    && JSON.stringify(localNodes.get(id)) !== JSON.stringify(remoteNodes.get(id)),
+  )
+  return {
+    localNodeCount: localNodes.size,
+    remoteNodeCount: remoteNodes.size,
+    localOnly,
+    remoteOnly,
+    changed,
+    metadataChanged:
+      currentWorkflowName.value !== conflict.remote.name
+      || workflowDescription.value !== (conflict.remote.description ?? ''),
+  }
+})
 const lastSavedLabel = computed(() => {
   if (!lastSavedAt.value) return '尚未自动保存'
   return `上次保存 ${new Intl.DateTimeFormat('zh-CN', {
@@ -620,6 +793,24 @@ const selectedToolSpecForNode = computed(() => {
   ) ?? toolSpecs.value.find((spec) =>
     spec.id === data.label.toLowerCase() || spec.name === data.label,
   )
+})
+
+const selectedToolLifecycle = computed(() => {
+  const data = selectedData.value
+  if (data?.kind !== 'tool' || !data.toolId) return undefined
+  const registry = registryTools.value.find(item => item.tool_id === data.toolId)
+  const isDraft = Boolean(
+    data.toolDigest
+    && registry?.draft_digest
+    && data.toolDigest === registry.draft_digest,
+  )
+  return {
+    toolId: data.toolId,
+    version: String(data.version ?? ''),
+    isDraft,
+    draftStatus: registry?.draft_status ?? null,
+    latestVersion: registry?.latest_version ?? null,
+  }
 })
 
 const selectedToolInputs = computed<Record<string, any>[]>(() =>
@@ -1483,7 +1674,7 @@ async function addLibraryNode(payload: LibraryDragPayload, position: XYPosition)
     nodes.value = [...nodes.value, nextNode]
     selectedNodeId.value = nextNode.id
     await nextTick()
-    await saveWorkflow(true)
+    if (!await saveWorkflow(true)) return
     showLayoutFeedback(`已添加 ${(nextNode.data as WorkflowNodeData).label}`, 'success')
   } catch (error) {
     console.error('Failed to add library node', error)
@@ -1653,11 +1844,15 @@ async function compileWorkflow() {
     compileState.value === 'running'
     || isWorkflowSwitching.value
     || saveState.value === 'saving'
+    || editingWdl.value
   ) return
   compileState.value = 'running'
   const workflowSlug = selectedWorkflowSlug.value
   try {
-    await saveWorkflow()
+    if (!await saveWorkflow()) {
+      compileState.value = 'idle'
+      return
+    }
     if (workflowSlug !== selectedWorkflowSlug.value) {
       compileState.value = 'idle'
       return
@@ -1666,7 +1861,11 @@ async function compileWorkflow() {
       `/api/v1/editor/workflows/${encodeURIComponent(workflowSlug)}/versions`,
       {
         method: 'POST',
-        body: { reuse_unchanged: true },
+        body: {
+          reuse_unchanged: true,
+          base_document_version: workflowDocumentVersion.value,
+          base_document_digest: workflowDocumentDigest.value,
+        },
       },
     )
     const response = await $fetch<{
@@ -1688,6 +1887,7 @@ async function compileWorkflow() {
     const version: CompilationVersion = {
       id: `compile-${Date.now()}`,
       version: `v${publishedVersion.version}`,
+      workflowVersion: publishedVersion.version,
       createdAt: new Intl.DateTimeFormat('zh-CN', {
         month: '2-digit',
         day: '2-digit',
@@ -1700,8 +1900,10 @@ async function compileWorkflow() {
     compilationVersions.value = [version, ...compilationVersions.value]
     selectedCompilationId.value = version.id
     await loadWdlRevisions()
+    await loadWorkflowLibrary()
     inspectorTab.value = response.status === 'succeeded' ? 'artifacts' : 'diagnostics'
     activeRail.value = response.status === 'succeeded' ? 'artifacts' : 'edit'
+    syncWorkspaceRoute(activeRail.value)
   } catch (error: any) {
     const data = error?.data
     diagnostics.value = data?.validation?.diagnostics ?? [{
@@ -1795,6 +1997,7 @@ function mapCompilationHistory(records: CompilationHistoryRecord[]): Compilation
   return records.map((record, index) => ({
     id: String(record.id),
     version: record.workflow_version ? `v${record.workflow_version}` : `编译 ${records.length - index}`,
+    workflowVersion: record.workflow_version,
     createdAt: new Intl.DateTimeFormat('zh-CN', {
       month: '2-digit',
       day: '2-digit',
@@ -1859,6 +2062,11 @@ async function loadWorkflow(slug = selectedWorkflowSlug.value) {
       : []
 
     selectedWorkflowSlug.value = slug
+    selectedWorkflowVersionSnapshot.value = undefined
+    workflowDocumentVersion.value = document.document_version
+    workflowDocumentDigest.value = document.document_digest
+    workflowConflict.value = undefined
+    workflowConflictDraftDownloaded.value = false
     workflowGraph.value = document.workflow_graph
     toolSpecs.value = document.tool_specs
     workflowDescription.value = document.description ?? ''
@@ -1870,11 +2078,17 @@ async function loadWorkflow(slug = selectedWorkflowSlug.value) {
     artifacts.value = nextCompilations[0]?.artifacts ?? []
     wdlRevisions.value = nextRevisions
     selectedWdlVersion.value = nextRevisions[0]?.version
+    wdlRevisionLoadSequence += 1
+    wdlRevisionLoadState.value = 'idle'
     selectedNodeId.value = nextNodes[0]?.id ?? ''
     selectedNodeIds.value = []
     diagnostics.value = []
     compileState.value = 'idle'
     editingWdl.value = false
+    wdlEditBaseRevision.value = undefined
+    wdlAssetCreateState.value = 'idle'
+    wdlAssetCreateError.value = ''
+    dismissWdlGraphProposal()
     editingWorkflowMetadata.value = false
     undoStack.value = []
     redoStack.value = []
@@ -1884,6 +2098,7 @@ async function loadWorkflow(slug = selectedWorkflowSlug.value) {
     switchingWorkflowSlug.value = ''
     await nextTick()
     vueFlowStore.value?.updateNodeInternals(nextNodes.map((node) => node.id))
+    workflowSavedSnapshot.value = workflowSaveSnapshot()
     void loadWorkflowLibrary()
     return true
   } catch (error) {
@@ -1898,47 +2113,159 @@ async function loadWorkflow(slug = selectedWorkflowSlug.value) {
   }
 }
 
+function workflowSaveRequest() {
+  const graph = graphWithCurrentLayout()
+  return {
+    name: graph.name,
+    description: workflowDescription.value,
+    kind: workflowKind.value,
+    subworkflow_references: graph.nodes
+      .filter((node: Record<string, any>) => node.type === 'subworkflow')
+      .map((node: Record<string, any>) => node.subworkflow_ref),
+    workflow_graph: graph,
+    tool_specs: toolSpecs.value,
+    editor_document: {
+      nodes: nodes.value.map((node) => ({ id: node.id, position: node.position })),
+      viewport: graph.layout.viewport,
+    },
+  }
+}
+
+function workflowSaveSnapshot() {
+  return JSON.stringify(workflowSaveRequest())
+}
+
 async function saveWorkflow(silent = false) {
   if (
     !workflowGraph.value
     || saveState.value === 'saving'
     || isWorkflowSwitching.value
-  ) return
+    || workflowConflict.value
+  ) return false
   const workflowSlug = selectedWorkflowSlug.value
+  const body = workflowSaveRequest()
+  const snapshot = JSON.stringify(body)
+  if (snapshot === workflowSavedSnapshot.value) {
+    saveState.value = 'saved'
+    if (!silent) editingWorkflowMetadata.value = false
+    return true
+  }
   saveState.value = 'saving'
   try {
-    const graph = graphWithCurrentLayout()
-    await $fetch(`/api/v1/editor/workflows/${encodeURIComponent(workflowSlug)}`, {
+    const saved = await $fetch<WorkflowDocumentPayload>(
+      `/api/v1/editor/workflows/${encodeURIComponent(workflowSlug)}`,
+      {
       method: 'PUT',
+      headers: { 'X-Workflow-Concurrency': 'required' },
       body: {
-        name: graph.name,
-        description: workflowDescription.value,
-        kind: workflowKind.value,
-        subworkflow_references: graph.nodes
-          .filter((node: Record<string, any>) => node.type === 'subworkflow')
-          .map((node: Record<string, any>) => node.subworkflow_ref),
-        workflow_graph: graph,
-        tool_specs: toolSpecs.value,
-        editor_document: {
-          nodes: nodes.value.map((node) => ({ id: node.id, position: node.position })),
-          viewport: graph.layout.viewport,
-        },
+        base_document_version: workflowDocumentVersion.value,
+        base_document_digest: workflowDocumentDigest.value,
+        ...body,
       },
     })
-    if (workflowSlug !== selectedWorkflowSlug.value) return
-    workflowGraph.value = graph
+    if (workflowSlug !== selectedWorkflowSlug.value) return false
+    workflowGraph.value = body.workflow_graph
+    workflowDocumentVersion.value = saved.document_version
+    workflowDocumentDigest.value = saved.document_digest
+    workflowSavedSnapshot.value = snapshot
     saveState.value = 'saved'
     lastSavedAt.value = new Date()
     if (!silent) editingWorkflowMetadata.value = false
-  } catch (error) {
+    return true
+  } catch (error: any) {
     console.error('Failed to save workflow document', error)
     saveState.value = 'error'
-    throw error
+    const conflict = error?.data?.error
+    if (
+      conflict?.code === 'WORKFLOW_DOCUMENT_CONFLICT'
+      && conflict.details?.current
+    ) {
+      workflowConflict.value = {
+        remote: conflict.details.current,
+        baseVersion: Number(conflict.details.base_document_version),
+      }
+      workflowConflictDraftDownloaded.value = false
+      showLayoutFeedback('检测到较新的远端画布，已停止自动保存', 'error')
+      return false
+    }
+    showLayoutFeedback(conflict?.message ?? '流程保存失败，请稍后重试', 'error')
+    return false
   }
 }
 
+function formatWorkflowConflictTime(value: string) {
+  return new Intl.DateTimeFormat('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).format(new Date(value))
+}
+
+function downloadLocalWorkflowConflictDraft() {
+  const conflict = workflowConflict.value
+  if (!conflict) return
+  const graph = graphWithCurrentLayout()
+  const payload = {
+    exported_at: new Date().toISOString(),
+    reason: 'workflow_document_conflict',
+    base_document_version: conflict.baseVersion,
+    remote_document_version: conflict.remote.document_version,
+    workflow: {
+      slug: selectedWorkflowSlug.value,
+      name: currentWorkflowName.value,
+      description: workflowDescription.value,
+      kind: workflowKind.value,
+      workflow_graph: graph,
+      tool_specs: toolSpecs.value,
+      editor_document: {
+        nodes: nodes.value.map(node => ({ id: node.id, position: node.position })),
+        viewport: graph.layout?.viewport,
+      },
+    },
+  }
+  const url = URL.createObjectURL(new Blob(
+    [JSON.stringify(payload, null, 2)],
+    { type: 'application/json' },
+  ))
+  const link = document.createElement('a')
+  link.href = url
+  link.download = `${selectedWorkflowSlug.value}.local-draft-v${conflict.baseVersion}.json`
+  link.click()
+  URL.revokeObjectURL(url)
+  workflowConflictDraftDownloaded.value = true
+}
+
+async function loadRemoteWorkflowConflict() {
+  if (!workflowConflict.value || !workflowConflictDraftDownloaded.value) return
+  await loadWorkflow(selectedWorkflowSlug.value)
+}
+
+function hasUndownloadedWorkflowConflict() {
+  return Boolean(workflowConflict.value && !workflowConflictDraftDownloaded.value)
+}
+
+function confirmWorkflowConflictExit() {
+  return !hasUndownloadedWorkflowConflict()
+    || window.confirm('当前本地画布与远端版本存在冲突，且本地草稿尚未下载。确定离开并丢弃本地改动吗？')
+}
+
+function confirmWdlEditExit() {
+  if (!editingWdl.value) return true
+  const confirmed = window.confirm('当前 WDL 派生稿尚未保存。确定离开并丢弃本次修改吗？')
+  if (confirmed) cancelWdlEdit()
+  return confirmed
+}
+
+function handleWorkflowBeforeUnload(event: BeforeUnloadEvent) {
+  if (!hasUndownloadedWorkflowConflict() && !editingWdl.value) return
+  event.preventDefault()
+  event.returnValue = ''
+}
+
 async function validateWorkflow() {
-  if (isWorkflowSwitching.value) return
+  if (isWorkflowSwitching.value || editingWdl.value) return
   try {
     const response = await $fetch<{ validation: { diagnostics: Diagnostic[] } }>(
       '/api/v1/validations/workflow-graph',
@@ -1962,22 +2289,44 @@ async function validateWorkflow() {
   }
   inspectorTab.value = 'diagnostics'
   activeRail.value = 'edit'
+  syncWorkspaceRoute('edit')
 }
 
-function selectRail(section: RailSection) {
-  if (section === 'packages') {
-    void navigateTo('/wdl-packages')
-    return
+function workflowPathQuery() {
+  return workflowNavigationStack.value.length
+    ? workflowNavigationStack.value.map(item => item.slug).join(',')
+    : undefined
+}
+
+function syncWorkspaceRoute(section: RailSection) {
+  const query: Record<string, string> = {
+    section,
+    workflow: selectedWorkflowSlug.value,
   }
-  if (section === 'runs') {
-    void navigateTo('/runs')
-    return
+  if (section === 'edit') {
+    const path = workflowPathQuery()
+    if (path) query.workflowPath = path
   }
-  if (section === 'wdl') {
-    void navigateTo('/wdl')
+  if (section === 'tools' && selectedToolId.value) {
+    query.tool = selectedToolId.value
+    if (selectedToolVersion.value) query.toolVersion = selectedToolVersion.value
+  }
+  void navigateTo({ path: '/', query }, { replace: true })
+}
+
+function selectRail(section: AppSection, syncRoute = true) {
+  if (section !== activeRail.value && !confirmWdlEditExit()) return
+  if (
+    section === 'overview'
+    || section === 'packages'
+    || section === 'runs'
+    || section === 'wdl'
+  ) {
+    void navigateSection(section)
     return
   }
   activeRail.value = section
+  if (syncRoute) syncWorkspaceRoute(section)
   if (section === 'tools') {
     activeLibrary.value = 'tools'
     loadToolRegistry()
@@ -2000,9 +2349,32 @@ function updateWorkflowName(name: string) {
 }
 
 async function openSubworkflowDetail() {
+  if (workflowConflict.value) {
+    showLayoutFeedback('请先处理当前画布的保存冲突', 'error')
+    return
+  }
   const slug = selectedData.value?.subworkflowSlug
   if (!slug) return
-  if (await loadWorkflow(slug)) activeRail.value = 'edit'
+  workflowNavigationStack.value.push({
+    slug: selectedWorkflowSlug.value,
+    name: currentWorkflowName.value,
+  })
+  if (await loadWorkflow(slug)) {
+    activeRail.value = 'edit'
+    syncWorkspaceRoute('edit')
+    return
+  }
+  workflowNavigationStack.value.pop()
+}
+
+async function returnToParentWorkflow() {
+  const parent = workflowNavigationStack.value.pop()
+  if (!parent) return
+  if (await loadWorkflow(parent.slug)) {
+    syncWorkspaceRoute('edit')
+    return
+  }
+  workflowNavigationStack.value.push(parent)
 }
 
 function selectSubworkflowUpgrade(event: Event) {
@@ -2053,7 +2425,7 @@ async function upgradeSelectedSubworkflow() {
   try {
     await nextTick()
     vueFlowStore.value?.updateNodeInternals([node.id])
-    await saveWorkflow(true)
+    if (!await saveWorkflow(true)) throw new Error('workflow save failed')
   } catch {
     nodes.value = previousNodes
     await nextTick()
@@ -2101,20 +2473,160 @@ async function upgradeSelectedSubworkflow() {
 async function selectWorkflowDocument(slug: string) {
   if (
     slug === selectedWorkflowSlug.value
+    || editingWdl.value
     || isWorkflowSwitching.value
     || saveState.value === 'saving'
     || compileState.value === 'running'
+    || wdlGraphProposalState.value === 'applying'
+    || workflowConflict.value
   ) return
-  await loadWorkflow(slug)
+  if (await loadWorkflow(slug)) {
+    workflowNavigationStack.value = []
+    const query: Record<string, string> = {
+      section: activeRail.value,
+      workflow: slug,
+    }
+    if (activeRail.value === 'artifacts') {
+      if (route.query.owner === 'mine' || route.query.owner === 'shared') query.owner = route.query.owner
+      if (route.query.kind === 'workflow' || route.query.kind === 'subworkflow') query.kind = route.query.kind
+    }
+    await navigateTo(
+      { path: '/', query },
+      { replace: true },
+    )
+  }
+}
+
+async function createWorkflow(payload: {
+  slug: string
+  name: string
+  description: string
+  kind: 'workflow' | 'subworkflow'
+}) {
+  if (workflowConflict.value) {
+    showLayoutFeedback('请先下载本地草稿并处理画布冲突', 'error')
+    return
+  }
+  const currentSaved = await saveWorkflow(true)
+  if (!currentSaved) {
+    workflowCreateState.value = 'error'
+    workflowCreateError.value = '当前画布尚未保存，处理保存问题后再创建新流程。'
+    return
+  }
+  workflowCreateState.value = 'saving'
+  workflowCreateError.value = ''
+  try {
+    const created = await $fetch<WorkflowDocumentPayload>('/api/v1/editor/workflows', {
+      method: 'POST',
+      body: payload,
+    })
+    await loadWorkflowLibrary()
+    const opened = await loadWorkflow(created.slug)
+    if (!opened) throw new Error('created workflow could not be opened')
+    workflowNavigationStack.value = []
+    activeRail.value = 'edit'
+    workflowCreateState.value = 'success'
+    await navigateTo(
+      { path: '/', query: { section: 'edit', workflow: created.slug } },
+      { replace: true },
+    )
+    showLayoutFeedback(
+      payload.kind === 'subworkflow' ? '子流程已创建，请在画布上定义接口和节点' : '流程已创建，请从左侧添加节点',
+      'success',
+    )
+  } catch (error: any) {
+    workflowCreateState.value = 'error'
+    workflowCreateError.value = error?.data?.error?.message ?? '流程创建失败，请检查流程 ID。'
+  }
+}
+
+function prepareWorkflowCreation() {
+  workflowCreateState.value = 'idle'
+  workflowCreateError.value = ''
+}
+
+function beginWorkflowCreationFromTopbar() {
+  prepareWorkflowCreation()
+  workflowCreateRequest.value = 'workflow'
+  selectRail('artifacts')
+}
+
+function handleWorkflowCreateRequest() {
+  workflowCreateRequest.value = undefined
+  const query = { ...route.query }
+  delete query.create
+  void navigateTo({ path: '/', query }, { replace: true })
+}
+
+async function openToolPackagesFromEditor(nodeId?: string) {
+  const saved = await saveWorkflow(true)
+  if (!saved) {
+    showLayoutFeedback('当前画布未保存，处理保存问题后再创建工具包', 'error')
+    return
+  }
+  await navigateTo({
+    path: '/wdl-packages',
+    query: {
+      from: 'editor',
+      workflow: selectedWorkflowSlug.value,
+      ...(nodeId ? { node: nodeId } : {}),
+    },
+  })
+}
+
+function openSelectedToolPackageSource() {
+  if (selectedData.value?.kind !== 'tool' || !selectedNodeId.value) return
+  void openToolPackagesFromEditor(selectedNodeId.value)
+}
+
+async function openOwnedSubworkflowsFromEditor() {
+  if (!confirmWdlEditExit()) return
+  activeRail.value = 'artifacts'
+  inspectorTab.value = 'artifacts'
+  await navigateTo({
+    path: '/',
+    query: { section: 'artifacts', owner: 'mine', kind: 'subworkflow' },
+  }, { replace: true })
+}
+
+async function loadWorkflowVersionSnapshot(version: number) {
+  try {
+    selectedWorkflowVersionSnapshot.value = await $fetch<WorkflowVersionSnapshot>(
+      `/api/v1/editor/workflows/${encodeURIComponent(selectedWorkflowSlug.value)}/versions/${version}`,
+    )
+    const revision = wdlRevisions.value.find(item =>
+      item.source === 'system' && item.workflow_version === version,
+    )
+    if (revision) await loadWdlRevisionDetail(revision.version)
+  } catch (error) {
+    selectedWorkflowVersionSnapshot.value = undefined
+    console.error('Failed to load workflow version snapshot', error)
+    showLayoutFeedback(`无法打开发布版本 v${version}`, 'error')
+  }
+}
+
+async function selectCompilationVersion(id: string) {
+  if (editingWdl.value) return
+  selectedCompilationId.value = id
+  selectedWorkflowVersionSnapshot.value = undefined
+  const version = compilationVersions.value.find(item => item.id === id)?.workflowVersion
+  if (typeof version !== 'number' || !Number.isInteger(version) || version < 1) return
+  await loadWorkflowVersionSnapshot(version)
+  await navigateTo({
+    path: '/',
+    query: {
+      ...route.query,
+      section: 'artifacts',
+      workflow: selectedWorkflowSlug.value,
+      workflowVersion: String(version),
+    },
+  }, { replace: true })
 }
 
 async function loadToolRegistry() {
   try {
     const response = await $fetch<{ results: ToolRegistryEntry[] }>('/api/v1/tools')
     registryTools.value = response.results
-    if (!selectedToolId.value && response.results[0]) {
-      await loadToolVersions(response.results[0].tool_id)
-    }
   } catch (error) {
     console.error('Failed to load tool registry', error)
   } finally {
@@ -2122,11 +2634,28 @@ async function loadToolRegistry() {
   }
 }
 
-async function loadToolVersions(toolId: string) {
-  selectedToolId.value = toolId
+function closeToolInspector() {
+  selectedToolId.value = ''
   selectedToolVersions.value = []
+  selectedToolVersion.value = ''
   selectedToolSpec.value = undefined
   toolDraft.value = undefined
+  toolDraftBaseVersion.value = undefined
+  toolDraftBaseDigest.value = undefined
+  const query: Record<string, any> = { ...route.query, section: 'tools' }
+  delete query.tool
+  delete query.toolVersion
+  void navigateTo({ path: '/', query }, { replace: true })
+}
+
+async function loadToolVersions(toolId: string, requestedVersion = '') {
+  selectedToolId.value = toolId
+  selectedToolVersions.value = []
+  selectedToolVersion.value = ''
+  selectedToolSpec.value = undefined
+  toolDraft.value = undefined
+  toolDraftBaseVersion.value = undefined
+  toolDraftBaseDigest.value = undefined
   toolDraftState.value = 'idle'
   toolDraftValidationStatus.value = undefined
   toolOperationError.value = undefined
@@ -2135,9 +2664,12 @@ async function loadToolVersions(toolId: string) {
       `/api/v1/tools/${encodeURIComponent(toolId)}/versions`,
     )
     selectedToolVersions.value = response.results
-    const draftLoaded = await loadToolDraft(toolId)
-    const latest = response.results[0]
-    if (!draftLoaded && latest) await loadToolVersionDetail(toolId, latest.version)
+    const selected = response.results.find(item => item.version === requestedVersion)
+      ?? response.results[0]
+    await Promise.all([
+      loadToolDraft(toolId),
+      selected ? loadToolVersionDetail(toolId, selected.version) : Promise.resolve(),
+    ])
   } catch (error) {
     console.error('Failed to load tool versions', error)
     selectedToolVersions.value = []
@@ -2149,8 +2681,12 @@ async function loadToolDraft(toolId: string) {
     const response = await $fetch<{
       draft_spec: Record<string, any>
       validation: { status?: string; diagnostics?: Diagnostic[] }
+      draft_version: number
+      draft_digest: string
     }>(`/api/v1/tools/${encodeURIComponent(toolId)}/drafts`)
     toolDraft.value = hydrateToolDraft(response.draft_spec, toolId)
+    toolDraftBaseVersion.value = response.draft_version
+    toolDraftBaseDigest.value = response.draft_digest
     toolDraftValidationStatus.value = response.validation.status
     toolDraftState.value = 'idle'
     toolOperationError.value = undefined
@@ -2159,6 +2695,8 @@ async function loadToolDraft(toolId: string) {
     if (error?.statusCode !== 404 && error?.status !== 404) {
       console.error('Failed to load tool draft', error)
     }
+    toolDraftBaseVersion.value = undefined
+    toolDraftBaseDigest.value = undefined
     return false
   }
 }
@@ -2168,14 +2706,75 @@ async function loadToolVersionDetail(toolId: string, version: string) {
     const detail = await $fetch<ToolVersionEntry>(
       `/api/v1/tools/${encodeURIComponent(toolId)}/versions/${encodeURIComponent(version)}`,
     )
+    selectedToolVersion.value = version
     selectedToolSpec.value = detail.tool_spec
-    toolDraft.value = detail.tool_spec ? hydrateToolDraft(detail.tool_spec, toolId) : undefined
-    toolDraftState.value = 'idle'
-    toolDraftValidationStatus.value = undefined
-    toolOperationError.value = undefined
   } catch (error) {
     console.error('Failed to load tool version detail', error)
   }
+}
+
+function syncToolVersionRoute(toolId: string, version = '') {
+  const query: Record<string, any> = {
+    ...route.query,
+    section: 'tools',
+    tool: toolId,
+  }
+  if (version) query.toolVersion = version
+  else delete query.toolVersion
+  delete query.toolDraft
+  void navigateTo({ path: '/', query }, { replace: true })
+}
+
+function syncToolDraftRoute(toolId: string) {
+  const query: Record<string, any> = {
+    ...route.query,
+    section: 'tools',
+    tool: toolId,
+    toolDraft: '1',
+  }
+  delete query.toolVersion
+  void navigateTo({ path: '/', query }, { replace: true })
+}
+
+async function openToolVersions(toolId: string) {
+  await loadToolVersions(toolId)
+  syncToolVersionRoute(toolId, selectedToolVersion.value)
+}
+
+async function selectToolVersion(toolId: string, version: string) {
+  await loadToolVersionDetail(toolId, version)
+  syncToolVersionRoute(toolId, version)
+}
+
+function selectToolDraft(toolId: string) {
+  syncToolDraftRoute(toolId)
+}
+
+async function openSelectedToolReference() {
+  const lifecycle = selectedToolLifecycle.value
+  if (!lifecycle) return
+  activeRail.value = 'tools'
+  activeLibrary.value = 'tools'
+  await loadToolVersions(
+    lifecycle.toolId,
+    lifecycle.isDraft ? '' : lifecycle.version,
+  )
+  if (lifecycle.isDraft) syncToolDraftRoute(lifecycle.toolId)
+  else syncToolVersionRoute(lifecycle.toolId, lifecycle.version)
+}
+
+function useSelectedToolVersionAsDraft() {
+  if (!selectedToolSpec.value || !selectedToolId.value) return
+  const next = hydrateToolDraft(selectedToolSpec.value, selectedToolId.value)
+  const match = selectedToolVersion.value.match(/^(\d+)\.(\d+)\.(\d+)$/)
+  next.tool_version = match
+    ? `${match[1]}.${match[2]}.${Number(match[3]) + 1}`
+    : `${selectedToolVersion.value || '1.0'}-next`
+  toolDraft.value = next
+  toolDraftState.value = 'idle'
+  toolDraftValidationStatus.value = undefined
+  toolOperationError.value = undefined
+  showLayoutFeedback(`已从 v${selectedToolVersion.value} 建立新版本草稿`, 'success')
 }
 
 async function saveToolDraft() {
@@ -2186,11 +2785,23 @@ async function saveToolDraft() {
     const response = await $fetch<{
       draft_spec: Record<string, any>
       validation: { status: string; diagnostics: Diagnostic[] }
+      draft_version: number
+      draft_digest: string
     }>(`/api/v1/tools/${encodeURIComponent(selectedToolId.value)}/drafts`, {
       method: 'PUT',
-      body: { tool_spec: toolDraft.value },
+      body: {
+        tool_spec: toolDraft.value,
+        ...(toolDraftBaseVersion.value !== undefined
+          ? {
+              base_draft_version: toolDraftBaseVersion.value,
+              base_draft_digest: toolDraftBaseDigest.value,
+            }
+          : {}),
+      },
     })
     toolDraft.value = hydrateToolDraft(response.draft_spec, selectedToolId.value)
+    toolDraftBaseVersion.value = response.draft_version
+    toolDraftBaseDigest.value = response.draft_digest
     toolDraftValidationStatus.value = response.validation.status
     diagnostics.value = response.validation.diagnostics ?? []
     toolDraftState.value = 'saved'
@@ -2199,10 +2810,17 @@ async function saveToolDraft() {
       showLayoutFeedback('草稿已保存，但还有校验问题需要修正', 'error')
     }
     return response.validation.status === 'valid'
-  } catch (error) {
+  } catch (error: any) {
     console.error('Failed to save tool draft', error)
     toolDraftState.value = 'error'
-    showLayoutFeedback('工具草稿保存失败', 'error')
+    const code = error?.data?.error?.code
+    toolOperationError.value = {
+      code: code ?? 'TOOL_DRAFT_SAVE_FAILED',
+      message: code === 'TOOL_DRAFT_CONFLICT'
+        ? '工具草稿已被其他用户修改，请重新打开后再保存。'
+        : error?.data?.error?.message ?? '工具草稿保存失败。',
+    }
+    showLayoutFeedback(toolOperationError.value.message, 'error')
     return false
   }
 }
@@ -2223,7 +2841,13 @@ async function publishToolDraft() {
   try {
     const published = await $fetch<ToolVersionEntry>(
       `/api/v1/tools/${encodeURIComponent(selectedToolId.value)}/publish`,
-      { method: 'POST' },
+      {
+        method: 'POST',
+        body: {
+          base_draft_version: toolDraftBaseVersion.value,
+          base_draft_digest: toolDraftBaseDigest.value,
+        },
+      },
     )
     toolDraftState.value = 'published'
     selectedToolSpec.value = published.tool_spec
@@ -2239,6 +2863,8 @@ async function publishToolDraft() {
       code,
       message: code === 'TOOL_VERSION_IMMUTABLE'
         ? '该工具版本已发布且内容不可修改；请提升软件版本后重新发布。'
+        : code === 'TOOL_DRAFT_CONFLICT'
+          ? '工具草稿已被其他用户修改，请重新打开后再发布。'
         : response?.error?.message ?? '工具版本发布失败。',
     }
     diagnostics.value = response?.validation?.diagnostics ?? [{
@@ -2268,8 +2894,11 @@ async function createTool() {
   toolCreateState.value = 'saving'
   selectedToolId.value = toolId
   selectedToolVersions.value = []
+  selectedToolVersion.value = ''
   selectedToolSpec.value = undefined
   toolDraft.value = createToolDraft(toolId)
+  toolDraftBaseVersion.value = undefined
+  toolDraftBaseDigest.value = undefined
   toolDraftValidationStatus.value = undefined
   toolOperationError.value = undefined
   const saved = await saveToolDraft()
@@ -2285,6 +2914,8 @@ async function createTool() {
 }
 
 async function loadWorkflowLibrary() {
+  if (workflowDocuments.value.length === 0) workflowLibraryState.value = 'loading'
+  workflowLibraryError.value = ''
   try {
     const response = await $fetch<{ results: WorkflowLibraryEntry[] }>('/api/v1/editor/workflows')
     workflowDocuments.value = response.results
@@ -2298,13 +2929,132 @@ async function loadWorkflowLibrary() {
       .flatMap((response) => response.results)
       .filter((item) => item.kind === 'subworkflow')
       .toSorted((a, b) => a.name.localeCompare(b.name) || b.version - a.version)
+    workflowNavigationStack.value = workflowNavigationStack.value.map(parent => ({
+      ...parent,
+      name: response.results.find(item => item.slug === parent.slug)?.name ?? parent.name,
+    }))
+    workflowLibraryState.value = 'ready'
   } catch (error) {
     console.error('Failed to load workflow library', error)
+    if (workflowDocuments.value.length === 0) {
+      workflowLibraryState.value = 'error'
+      workflowLibraryError.value = '暂时无法读取流程列表。'
+    }
+  }
+}
+
+function dismissWdlGraphProposal() {
+  wdlGraphProposal.value = undefined
+  wdlGraphProposalState.value = 'idle'
+  wdlGraphProposalError.value = ''
+  wdlGraphConfirmations.value = []
+}
+
+async function generateWdlGraphProposal() {
+  const revision = selectedWdlRevision.value
+  if (
+    !revision
+    || revision.artifact_role !== 'derived_draft'
+    || !workflowDocumentVersion.value
+    || !workflowDocumentDigest.value
+  ) return
+  wdlGraphProposalState.value = 'loading'
+  wdlGraphProposalError.value = ''
+  wdlGraphProposal.value = undefined
+  wdlGraphConfirmations.value = []
+  try {
+    wdlGraphProposal.value = await $fetch<WdlGraphProposal>(
+      `/api/v1/editor/workflows/${encodeURIComponent(selectedWorkflowSlug.value)}/wdl-versions/${revision.version}/graph-proposals`,
+      {
+        method: 'POST',
+        body: {
+          base_document_version: workflowDocumentVersion.value,
+          base_document_digest: workflowDocumentDigest.value,
+        },
+      },
+    )
+    wdlGraphProposalState.value = 'idle'
+  } catch (error: any) {
+    wdlGraphProposalState.value = 'error'
+    wdlGraphProposalError.value = error?.data?.error?.message
+      ?? '无法检查 WDL 对画布的影响，请刷新后重试。'
+  }
+}
+
+async function applyWdlGraphProposal() {
+  const proposal = wdlGraphProposal.value
+  if (
+    !proposal
+    || proposal.status !== 'ready'
+    || !proposal.required_confirmations.length
+    || !proposal.required_confirmations.every(
+      section => wdlGraphConfirmations.value.includes(section),
+    )
+  ) return
+  const workflowSlug = selectedWorkflowSlug.value
+  const affectedToolIds = proposal.tool_drafts.map(draft => draft.tool_id)
+  wdlGraphProposalState.value = 'applying'
+  wdlGraphProposalError.value = ''
+  try {
+    await $fetch(
+      `/api/v1/editor/workflows/${encodeURIComponent(workflowSlug)}/wdl-graph-proposals/${proposal.id}/apply`,
+      {
+        method: 'POST',
+        body: {
+          proposal_digest: proposal.proposal_digest,
+          base_document_version: proposal.base_document_version,
+          base_document_digest: proposal.base_document_digest,
+          confirm_sections: wdlGraphConfirmations.value,
+        },
+      },
+    )
+    const loaded = await loadWorkflow(workflowSlug)
+    if (!loaded || selectedWorkflowSlug.value !== workflowSlug) {
+      wdlGraphProposalState.value = 'error'
+      wdlGraphProposalError.value = '提案已应用，但画布刷新失败；请重新打开该流程。'
+      return
+    }
+    await loadToolRegistry()
+    const affectedNodes = nodes.value.filter((node) => {
+      const data = node.data as WorkflowNodeData | undefined
+      return data?.kind === 'tool'
+        && Boolean(data.toolId)
+        && affectedToolIds.includes(data.toolId!)
+    })
+    const affectedNode = affectedNodes[0]
+    const affectedData = affectedNode?.data as WorkflowNodeData | undefined
+    if (affectedNode) {
+      selectedNodeId.value = affectedNode.id
+      selectedNodeIds.value = affectedNodes.map(node => node.id)
+      inspectorTab.value = 'properties'
+    }
+    const affectedDraftVisible = Boolean(
+      affectedData?.toolDigest
+      && registryTools.value.some(tool => (
+        tool.tool_id === affectedData.toolId
+        && tool.draft_digest === affectedData.toolDigest
+      )),
+    )
+    activeRail.value = 'edit'
+    syncWorkspaceRoute('edit')
+    showLayoutFeedback(
+      affectedDraftVisible && affectedNodes.length > 1
+        ? `WDL 变更已写入画布草稿；已选中 ${affectedNodes.length} 个受影响工具节点，右侧显示第一个草稿。`
+        : affectedDraftVisible
+          ? 'WDL 变更已写入画布草稿；已定位待审查工具草稿。'
+        : 'WDL 变更已写入画布草稿。',
+      'success',
+    )
+  } catch (error: any) {
+    wdlGraphProposalState.value = 'error'
+    wdlGraphProposalError.value = error?.data?.error?.message
+      ?? '提案未应用，当前画布没有被覆盖。'
   }
 }
 
 async function loadWdlRevisions() {
   const workflowSlug = selectedWorkflowSlug.value
+  wdlRevisionLoadState.value = 'loading'
   try {
     const response = await $fetch<{ results: WdlRevision[] }>(
       `/api/v1/editor/workflows/${encodeURIComponent(workflowSlug)}/wdl-versions`,
@@ -2312,7 +3062,11 @@ async function loadWdlRevisions() {
     if (workflowSlug !== selectedWorkflowSlug.value) return
     wdlRevisions.value = response.results
     selectedWdlVersion.value = response.results[0]?.version
-    if (response.results[0]) await loadWdlRevisionDetail(response.results[0].version)
+    if (response.results[0]) {
+      await loadWdlRevisionDetail(response.results[0].version)
+    } else {
+      wdlRevisionLoadState.value = 'idle'
+    }
   } catch {
     wdlRevisions.value = previewArtifact.value
       ? [{
@@ -2323,34 +3077,72 @@ async function loadWdlRevisions() {
           created_at: new Date().toISOString(),
         }]
       : []
+    wdlRevisionLoadState.value = 'idle'
   }
 }
 
 async function loadWdlRevisionDetail(version: number) {
+  if (editingWdl.value) return
+  dismissWdlGraphProposal()
+  const sequence = ++wdlRevisionLoadSequence
+  const workflowSlug = selectedWorkflowSlug.value
   selectedWdlVersion.value = version
+  wdlAssetCreateState.value = 'idle'
+  wdlAssetCreateError.value = ''
   const existing = wdlRevisions.value.find((revision) => revision.version === version)
-  if (existing?.content) return
+  if (existing?.content !== undefined) {
+    wdlRevisionLoadState.value = 'idle'
+    return
+  }
+  wdlRevisionLoadState.value = 'loading'
   try {
     const detail = await $fetch<WdlRevision>(
-      `/api/v1/editor/workflows/${encodeURIComponent(selectedWorkflowSlug.value)}/wdl-versions/${version}`,
+      `/api/v1/editor/workflows/${encodeURIComponent(workflowSlug)}/wdl-versions/${version}`,
     )
+    if (
+      sequence !== wdlRevisionLoadSequence
+      || workflowSlug !== selectedWorkflowSlug.value
+      || version !== selectedWdlVersion.value
+    ) return
     wdlRevisions.value = wdlRevisions.value.map((revision) =>
       revision.version === version ? { ...revision, ...detail } : revision,
     )
+    wdlRevisionLoadState.value = 'idle'
   } catch (error) {
+    if (sequence !== wdlRevisionLoadSequence) return
+    wdlRevisionLoadState.value = 'error'
     console.error('Failed to load WDL revision detail', error)
   }
 }
 
 function beginWdlEdit() {
+  if (wdlRevisionLoadState.value !== 'idle') return
+  if (selectedWdlRevision.value && !selectedWdlRevision.value.digest) {
+    showLayoutFeedback('当前 WDL 快照缺少并发摘要，请刷新后重试', 'error')
+    return
+  }
+  dismissWdlGraphProposal()
   wdlDraft.value = activeWdlContent.value
+  wdlEditBaseRevision.value = selectedWdlRevision.value
+    ? { ...selectedWdlRevision.value }
+    : undefined
   editingWdl.value = true
+  wdlSaveState.value = 'idle'
+  wdlAssetCreateState.value = 'idle'
+  wdlAssetCreateError.value = ''
+}
+
+function cancelWdlEdit() {
+  editingWdl.value = false
+  wdlDraft.value = ''
+  wdlEditBaseRevision.value = undefined
   wdlSaveState.value = 'idle'
 }
 
 async function saveManualWdl() {
   if (!wdlDraft.value.trim()) return
   wdlSaveState.value = 'saving'
+  const baseRevision = wdlEditBaseRevision.value
   try {
     const revision = await $fetch<WdlRevision>(
       `/api/v1/editor/workflows/${encodeURIComponent(selectedWorkflowSlug.value)}/wdl-versions`,
@@ -2359,15 +3151,64 @@ async function saveManualWdl() {
         body: {
           content: wdlDraft.value,
           source: 'manual',
-          workflow_version: selectedCompilation.value?.version.replace(/\D/g, '') || null,
+          workflow_version: baseRevision?.workflow_version ?? null,
+          base_wdl_version: baseRevision?.version ?? null,
+          base_wdl_digest: baseRevision?.digest ?? null,
+          note: baseRevision
+            ? `基于 WDL v${baseRevision.version} 创建派生稿。`
+            : '从当前编译预览创建派生稿。',
         },
       },
     )
     wdlRevisions.value = [revision, ...wdlRevisions.value]
     selectedWdlVersion.value = revision.version
+    dismissWdlGraphProposal()
     editingWdl.value = false
+    wdlEditBaseRevision.value = undefined
+    wdlSaveState.value = 'idle'
+    showLayoutFeedback(`已保存 WDL 派生稿 v${revision.version}`, 'success')
   } catch {
     wdlSaveState.value = 'error'
+  }
+}
+
+async function createHistoricalWdlAsset() {
+  const content = activeWdlContent.value
+  if (
+    !content.trim()
+    || wdlRevisionLoadState.value !== 'idle'
+    || wdlAssetCreateState.value === 'saving'
+  ) return
+  const revision = selectedWdlRevision.value
+  const compilationVersion = Number(selectedCompilation.value?.version.replace(/\D/g, ''))
+  const workflowVersion = revision
+    ? (revision.workflow_version ?? null)
+    : (Number.isInteger(compilationVersion) && compilationVersion > 0 ? compilationVersion : null)
+  const revisionLabel = revision ? `wdl-v${revision.version}` : 'generated-wdl'
+  const workflowVersionLabel = workflowVersion ? `workflow-v${workflowVersion}` : 'workflow-draft'
+  wdlAssetCreateState.value = 'saving'
+  wdlAssetCreateError.value = ''
+  try {
+    const asset = await $fetch<{ slug: string }>('/api/v1/wdl-assets', {
+      method: 'POST',
+      body: {
+        name: `${currentWorkflowName.value} WDL`,
+        description: `由画布流程 ${currentWorkflowName.value} 的 WDL 修订转入，用于独立维护。`,
+        filename: `${selectedWorkflowSlug.value}.wdl`,
+        entrypoint: `${selectedWorkflowSlug.value}.wdl`,
+        content,
+        tags: [],
+        lifecycle: 'active',
+        note: `从流程 ${selectedWorkflowSlug.value} 的 ${workflowVersionLabel}/${revisionLabel} 转入。`,
+        source_repository: `bioworkflow://editor/workflows/${selectedWorkflowSlug.value}`,
+        source_revision: `${workflowVersionLabel}:${revisionLabel}`,
+      },
+    })
+    await navigateTo(`/wdl/${encodeURIComponent(asset.slug)}`)
+  } catch (error: any) {
+    wdlAssetCreateState.value = 'error'
+    wdlAssetCreateError.value = error?.data?.error?.message
+      ?? '历史 WDL 资产创建失败，请检查当前 WDL 后重试。'
   }
 }
 
@@ -2400,7 +3241,7 @@ async function importToolSpec(event: Event) {
         method: 'POST',
         body: { tool_spec: tool },
       })
-      await saveWorkflow()
+      if (!await saveWorkflow()) return
       await loadToolRegistry()
     }
     inspectorTab.value = 'diagnostics'
@@ -2420,10 +3261,37 @@ onMounted(() => {
   narrowViewport = window.matchMedia('(max-width: 48rem)')
   syncCanvasMode()
   narrowViewport.addEventListener('change', syncCanvasMode)
-  void Promise.all([loadWorkflow(), loadToolRegistry()]).then(() => {
+  const requestedWorkflow = typeof route.query.workflow === 'string'
+    ? route.query.workflow
+    : selectedWorkflowSlug.value
+  const requestedPath = typeof route.query.workflowPath === 'string'
+    ? route.query.workflowPath.split(',').filter(Boolean)
+    : []
+  workflowNavigationStack.value = requestedPath
+    .filter(slug => slug !== requestedWorkflow)
+    .map(slug => ({ slug, name: slug }))
+  void Promise.all([loadWorkflow(requestedWorkflow), loadToolRegistry()]).then(async () => {
+    const requestedWdlVersion = Number(route.query.wdlVersion)
+    const requestedWorkflowVersion = Number(route.query.workflowVersion)
+    if (Number.isInteger(requestedWdlVersion) && requestedWdlVersion > 0) {
+      await loadWdlRevisionDetail(requestedWdlVersion)
+    } else if (Number.isInteger(requestedWorkflowVersion) && requestedWorkflowVersion > 0) {
+      const compilation = compilationVersions.value.find(
+        item => item.version === `v${requestedWorkflowVersion}`,
+      )
+      if (compilation) selectedCompilationId.value = compilation.id
+      await loadWorkflowVersionSnapshot(requestedWorkflowVersion)
+    }
     const requestedTool = route.query.tool
     if (typeof requestedTool === 'string' && requestedTool) {
-      void loadToolVersions(requestedTool)
+      const requestedToolDraft = route.query.toolDraft === '1'
+      const requestedToolVersion = typeof route.query.toolVersion === 'string'
+        ? route.query.toolVersion
+        : ''
+      await loadToolVersions(requestedTool, requestedToolVersion)
+      if (!requestedToolDraft && selectedToolVersion.value !== requestedToolVersion) {
+        syncToolVersionRoute(requestedTool, selectedToolVersion.value)
+      }
     }
   })
   const requestedSection = route.query.section
@@ -2431,9 +3299,16 @@ onMounted(() => {
     typeof requestedSection === 'string'
     && ['edit', 'tools', 'artifacts', 'help'].includes(requestedSection)
   ) {
-    selectRail(requestedSection as RailSection)
+    selectRail(requestedSection as RailSection, false)
+  }
+  if (
+    requestedSection === 'artifacts'
+    && (route.query.create === 'workflow' || route.query.create === 'subworkflow')
+  ) {
+    workflowCreateRequest.value = route.query.create
   }
   window.addEventListener('keydown', handleCanvasDeleteKey)
+  window.addEventListener('beforeunload', handleWorkflowBeforeUnload)
   autosaveTimer = window.setInterval(() => {
     void saveWorkflow(true)
   }, 60_000)
@@ -2442,9 +3317,15 @@ onMounted(() => {
 onBeforeUnmount(() => {
   narrowViewport?.removeEventListener('change', syncCanvasMode)
   window.removeEventListener('keydown', handleCanvasDeleteKey)
+  window.removeEventListener('beforeunload', handleWorkflowBeforeUnload)
   window.clearTimeout(layoutFeedbackTimer)
   window.clearTimeout(positionSaveTimer)
   window.clearInterval(autosaveTimer)
+})
+
+onBeforeRouteLeave(() => {
+  if (!confirmWdlEditExit()) return false
+  if (!confirmWorkflowConflictExit()) return false
 })
 </script>
 
@@ -2459,12 +3340,13 @@ onBeforeUnmount(() => {
           class="save-state save-state--button"
           type="button"
           aria-label="保存草稿"
-          :disabled="isWorkflowSwitching"
+          :disabled="isWorkflowSwitching || Boolean(workflowConflict)"
           @click="saveWorkflow()"
         >
           <span class="status-dot" />
           {{
             isWorkflowSwitching ? `正在打开 ${switchingWorkflowSlug}…`
+              : workflowConflict ? '存在保存冲突'
               : saveState === 'loading' ? '正在载入…'
               : saveState === 'saving' ? '正在保存…'
                 : saveState === 'error' ? '保存失败，重试'
@@ -2473,21 +3355,35 @@ onBeforeUnmount(() => {
         </button>
       </template>
       <template #actions>
-        <button class="button button--ghost" type="button" :disabled="isWorkflowSwitching" @click="validateWorkflow">验证</button>
+        <button
+          class="button button--ghost topbar-workflow-library-action"
+          type="button"
+          :disabled="isWorkflowSwitching || editingWdl"
+          @click="selectRail('artifacts')"
+        >我的流程</button>
+        <button
+          class="button button--ghost topbar-workflow-create-action"
+          type="button"
+          :disabled="isWorkflowSwitching || editingWdl"
+          @click="beginWorkflowCreationFromTopbar"
+        >新建</button>
+        <button class="button button--ghost" type="button" :disabled="isWorkflowSwitching || editingWdl" @click="validateWorkflow">验证</button>
         <button
           class="button button--primary"
           type="button"
-          :disabled="compileState === 'running' || isWorkflowSwitching || saveState === 'saving'"
+          :disabled="compileState === 'running' || isWorkflowSwitching || saveState === 'saving' || editingWdl || Boolean(workflowConflict)"
           @click="compileWorkflow"
         >
           {{
             compileState === 'running'
-              ? '正在编译…'
+              ? '正在发布…'
               : compileState === 'success'
-                ? '编译完成'
+                ? '版本已发布'
                 : compileState === 'error'
-                  ? '编译失败'
-                : '编译流程'
+                  ? '发布失败'
+                  : workflowKind === 'subworkflow'
+                    ? '发布子流程版本'
+                    : '发布流程版本'
           }}
         </button>
       </template>
@@ -2510,14 +3406,20 @@ onBeforeUnmount(() => {
         :registry-loaded="toolRegistryLoaded"
         :selected-tool-id="selectedToolId"
         :selected-tool-versions="selectedToolVersions"
+        :selected-tool-version="selectedToolVersion"
+        :selected-tool-spec="selectedToolSpec"
         :tool-draft-state="toolDraftState"
         :tool-draft-validation-status="toolDraftValidationStatus"
         :tool-operation-error="toolOperationError"
         :tool-create-state="toolCreateState"
+        :initial-inspector-view="requestedToolInspectorView"
         @create="createTool"
         @import="importInput?.click()"
-        @select-tool="loadToolVersions"
-        @select-version="loadToolVersionDetail"
+        @select-tool="openToolVersions"
+        @close-inspector="closeToolInspector"
+        @select-version="selectToolVersion"
+        @select-draft="selectToolDraft"
+        @use-version-as-draft="useSelectedToolVersionAsDraft"
         @draft-dirty="markToolDraftDirty"
         @draft-save="saveToolDraft"
         @draft-publish="publishToolDraft"
@@ -2532,8 +3434,11 @@ onBeforeUnmount(() => {
         v-model:workflow-description="workflowDescription"
         v-model:editing-wdl="editingWdl"
         v-model:wdl-draft="wdlDraft"
+        v-model:wdl-graph-confirmations="wdlGraphConfirmations"
         :workflow-slug="selectedWorkflowSlug"
         :workflow-documents="workflowDocuments"
+        :library-state="workflowLibraryState"
+        :library-error="workflowLibraryError"
         :is-workflow-switching="isWorkflowSwitching"
         :switching-workflow-slug="switchingWorkflowSlug"
         :save-state="saveState"
@@ -2547,15 +3452,36 @@ onBeforeUnmount(() => {
         :active-wdl-content="activeWdlContent"
         :preview-lines="previewLines"
         :wdl-save-state="wdlSaveState"
+        :wdl-revision-load-state="wdlRevisionLoadState"
+        :wdl-asset-create-state="wdlAssetCreateState"
+        :wdl-asset-create-error="wdlAssetCreateError"
+        :wdl-graph-proposal="wdlGraphProposal"
+        :wdl-graph-proposal-state="wdlGraphProposalState"
+        :wdl-graph-proposal-error="wdlGraphProposalError"
         :copied-artifact="copiedArtifact"
+        :create-state="workflowCreateState"
+        :create-error="workflowCreateError"
+        :create-request="workflowCreateRequest"
+        :initial-owner-filter="requestedWorkflowOwner"
+        :initial-kind-filter="requestedWorkflowKind"
+        :version-snapshot="selectedWorkflowVersionSnapshot"
+        :workflow-graph="workflowGraph"
         @open-editor="selectRail('edit')"
         @save-metadata="saveWorkflow()"
         @select-workflow="selectWorkflowDocument"
-        @select-compilation="selectedCompilationId = $event"
+        @select-compilation="selectCompilationVersion"
         @select-wdl-version="loadWdlRevisionDetail"
         @begin-wdl-edit="beginWdlEdit"
+        @cancel-wdl-edit="cancelWdlEdit"
+        @create-wdl-asset="createHistoricalWdlAsset"
+        @generate-wdl-graph-proposal="generateWdlGraphProposal"
+        @apply-wdl-graph-proposal="applyWdlGraphProposal"
+        @dismiss-wdl-graph-proposal="dismissWdlGraphProposal"
         @save-wdl="saveManualWdl"
         @copy-wdl="copyWdl"
+        @create-workflow="createWorkflow"
+        @create-request-handled="handleWorkflowCreateRequest"
+        @retry-library="loadWorkflowLibrary"
       />
 
       <HelpWorkspace v-else />
@@ -2565,16 +3491,30 @@ onBeforeUnmount(() => {
       v-if="activeRail === 'edit'"
       v-model:active-library="activeLibrary"
       v-model:search-query="searchQuery"
+      :current-workflow-name="currentWorkflowName"
+      :current-workflow-kind="workflowKind"
+      :current-workflow-published="currentWorkflowPublished"
+      :can-create-tool-package="nodes.some(node => node.data?.kind === 'tool')"
+      :subworkflow-guide="subworkflowGuide"
+      :owned-subworkflows="workflowDocuments.filter(item => item.is_mine && item.kind === 'subworkflow')"
       :tools="filteredTools"
       :subworkflows="filteredSubworkflows"
       :workflow-inputs="workflowInputs"
       :workflow-outputs="workflowOutputs"
       :tool-registry-loaded="toolRegistryLoaded"
       :is-workflow-switching="isWorkflowSwitching"
+      :create-state="workflowCreateState"
+      :create-error="workflowCreateError"
       @quick-add="quickAddLibraryNode"
       @drag-start="startLibraryDrag"
       @drag-end="finishLibraryDrag"
       @import-tool-spec="importInput?.click()"
+      @open-tool-packages="openToolPackagesFromEditor"
+      @prepare-create="prepareWorkflowCreation"
+      @open-owned-subworkflows="openOwnedSubworkflowsFromEditor"
+      @open-workflow="selectWorkflowDocument"
+      @create-workflow="createWorkflow"
+      @validate-workflow="validateWorkflow"
     />
 
     <main
@@ -2588,6 +3528,44 @@ onBeforeUnmount(() => {
       @dragleave="handleCanvasDragLeave"
       @drop="handleCanvasDrop"
     >
+      <section v-if="workflowConflict" class="workflow-conflict" role="alert" aria-live="assertive">
+        <div class="workflow-conflict__copy">
+          <strong>远端画布已更新，本地改动没有被覆盖</strong>
+          <p>
+            {{ workflowConflict.remote.updated_by || '其他用户' }} 于
+            {{ formatWorkflowConflictTime(workflowConflict.remote.updated_at) }}
+            保存了 v{{ workflowConflict.remote.document_version }}；你的画布基于 v{{ workflowConflict.baseVersion }}。
+          </p>
+          <details v-if="workflowConflictSummary" class="workflow-conflict__details">
+            <summary>查看变化范围</summary>
+            <ul>
+              <li>本地 {{ workflowConflictSummary.localNodeCount }} 个节点，远端 {{ workflowConflictSummary.remoteNodeCount }} 个节点</li>
+              <li v-if="workflowConflictSummary.localOnly.length">仅本地：{{ workflowConflictSummary.localOnly.slice(0, 5).join('、') }}</li>
+              <li v-if="workflowConflictSummary.remoteOnly.length">仅远端：{{ workflowConflictSummary.remoteOnly.slice(0, 5).join('、') }}</li>
+              <li v-if="workflowConflictSummary.changed.length">同名节点已变更：{{ workflowConflictSummary.changed.slice(0, 5).join('、') }}</li>
+              <li v-if="workflowConflictSummary.metadataChanged">流程名称或说明已变更</li>
+            </ul>
+          </details>
+        </div>
+        <div class="workflow-conflict__actions">
+          <button class="button button--primary" type="button" @click="downloadLocalWorkflowConflictDraft">
+            {{ workflowConflictDraftDownloaded ? '已下载本地草稿' : '下载本地草稿' }}
+          </button>
+          <button
+            class="button button--ghost"
+            type="button"
+            :disabled="!workflowConflictDraftDownloaded"
+            :title="workflowConflictDraftDownloaded ? '加载最新远端画布' : '先下载本地草稿，避免丢失改动'"
+            @click="loadRemoteWorkflowConflict"
+          >加载远端版本</button>
+        </div>
+      </section>
+      <div v-if="workflowNavigationStack.length" class="canvas-context-bar">
+        <button type="button" @click="returnToParentWorkflow">
+          ← 返回 {{ workflowNavigationStack[workflowNavigationStack.length - 1]?.name }}
+        </button>
+        <span>正在编辑子流程 {{ currentWorkflowName }}</span>
+      </div>
       <div class="canvas-toolbar" aria-label="画布工具">
         <button type="button" aria-label="选择工具" class="canvas-tool canvas-tool--active">↖</button>
         <button type="button" aria-label="添加便签" class="canvas-tool">A</button>
@@ -2876,6 +3854,7 @@ onBeforeUnmount(() => {
       :selected-data="selectedData"
       :selected-node-id="selectedNode?.id"
       :selected-tool-spec="selectedToolSpecForNode"
+      :selected-tool-lifecycle="selectedToolLifecycle"
       :workflow-port-wdl-types="workflowPortWdlTypes"
       :available-subworkflow-upgrades="availableSubworkflowUpgrades"
       :selected-subworkflow-upgrade="selectedSubworkflowUpgrade"
@@ -2899,6 +3878,8 @@ onBeforeUnmount(() => {
       @upgrade-subworkflow="upgradeSelectedSubworkflow"
       @update-tool-parameter="updateToolParameter"
       @update-annotation-selection="updateAnnotationSelection"
+      @open-tool-reference="openSelectedToolReference"
+      @create-tool-package="openSelectedToolPackageSource"
       @open-artifact="openArtifactPreview"
     />
 

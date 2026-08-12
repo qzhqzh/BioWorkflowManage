@@ -3,6 +3,7 @@ from copy import deepcopy
 from pathlib import Path
 
 import pytest
+from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from rest_framework.test import APIClient
 
@@ -34,6 +35,19 @@ def chain_fixture():
         json.loads((CHAIN_FIXTURE / "tool-bwa-mem.json").read_text(encoding="utf-8")),
     ]
     return graph, tools
+
+
+def publish_workflow(client, slug: str, payload: dict | None = None):
+    document = client.get(f"/api/v1/editor/workflows/{slug}").data
+    return client.post(
+        f"/api/v1/editor/workflows/{slug}/versions",
+        {
+            **(payload or {}),
+            "base_document_version": document["document_version"],
+            "base_document_digest": document["document_digest"],
+        },
+        format="json",
+    )
 
 
 def test_compiler_matches_golden_wdl_and_ignores_layout():
@@ -126,13 +140,50 @@ def test_editor_persistence_and_compilation_history():
     assert compiled.status_code == 201
     assert compiled.data["status"] == "succeeded"
     assert len(compiled.data["artifacts"]) == 4
+    assert compiled.data["wdl_revision"] is None
 
     history = client.get("/api/v1/editor/workflows/fastp_demo/compilations")
     assert history.status_code == 200
     assert history.data["results"][0]["status"] == "succeeded"
-    generated_wdl = WDLRevision.objects.get()
-    assert generated_wdl.source == "system"
-    assert generated_wdl.content.startswith("version 1.0")
+    assert WDLRevision.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_user_can_create_and_discover_owned_subworkflow_draft():
+    user = get_user_model().objects.create_user(username="workflow_author")
+    client = APIClient()
+    client.force_authenticate(user)
+
+    created = client.post(
+        "/api/v1/editor/workflows",
+        {
+            "slug": "my_qc_subflow",
+            "name": "我的 QC 子流程",
+            "description": "画布优先创建的可复用子流程",
+            "kind": "subworkflow",
+        },
+        format="json",
+    )
+
+    assert created.status_code == 201
+    assert created.data["created_by"] == "workflow_author"
+    assert created.data["is_mine"] is True
+    assert created.data["kind"] == "subworkflow"
+    assert created.data["workflow_graph"]["id"] == "my_qc_subflow"
+    assert created.data["workflow_graph"]["nodes"][0]["id"] == "input_file"
+
+    listing = client.get("/api/v1/editor/workflows")
+    owned = next(item for item in listing.data["results"] if item["slug"] == "my_qc_subflow")
+    assert owned["is_mine"] is True
+    assert owned["created_by"] == "workflow_author"
+
+    duplicate = client.post(
+        "/api/v1/editor/workflows",
+        {"slug": "my_qc_subflow", "name": "重复", "kind": "workflow"},
+        format="json",
+    )
+    assert duplicate.status_code == 409
+    assert duplicate.data["error"]["code"] == "WORKFLOW_ALREADY_EXISTS"
 
 
 @pytest.mark.django_db
@@ -190,12 +241,14 @@ def test_workflow_publish_creates_immutable_versions_and_links_compilation():
     )
     assert saved.status_code == 200
 
-    first = client.post(
+    unprotected = client.post(
         "/api/v1/editor/workflows/fastp_demo/versions", {}, format="json"
     )
-    second = client.post(
-        "/api/v1/editor/workflows/fastp_demo/versions", {}, format="json"
-    )
+    assert unprotected.status_code == 428
+    assert unprotected.data["error"]["code"] == "WORKFLOW_PUBLISH_PRECONDITION_REQUIRED"
+
+    first = publish_workflow(client, "fastp_demo")
+    second = publish_workflow(client, "fastp_demo")
     assert first.status_code == 201
     assert second.status_code == 201
     assert [first.data["version"], second.data["version"]] == [1, 2]
@@ -207,6 +260,10 @@ def test_workflow_publish_creates_immutable_versions_and_links_compilation():
     detail = client.get("/api/v1/editor/workflows/fastp_demo/versions/1")
     assert detail.status_code == 200
     assert detail.data["workflow_graph"] == graph
+    assert detail.data["compiled_bundle"]["entrypoint"] == "workflow.wdl"
+    assert "version 1.0" in detail.data["compiled_bundle"]["files"]["workflow.wdl"]
+    assert detail.data["compiled_digest"]
+    assert detail.data["compiler_profile"] == "compiler-core-v1"
 
     compiled = client.post(
         "/api/v1/compilations",
@@ -218,8 +275,40 @@ def test_workflow_publish_creates_immutable_versions_and_links_compilation():
         format="json",
     )
     assert compiled.status_code == 201
+    assert compiled.data["wdl_revision"]["artifact_role"] == "compiled_snapshot"
+    assert compiled.data["wdl_revision"]["run_source"]["version"] == 1
+    assert compiled.data["wdl_revision"]["executable"] is False
+    assert compiled.data["wdl_revision"]["created_by"] == "local-user"
+    assert compiled.data["wdl_revision"]["note"] == "由 WorkflowVersion v1 编译生成。"
     history = client.get("/api/v1/editor/workflows/fastp_demo/compilations")
     assert history.data["results"][0]["workflow_version"] == 1
+
+    mismatched_graph = deepcopy(graph)
+    mismatched_graph["name"] = "Not the immutable snapshot"
+    mismatched = client.post(
+        "/api/v1/compilations",
+        {
+            "workflow_graph": mismatched_graph,
+            "tool_specs": [tool],
+            "workflow_version": 1,
+        },
+        format="json",
+    )
+    assert mismatched.status_code == 409
+    assert mismatched.data["error"]["code"] == "WORKFLOW_VERSION_INPUT_MISMATCH"
+
+    missing_version = client.post(
+        "/api/v1/compilations",
+        {
+            "workflow_graph": graph,
+            "tool_specs": [tool],
+            "workflow_version": 999,
+        },
+        format="json",
+    )
+    assert missing_version.status_code == 404
+    assert missing_version.data["error"]["code"] == "WORKFLOW_VERSION_NOT_FOUND"
+    assert WDLRevision.objects.count() == 1
 
     snapshot = WorkflowVersion.objects.get(version=1)
     snapshot.name = "mutated"
@@ -245,11 +334,7 @@ def test_workflow_publish_can_reuse_unchanged_semantic_version():
     )
     assert saved.status_code == 200
 
-    first = client.post(
-        "/api/v1/editor/workflows/fastp_demo/versions",
-        {},
-        format="json",
-    )
+    first = publish_workflow(client, "fastp_demo")
     assert first.status_code == 201
     assert first.data["reused"] is False
 
@@ -259,6 +344,8 @@ def test_workflow_publish_can_reuse_unchanged_semantic_version():
         "/api/v1/editor/workflows/fastp_demo",
         {
             **document,
+            "base_document_version": saved.data["document_version"],
+            "base_document_digest": saved.data["document_digest"],
             "workflow_graph": layout_only_graph,
             "editor_document": {
                 "nodes": [{"id": "fastp_1", "position": {"x": 640, "y": 320}}]
@@ -268,27 +355,48 @@ def test_workflow_publish_can_reuse_unchanged_semantic_version():
     )
     assert layout_saved.status_code == 200
 
-    reused = client.post(
+    stale_publish = client.post(
         "/api/v1/editor/workflows/fastp_demo/versions",
-        {"reuse_unchanged": True},
+        {
+            "reuse_unchanged": True,
+            "base_document_version": saved.data["document_version"],
+            "base_document_digest": saved.data["document_digest"],
+        },
         format="json",
     )
+    assert stale_publish.status_code == 409
+    assert stale_publish.data["error"]["code"] == "WORKFLOW_PUBLISH_CONFLICT"
+
+    reused = publish_workflow(client, "fastp_demo", {"reuse_unchanged": True})
     assert reused.status_code == 200
     assert reused.data["version"] == 1
     assert reused.data["reused"] is True
     assert WorkflowVersion.objects.count() == 1
 
+    compiled_reused = client.post(
+        "/api/v1/compilations",
+        {
+            "workflow_graph": layout_only_graph,
+            "tool_specs": [tool],
+            "workflow_version": 1,
+        },
+        format="json",
+    )
+    assert compiled_reused.status_code == 201
+    assert compiled_reused.data["wdl_revision"]["run_source"]["version"] == 1
+
     metadata_saved = client.put(
         "/api/v1/editor/workflows/fastp_demo",
-        {**document, "description": "Changed workflow metadata."},
+        {
+            **document,
+            "base_document_version": layout_saved.data["document_version"],
+            "base_document_digest": layout_saved.data["document_digest"],
+            "description": "Changed workflow metadata.",
+        },
         format="json",
     )
     assert metadata_saved.status_code == 200
-    changed = client.post(
-        "/api/v1/editor/workflows/fastp_demo/versions",
-        {"reuse_unchanged": True},
-        format="json",
-    )
+    changed = publish_workflow(client, "fastp_demo", {"reuse_unchanged": True})
     assert changed.status_code == 201
     assert changed.data["version"] == 2
     assert changed.data["reused"] is False
@@ -310,9 +418,7 @@ def test_manual_wdl_requires_miniwdl_and_creates_immutable_version():
         },
         format="json",
     )
-    published = client.post(
-        "/api/v1/editor/workflows/fastp_demo/versions", {}, format="json"
-    )
+    published = publish_workflow(client, "fastp_demo")
     assert published.status_code == 201
     content = (FIXTURE / "expected" / "workflow.wdl").read_text(encoding="utf-8")
     created = client.post(
@@ -322,8 +428,71 @@ def test_manual_wdl_requires_miniwdl_and_creates_immutable_version():
     )
     assert created.status_code == 201
     assert created.data["source"] == "manual"
+    assert created.data["artifact_role"] == "derived_draft"
+    assert created.data["executable"] is False
+    assert created.data["run_source"] is None
+    assert created.data["base_workflow_version"]["version"] == 1
     assert created.data["version"] == 1
     assert created.data["content"] == content
+    assert created.data["created_by"] == "local-user"
+    assert created.data["base_wdl_revision"] is None
+
+    derived_content = content + "\n# derived from WDL v1\n"
+    missing_digest = client.post(
+        "/api/v1/editor/workflows/fastp_demo/wdl-versions",
+        {
+            "content": derived_content,
+            "source": "manual",
+            "base_wdl_version": 1,
+        },
+        format="json",
+    )
+    assert missing_digest.status_code == 428
+    assert missing_digest.data["error"]["code"] == "WDL_PRECONDITION_REQUIRED"
+    wrong_digest = client.post(
+        "/api/v1/editor/workflows/fastp_demo/wdl-versions",
+        {
+            "content": derived_content,
+            "source": "manual",
+            "base_wdl_version": 1,
+            "base_wdl_digest": "sha256:wrong",
+        },
+        format="json",
+    )
+    assert wrong_digest.status_code == 409
+    assert wrong_digest.data["error"]["code"] == "WDL_BASE_REVISION_CONFLICT"
+    derived = client.post(
+        "/api/v1/editor/workflows/fastp_demo/wdl-versions",
+        {
+            "content": derived_content,
+            "source": "manual",
+            "base_wdl_version": 1,
+            "base_wdl_digest": created.data["digest"],
+            "note": "Compare a parameter alternative.",
+        },
+        format="json",
+    )
+    assert derived.status_code == 201
+    assert derived.data["version"] == 2
+    assert derived.data["workflow_version"] == 1
+    assert derived.data["base_wdl_revision"] == 1
+    assert derived.data["note"] == "Compare a parameter alternative."
+
+    second_published = publish_workflow(client, "fastp_demo")
+    assert second_published.status_code == 201
+    mismatch = client.post(
+        "/api/v1/editor/workflows/fastp_demo/wdl-versions",
+        {
+            "content": derived_content,
+            "source": "manual",
+            "base_wdl_version": 1,
+            "base_wdl_digest": created.data["digest"],
+            "workflow_version": 2,
+        },
+        format="json",
+    )
+    assert mismatch.status_code == 409
+    assert mismatch.data["error"]["code"] == "WDL_BASE_VERSION_MISMATCH"
 
     rejected = client.post(
         "/api/v1/editor/workflows/fastp_demo/wdl-versions",
@@ -331,21 +500,75 @@ def test_manual_wdl_requires_miniwdl_and_creates_immutable_version():
         format="json",
     )
     assert rejected.status_code == 422
-    assert WDLRevision.objects.count() == 1
+    assert WDLRevision.objects.count() == 2
 
     listing = client.get(
         "/api/v1/editor/workflows/fastp_demo/wdl-versions"
     )
-    assert listing.data["results"][0]["source"] == "manual"
+    assert listing.data["results"][0]["version"] == 2
     detail = client.get(
         "/api/v1/editor/workflows/fastp_demo/wdl-versions/1"
     )
     assert detail.data["content"] == content
 
-    revision = WDLRevision.objects.get()
+    revision = WDLRevision.objects.get(version=2)
     revision.content = "mutated"
     with pytest.raises(ValidationError):
         revision.save()
+
+
+@pytest.mark.django_db
+def test_manual_wdl_base_without_workflow_version_cannot_be_relabelled():
+    graph, tool = fixture()
+    client = APIClient()
+    client.put(
+        "/api/v1/editor/workflows/fastp_demo",
+        {
+            "name": graph["name"],
+            "workflow_graph": graph,
+            "tool_specs": [tool],
+            "editor_document": {},
+        },
+        format="json",
+    )
+    content = (FIXTURE / "expected" / "workflow.wdl").read_text(encoding="utf-8")
+    base = client.post(
+        "/api/v1/editor/workflows/fastp_demo/wdl-versions",
+        {"content": content, "source": "manual"},
+        format="json",
+    )
+    assert base.status_code == 201
+    assert base.data["workflow_version"] is None
+    published = publish_workflow(client, "fastp_demo")
+    assert published.status_code == 201
+
+    relabelled = client.post(
+        "/api/v1/editor/workflows/fastp_demo/wdl-versions",
+        {
+            "content": content + "\n# relabelled\n",
+            "source": "manual",
+            "base_wdl_version": 1,
+            "base_wdl_digest": base.data["digest"],
+            "workflow_version": 1,
+        },
+        format="json",
+    )
+    assert relabelled.status_code == 409
+    assert relabelled.data["error"]["code"] == "WDL_BASE_VERSION_MISMATCH"
+
+    inherited = client.post(
+        "/api/v1/editor/workflows/fastp_demo/wdl-versions",
+        {
+            "content": content + "\n# inherited unbound source\n",
+            "source": "manual",
+            "base_wdl_version": 1,
+            "base_wdl_digest": base.data["digest"],
+        },
+        format="json",
+    )
+    assert inherited.status_code == 201
+    assert inherited.data["workflow_version"] is None
+    assert inherited.data["base_wdl_revision"] == 1
 
 
 @pytest.mark.django_db
@@ -365,9 +588,7 @@ def test_subworkflow_publish_extracts_contract_and_parent_pins_exact_version():
         format="json",
     )
     assert saved.status_code == 200
-    published = client.post(
-        "/api/v1/editor/workflows/read_cleanup/versions", {}, format="json"
-    )
+    published = publish_workflow(client, "read_cleanup")
     assert published.status_code == 201
     assert published.data["kind"] == "subworkflow"
     assert [item["name"] for item in published.data["interface_contract"]["inputs"]] == [
@@ -399,9 +620,7 @@ def test_subworkflow_publish_extracts_contract_and_parent_pins_exact_version():
         format="json",
     )
     assert parent.status_code == 200
-    parent_version = client.post(
-        "/api/v1/editor/workflows/parent/versions", {}, format="json"
-    )
+    parent_version = publish_workflow(client, "parent")
     assert parent_version.status_code == 201
     assert parent_version.data["subworkflow_references"] == [reference]
 
@@ -409,6 +628,8 @@ def test_subworkflow_publish_extracts_contract_and_parent_pins_exact_version():
         "/api/v1/editor/workflows/parent",
         {
             "name": "Parent workflow",
+            "base_document_version": parent.data["document_version"],
+            "base_document_digest": parent.data["document_digest"],
             "workflow_graph": graph,
             "tool_specs": [tool],
             "editor_document": {},
@@ -422,6 +643,96 @@ def test_subworkflow_publish_extracts_contract_and_parent_pins_exact_version():
     assert snapshot.interface_contract["contract_version"] == "1.0.0"
     assert WorkflowDocument.objects.get(slug="parent").description == (
         "Uses a fixed child contract."
+    )
+
+
+@pytest.mark.django_db
+def test_workflow_document_rejects_stale_or_unprotected_writes(django_user_model):
+    graph, tool = fixture()
+    alice = django_user_model.objects.create_user(username="alice")
+    bob = django_user_model.objects.create_user(username="bob")
+    alice_client = APIClient()
+    alice_client.force_authenticate(alice)
+    bob_client = APIClient()
+    bob_client.force_authenticate(bob)
+    workflow_url = "/api/v1/editor/workflows/collaborative_demo"
+    document = {
+        "name": "Collaborative demo",
+        "description": "Initial draft.",
+        "workflow_graph": graph,
+        "tool_specs": [tool],
+        "editor_document": {"nodes": []},
+    }
+
+    created = alice_client.put(workflow_url, document, format="json")
+    assert created.status_code == 200
+
+    legacy_saved = bob_client.put(
+        workflow_url,
+        {**document, "description": "Legacy client save."},
+        format="json",
+    )
+    assert legacy_saved.status_code == 200
+    assert legacy_saved.headers["Deprecation"] == "true"
+    assert "deprecated" in legacy_saved.headers["Warning"]
+
+    alice_base = alice_client.get(workflow_url).data
+    bob_base = bob_client.get(workflow_url).data
+
+    unprotected = bob_client.put(
+        workflow_url,
+        document,
+        format="json",
+        HTTP_X_WORKFLOW_CONCURRENCY="required",
+    )
+    assert unprotected.status_code == 428
+    assert unprotected.data["error"]["code"] == "WORKFLOW_PRECONDITION_REQUIRED"
+
+    saved = alice_client.put(
+        workflow_url,
+        {
+            **document,
+            "description": "Alice saved this draft.",
+            "base_document_version": alice_base["document_version"],
+            "base_document_digest": alice_base["document_digest"],
+        },
+        format="json",
+    )
+    assert saved.status_code == 200
+    assert saved.data["document_version"] == alice_base["document_version"] + 1
+    assert saved.data["updated_by"] == "alice"
+
+    unchanged = bob_client.put(
+        workflow_url,
+        {
+            **saved.data,
+            "base_document_version": saved.data["document_version"],
+            "base_document_digest": saved.data["document_digest"],
+        },
+        format="json",
+    )
+    assert unchanged.status_code == 200
+    assert unchanged.data["document_version"] == saved.data["document_version"]
+    assert unchanged.data["document_digest"] == saved.data["document_digest"]
+    assert unchanged.data["updated_by"] == "alice"
+
+    stale = bob_client.put(
+        workflow_url,
+        {
+            **document,
+            "description": "Bob's stale draft.",
+            "base_document_version": bob_base["document_version"],
+            "base_document_digest": bob_base["document_digest"],
+        },
+        format="json",
+    )
+    assert stale.status_code == 409
+    assert stale.data["error"]["code"] == "WORKFLOW_DOCUMENT_CONFLICT"
+    current = stale.data["error"]["details"]["current"]
+    assert current["description"] == "Alice saved this draft."
+    assert current["updated_by"] == "alice"
+    assert WorkflowDocument.objects.get(slug="collaborative_demo").description == (
+        "Alice saved this draft."
     )
 
 
@@ -440,9 +751,7 @@ def test_subworkflow_node_compiles_as_pinned_import_and_dependency_artifact():
         },
         format="json",
     ).status_code == 200
-    published = client.post(
-        "/api/v1/editor/workflows/read_cleanup/versions", {}, format="json"
-    )
+    published = publish_workflow(client, "read_cleanup")
     assert published.status_code == 201
     contract = published.data["interface_contract"]
     parent_graph = {
