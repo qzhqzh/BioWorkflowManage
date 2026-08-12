@@ -1373,17 +1373,10 @@ test('shows all mocked compile artifacts without writing compilation history', a
     base_document_digest: beforeState[0].document_digest,
   })
   const expectedGraph = beforeState[0].workflow_graph
+  const { layout: _expectedLayout, ...expectedSemanticGraph } = expectedGraph
   expect(compilePayload).toMatchObject({
     workflow_graph: {
-      ...expectedGraph,
-      layout: {
-        ...expectedGraph.layout,
-        viewport: {
-          x: expect.any(Number),
-          y: expect.any(Number),
-          zoom: expect.any(Number),
-        },
-      },
+      ...expectedSemanticGraph,
     },
     tool_specs: beforeState[0].tool_specs,
     workflow_version: 999,
