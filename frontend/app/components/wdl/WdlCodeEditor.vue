@@ -17,6 +17,8 @@ const props = withDefaults(defineProps<{
 const emit = defineEmits<{
   export: []
   format: []
+  comment: [line: number]
+  cursorLine: [line: number]
 }>()
 
 const container = ref<HTMLElement>()
@@ -24,6 +26,8 @@ let editor: MonacoEditor.IStandaloneCodeEditor | undefined
 let subscription: IDisposable | undefined
 let formatAction: IDisposable | undefined
 let exportAction: IDisposable | undefined
+let commentAction: IDisposable | undefined
+let cursorSubscription: IDisposable | undefined
 let applyingExternalValue = false
 
 function applyFormattedValue(value: string) {
@@ -164,6 +168,10 @@ onMounted(async () => {
   subscription = editor.onDidChangeModelContent(() => {
     if (!applyingExternalValue) modelValue.value = editor?.getValue() ?? ''
   })
+  cursorSubscription = editor.onDidChangeCursorPosition((event) => {
+    emit('cursorLine', event.position.lineNumber)
+  })
+  emit('cursorLine', editor.getPosition()?.lineNumber ?? 1)
   formatAction = editor.addAction({
     id: 'bioworkflow.format-wdl',
     label: '格式化 WDL',
@@ -182,6 +190,16 @@ onMounted(async () => {
     ],
     run: () => emit('export'),
   })
+  commentAction = editor.addAction({
+    id: 'bioworkflow.add-wdl-review-comment',
+    label: '添加行级评论',
+    keybindings: [
+      monaco.KeyMod.CtrlCmd | monaco.KeyMod.Alt | monaco.KeyCode.KeyM,
+    ],
+    contextMenuGroupId: 'navigation',
+    contextMenuOrder: 1.5,
+    run: () => emit('comment', editor?.getPosition()?.lineNumber ?? 1),
+  })
 })
 
 watch(modelValue, (value) => {
@@ -194,6 +212,8 @@ watch(modelValue, (value) => {
 watch(() => props.readOnly, value => editor?.updateOptions({ readOnly: value }))
 
 onBeforeUnmount(() => {
+  cursorSubscription?.dispose()
+  commentAction?.dispose()
   exportAction?.dispose()
   formatAction?.dispose()
   subscription?.dispose()

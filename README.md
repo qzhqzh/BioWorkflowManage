@@ -35,7 +35,7 @@ BioWorkflowManage 是面向生物信息学流程工程化的可视化 Workflow �
 
 ## 当前阶段
 
-项目已完成 Phase 1 编译器原型的主要能力，正在推进 **多流程 Beta 工程化**：
+项目已完成多流程 Beta 的核心闭环，进入 **稳定维护期**：
 
 - Docker Compose、PostgreSQL 持久化和局域网访问；
 - ToolSpec、Workflow Graph、DAG 与类型校验；
@@ -52,12 +52,11 @@ BioWorkflowManage 是面向生物信息学流程工程化的可视化 Workflow �
 - 未发生语义或元数据变化的重复编译复用已有流程版本，画布布局不制造新版本；
 - Playwright 连接真实 Docker Compose 服务，覆盖流程切换、WDL 预览、参数持久化、
   校验失败、工具版本冲突和完整编译产物。
+- 历史 WDL 支持指派评审、行级讨论、冲突工作队列和不可变发布证据链；
+- 原始数据由后台索引器分批扫描，页面读取持久快照并展示变化与运行引用。
 
-进入可持续 Beta 前仍需完成：
-
-- 补齐专用 FastQC 单节点与分支流程的 golden/错误用例；
-- 流程创建和显式发布入口；
-- 并发编辑保护、备份恢复等生产能力。
+稳定版本之后默认只做缺陷修复、性能、可用性、安全、兼容性和测试改进；新增大功能必须
+独立立项，不混入维护版本。
 
 认证登录、WDL 工具包管理和运行分析页面已经落地；运行分析由独立
 `analysis-worker` 领取队列任务并记录进度、事件、取消、重跑和输出证据。成本、集群资源
@@ -94,6 +93,9 @@ BioWorkflowManage 是面向生物信息学流程工程化的可视化 Workflow �
 [`docs/14-integration-api-and-mcp.md`](docs/14-integration-api-and-mcp.md)。
 Reference、Panel、BED 与 CNV 基线的统一配置见
 [`docs/15-analysis-resource-catalog.md`](docs/15-analysis-resource-catalog.md)。
+WDL 协作、原始数据索引和稳定升级见
+[`docs/17-wdl-rawdata-iteration.md`](docs/17-wdl-rawdata-iteration.md) 与
+[`docs/18-stable-release.md`](docs/18-stable-release.md)。
 
 ## Phase 1: Workflow Compiler Foundation
 

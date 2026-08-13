@@ -6,6 +6,17 @@ from django.db import models
 from django.db.models.functions import Lower
 
 
+def default_wdl_release_checks():
+    return [
+        "syntax",
+        "imports",
+        "package_pins",
+        "approved_review",
+        "resolved_threads",
+        "small_data_run",
+    ]
+
+
 class ImmutableSnapshot(models.Model):
     class Meta:
         abstract = True
@@ -668,6 +679,400 @@ class WDLAuditEvent(ImmutableSnapshot):
 
     class Meta:
         ordering = ["-created_at", "-id"]
+
+
+class WDLReviewRequest(models.Model):
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        APPROVED = "approved", "Approved"
+        CHANGES_REQUESTED = "changes_requested", "Changes requested"
+        CANCELLED = "cancelled", "Cancelled"
+
+    asset = models.ForeignKey(
+        WDLAsset,
+        on_delete=models.PROTECT,
+        related_name="review_requests",
+    )
+    revision = models.ForeignKey(
+        WDLSourceRevision,
+        on_delete=models.PROTECT,
+        related_name="review_requests",
+    )
+    status = models.CharField(
+        max_length=24,
+        choices=Status.choices,
+        default=Status.PENDING,
+        db_index=True,
+    )
+    version = models.PositiveIntegerField(default=1)
+    requester = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        related_name="requested_wdl_reviews",
+        null=True,
+        blank=True,
+    )
+    requester_name = models.CharField(max_length=256)
+    assignee = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        related_name="assigned_wdl_reviews",
+        null=True,
+        blank=True,
+    )
+    assignee_name = models.CharField(max_length=256)
+    request_note = models.TextField(blank=True)
+    conclusion = models.TextField(blank=True)
+    concluded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        related_name="concluded_wdl_reviews",
+        null=True,
+        blank=True,
+    )
+    concluded_by_name = models.CharField(max_length=256, blank=True)
+    concluded_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["revision"],
+                condition=models.Q(status="pending"),
+                name="unique_pending_wdl_revision_review",
+            )
+        ]
+
+
+class WDLReviewThread(models.Model):
+    class Status(models.TextChoices):
+        OPEN = "open", "Open"
+        RESOLVED = "resolved", "Resolved"
+
+    asset = models.ForeignKey(
+        WDLAsset,
+        on_delete=models.PROTECT,
+        related_name="review_threads",
+    )
+    revision = models.ForeignKey(
+        WDLSourceRevision,
+        on_delete=models.PROTECT,
+        related_name="review_threads",
+    )
+    file_path = models.CharField(max_length=512)
+    line = models.PositiveIntegerField()
+    status = models.CharField(
+        max_length=16,
+        choices=Status.choices,
+        default=Status.OPEN,
+        db_index=True,
+    )
+    version = models.PositiveIntegerField(default=1)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        related_name="created_wdl_review_threads",
+        null=True,
+        blank=True,
+    )
+    created_by_name = models.CharField(max_length=256)
+    resolved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        related_name="resolved_wdl_review_threads",
+        null=True,
+        blank=True,
+    )
+    resolved_by_name = models.CharField(max_length=256, blank=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["status", "file_path", "line", "created_at", "id"]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(line__gte=1),
+                name="wdl_review_thread_line_positive",
+            )
+        ]
+
+
+class WDLReviewComment(ImmutableSnapshot):
+    thread = models.ForeignKey(
+        WDLReviewThread,
+        on_delete=models.PROTECT,
+        related_name="comments",
+    )
+    author = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        related_name="wdl_review_comments",
+        null=True,
+        blank=True,
+    )
+    author_name = models.CharField(max_length=256)
+    body = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+
+
+class WDLSourceConflict(models.Model):
+    asset = models.ForeignKey(
+        WDLAsset,
+        on_delete=models.PROTECT,
+        related_name="source_conflicts",
+    )
+    current_revision = models.ForeignKey(
+        WDLSourceRevision,
+        on_delete=models.PROTECT,
+        related_name="source_conflicts",
+    )
+    actor = models.CharField(max_length=256)
+    assigned_to = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        related_name="wdl_source_conflicts",
+        null=True,
+        blank=True,
+    )
+    base_version = models.PositiveIntegerField()
+    base_digest = models.CharField(max_length=80)
+    note = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-updated_at", "-id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["asset", "actor"],
+                condition=models.Q(resolved_at__isnull=True),
+                name="unique_open_wdl_source_conflict",
+            ),
+            models.UniqueConstraint(
+                fields=["asset", "assigned_to"],
+                condition=(
+                    models.Q(resolved_at__isnull=True)
+                    & models.Q(assigned_to__isnull=False)
+                ),
+                name="unique_assigned_open_wdl_source_conflict",
+            ),
+        ]
+
+
+class WDLReleasePolicy(models.Model):
+    key = models.SlugField(max_length=64, unique=True, default="default")
+    version = models.PositiveIntegerField(default=1)
+    enabled_checks = models.JSONField(default=default_wdl_release_checks)
+    max_input_bytes = models.BigIntegerField(default=1_073_741_824)
+    updated_by = models.CharField(max_length=256, default="system")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["key"]
+
+
+class WDLReleaseCheck(ImmutableSnapshot):
+    class Status(models.TextChoices):
+        PASSED = "passed", "Passed"
+        FAILED = "failed", "Failed"
+
+    asset = models.ForeignKey(
+        WDLAsset,
+        on_delete=models.PROTECT,
+        related_name="release_checks",
+    )
+    revision = models.ForeignKey(
+        WDLSourceRevision,
+        on_delete=models.PROTECT,
+        related_name="release_checks",
+    )
+    analysis_run = models.ForeignKey(
+        "AnalysisRun",
+        on_delete=models.PROTECT,
+        related_name="wdl_release_checks",
+        null=True,
+        blank=True,
+    )
+    status = models.CharField(max_length=16, choices=Status.choices)
+    policy_version = models.PositiveIntegerField()
+    policy_snapshot = models.JSONField(default=dict)
+    checks = models.JSONField(default=list)
+    requested_by = models.CharField(max_length=256)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+
+
+class WDLAssetRelease(ImmutableSnapshot):
+    asset = models.ForeignKey(
+        WDLAsset,
+        on_delete=models.PROTECT,
+        related_name="releases",
+    )
+    revision = models.ForeignKey(
+        WDLSourceRevision,
+        on_delete=models.PROTECT,
+        related_name="releases",
+    )
+    release_check = models.OneToOneField(
+        WDLReleaseCheck,
+        on_delete=models.PROTECT,
+        related_name="release",
+    )
+    version = models.CharField(max_length=64)
+    note = models.TextField(blank=True)
+    actor = models.CharField(max_length=256)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["asset", "version"],
+                name="unique_wdl_asset_release_version",
+            ),
+            models.UniqueConstraint(
+                fields=["asset", "revision"],
+                name="unique_wdl_asset_release_revision",
+            ),
+        ]
+
+
+class RawdataScan(models.Model):
+    class Status(models.TextChoices):
+        QUEUED = "queued", "Queued"
+        RUNNING = "running", "Running"
+        SUCCEEDED = "succeeded", "Succeeded"
+        LIMITED = "limited", "Limited"
+        FAILED = "failed", "Failed"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    root_key = models.CharField(max_length=80, db_index=True)
+    status = models.CharField(
+        max_length=16,
+        choices=Status.choices,
+        default=Status.QUEUED,
+        db_index=True,
+    )
+    trigger = models.CharField(max_length=24, default="scheduled")
+    actor = models.CharField(max_length=256, default="system")
+    progress = models.JSONField(default=dict)
+    catalog = models.JSONField(default=dict)
+    error = models.TextField(blank=True)
+    scanned_entry_count = models.PositiveIntegerField(default=0)
+    scan_limited = models.BooleanField(default=False)
+    attempt_count = models.PositiveSmallIntegerField(default=0)
+    lease_token = models.UUIDField(null=True, blank=True, editable=False)
+    lease_expires_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    heartbeat_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["root_key"],
+                condition=models.Q(status__in=["queued", "running"]),
+                name="unique_active_rawdata_scan",
+            )
+        ]
+
+
+class RawdataDatasetIndex(models.Model):
+    root_key = models.CharField(max_length=80, db_index=True)
+    dataset_id = models.CharField(max_length=64)
+    pair_key = models.CharField(max_length=1024)
+    name = models.CharField(max_length=256)
+    directory = models.CharField(max_length=1024)
+    status = models.CharField(max_length=32, db_index=True)
+    issues = models.JSONField(default=list)
+    files = models.JSONField(default=list)
+    total_size = models.BigIntegerField(default=0)
+    identity_digest = models.CharField(max_length=80)
+    active = models.BooleanField(default=True, db_index=True)
+    first_seen_at = models.DateTimeField()
+    last_seen_at = models.DateTimeField()
+    last_changed_at = models.DateTimeField()
+    last_scan = models.ForeignKey(
+        RawdataScan,
+        on_delete=models.PROTECT,
+        related_name="datasets",
+    )
+
+    class Meta:
+        ordering = ["directory", "name", "dataset_id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["root_key", "dataset_id"],
+                name="unique_rawdata_dataset_index",
+            )
+        ]
+
+
+class RawdataDatasetEvent(ImmutableSnapshot):
+    dataset = models.ForeignKey(
+        RawdataDatasetIndex,
+        on_delete=models.PROTECT,
+        related_name="events",
+    )
+    scan = models.ForeignKey(
+        RawdataScan,
+        on_delete=models.PROTECT,
+        related_name="dataset_events",
+        null=True,
+        blank=True,
+    )
+    run = models.ForeignKey(
+        "AnalysisRun",
+        on_delete=models.PROTECT,
+        related_name="rawdata_events",
+        null=True,
+        blank=True,
+    )
+    action = models.CharField(max_length=24)
+    actor = models.CharField(max_length=256, default="system")
+    before = models.JSONField(default=dict)
+    after = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+
+
+class RawdataRunReference(ImmutableSnapshot):
+    dataset = models.ForeignKey(
+        RawdataDatasetIndex,
+        on_delete=models.PROTECT,
+        related_name="run_references",
+    )
+    run = models.ForeignKey(
+        "AnalysisRun",
+        on_delete=models.PROTECT,
+        related_name="rawdata_references",
+    )
+    identity = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["dataset", "run"],
+                name="unique_rawdata_dataset_run_reference",
+            )
+        ]
 
 
 class AnalysisRun(models.Model):

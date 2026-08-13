@@ -18,6 +18,10 @@
 12. [miniwdl 校验与隔离执行框架](12-miniwdl-execution.md)
 13. [历史 WDL 资产与工作台](13-historical-wdl-workbench.md)
 14. [第三方分析投递 API 与 MCP](14-integration-api-and-mcp.md)
+15. [分析资源统一目录](15-analysis-resource-catalog.md)
+16. [产品融合评估](16-product-cohesion-assessment.md)
+17. [WDL 协作与原始数据体验迭代](17-wdl-rawdata-iteration.md)
+18. [稳定版本发布与升级](18-stable-release.md)
 
 ## Architecture Decision Records
 
@@ -90,4 +94,5 @@ GitHub Actions 配置：`.github/workflows/validate-contracts.yml`。
 - 四项关键架构决策。
 
 在 Phase 1 编译规范之外，项目已补充认证、执行调度、历史 WDL、第三方 Integration API
-与受限 AI Agent MCP；对应运行边界分别以第 12 至 14 章为准。
+与受限 AI Agent MCP、WDL 多人协作、原始数据后台索引和稳定发布治理；对应运行边界以
+第 12 至 18 章为准。

@@ -122,6 +122,42 @@ SPROCKET_FORMAT_TIMEOUT_SECONDS = float(
 ANALYSIS_RAWDATA_ROOT = Path(
     os.environ.get("ANALYSIS_RAWDATA_ROOT", BASE_DIR / "workspace" / "rawdata")
 )
+RAWDATA_SCAN_BATCH_ENTRIES = max(
+    100,
+    int(os.environ.get("RAWDATA_SCAN_BATCH_ENTRIES", "1000")),
+)
+RAWDATA_SCAN_MAX_FILES = max(
+    RAWDATA_SCAN_BATCH_ENTRIES,
+    int(os.environ.get("RAWDATA_SCAN_MAX_FILES", "20000")),
+)
+RAWDATA_SCAN_MAX_ENTRIES = max(
+    RAWDATA_SCAN_BATCH_ENTRIES,
+    int(os.environ.get("RAWDATA_SCAN_MAX_ENTRIES", "100000")),
+)
+RAWDATA_SCAN_MAX_DEPTH = max(
+    1,
+    int(os.environ.get("RAWDATA_SCAN_MAX_DEPTH", "8")),
+)
+RAWDATA_SCAN_BATCH_SECONDS = max(
+    0.25,
+    float(os.environ.get("RAWDATA_SCAN_BATCH_SECONDS", "2")),
+)
+RAWDATA_SCAN_LEASE_SECONDS = max(
+    30,
+    int(os.environ.get("RAWDATA_SCAN_LEASE_SECONDS", "60")),
+)
+RAWDATA_INDEX_INTERVAL_SECONDS = max(
+    30,
+    int(os.environ.get("RAWDATA_INDEX_INTERVAL_SECONDS", "300")),
+)
+RAWDATA_INDEX_STALE_SECONDS = max(
+    RAWDATA_INDEX_INTERVAL_SECONDS,
+    int(os.environ.get("RAWDATA_INDEX_STALE_SECONDS", "900")),
+)
+RAWDATA_MANUAL_SCAN_COOLDOWN_SECONDS = max(
+    5,
+    int(os.environ.get("RAWDATA_MANUAL_SCAN_COOLDOWN_SECONDS", "30")),
+)
 ANALYSIS_DATABASE_ROOT = Path(
     os.environ.get("ANALYSIS_DATABASE_ROOT", BASE_DIR / "workspace" / "databases")
 )

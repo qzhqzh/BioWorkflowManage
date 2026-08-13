@@ -6614,14 +6614,16 @@ kbd {
 }
 
 .wdl-format-button,
-.wdl-export-button {
+.wdl-export-button,
+.wdl-comment-button {
   display: inline-flex;
   align-items: center;
   gap: var(--space-2);
 }
 
 .wdl-format-button kbd,
-.wdl-export-button kbd {
+.wdl-export-button kbd,
+.wdl-comment-button kbd {
   border-left: 1px solid var(--color-border);
   padding-left: var(--space-2);
   color: var(--color-muted);

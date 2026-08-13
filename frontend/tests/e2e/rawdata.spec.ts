@@ -10,6 +10,11 @@ const readyDataset = {
   issues: [],
   total_size: 2048,
   total_size_label: '2.0 KiB',
+  first_seen_at: '2026-08-12T08:00:00Z',
+  last_seen_at: '2026-08-12T08:10:00Z',
+  last_changed_at: '2026-08-12T08:00:00Z',
+  run_count: 0,
+  recent_runs: [],
   files: [
     { mate: 1, name: 'SAMPLE01_R1.fastq.gz', relative_path: 'batch-a/SAMPLE01_R1.fastq.gz', size: 1024, size_label: '1.0 KiB', modified_at: '2026-08-12T08:00:00Z' },
     { mate: 2, name: 'SAMPLE01_R2.fastq.gz', relative_path: 'batch-a/SAMPLE01_R2.fastq.gz', size: 1024, size_label: '1.0 KiB', modified_at: '2026-08-12T08:00:00Z' },
@@ -58,6 +63,18 @@ const catalog = {
     size_label: '1.0 KiB', modified_at: '2026-08-12T08:00:00Z',
   }],
   issues: [],
+  index: {
+    latest_scan_id: 'scan-1',
+    latest_status: 'succeeded',
+    active_scan_id: null,
+    active_status: null,
+    queued_at: null,
+    started_at: null,
+    finished_at: '2026-08-12T08:10:00Z',
+    stale: false,
+    policy: { max_files: 20000, max_entries: 100000, max_depth: 8, batch_entries: 1000 },
+    repair_suggestions: [],
+  },
 }
 
 async function mockOperatorAuth(page: Page) {
@@ -116,6 +133,38 @@ test('窄屏原始数据页面可滚动且没有页面级横向溢出', async ({
 
   await expect(page.getByRole('heading', { name: '原始数据', level: 1 })).toBeVisible()
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(390)
-  await page.getByText('v1 · 开发版').scrollIntoViewIfNeeded()
-  await expect(page.getByText('v1 · 开发版')).toBeVisible()
+  await page.getByText('v1.0 · 稳定版').scrollIntoViewIfNeeded()
+  await expect(page.getByText('v1.0 · 稳定版')).toBeVisible()
+})
+
+test('更新清单只创建后台扫描并持续展示成功快照', async ({ page }) => {
+  await mockOperatorAuth(page)
+  let queued = false
+  await page.route('**/api/v1/rawdata/catalog**', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(queued ? {
+      ...catalog,
+      index: {
+        ...catalog.index,
+        active_scan_id: 'scan-2',
+        active_status: 'running',
+      },
+    } : catalog),
+  }))
+  await page.route('**/api/v1/rawdata/scans', async (route) => {
+    queued = true
+    await route.fulfill({
+      status: 202,
+      contentType: 'application/json',
+      body: JSON.stringify({ id: 'scan-2', status: 'queued', created: true }),
+    })
+  })
+
+  await page.goto('/rawdata')
+  await page.getByRole('button', { name: '更新清单' }).click()
+
+  await expect(page.getByText('后台正在更新清单')).toBeVisible()
+  await expect(page.getByRole('button', { name: '扫描进行中' })).toBeDisabled()
+  await expect(page.getByRole('button', { name: /SAMPLE01.*可运行/ })).toBeVisible()
 })

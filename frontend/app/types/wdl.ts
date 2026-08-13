@@ -169,10 +169,134 @@ export interface WdlAsset {
     errors: number
     warnings: number
   }
+  attention?: {
+    total: number
+    reviews: number
+    conflicts: number
+    diagnostics: number
+    reasons: Array<'review' | 'conflict' | 'diagnostic'>
+  }
+  collaboration?: {
+    pending_review?: {
+      id: number
+      status: WdlReviewStatus
+      assignee: string
+      requester: string
+      version: number
+    } | null
+    open_thread_count: number
+  }
   latest_activity?: WdlLatestActivity | null
   current_revision?: WdlSourceRevision | null
   revisions?: WdlSourceRevision[]
   audit_events?: WdlAuditEvent[]
+}
+
+export type WdlReviewStatus = 'pending' | 'approved' | 'changes_requested' | 'cancelled'
+
+export interface WdlReviewRequest {
+  id: number
+  revision: number
+  status: WdlReviewStatus
+  version: number
+  requester: string
+  assignee: string
+  request_note: string
+  conclusion: string
+  concluded_by: string
+  concluded_at?: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface WdlReviewComment {
+  id: number
+  author: string
+  body: string
+  created_at: string
+}
+
+export interface WdlReviewThread {
+  id: number
+  revision: number
+  file_path: string
+  line: number
+  status: 'open' | 'resolved'
+  version: number
+  created_by: string
+  resolved_by: string
+  resolved_at?: string | null
+  created_at: string
+  updated_at: string
+  stale: boolean
+  comments: WdlReviewComment[]
+}
+
+export interface WdlCollaboration {
+  asset: string
+  revision: number
+  latest_revision: number
+  is_latest: boolean
+  reviews: WdlReviewRequest[]
+  threads: WdlReviewThread[]
+  assignees: Array<{ username: string }>
+  me: string
+  attention: {
+    pending_reviews: number
+    open_conflicts: number
+    total: number
+  }
+  governance: {
+    policy: WdlReleasePolicy
+    can_manage_policy: boolean
+    checks: WdlReleaseCheck[]
+    releases: WdlAssetRelease[]
+  }
+}
+
+export type WdlReleaseCheckKey =
+  | 'syntax'
+  | 'imports'
+  | 'package_pins'
+  | 'approved_review'
+  | 'resolved_threads'
+  | 'small_data_run'
+
+export interface WdlReleasePolicy {
+  version: number
+  enabled_checks: WdlReleaseCheckKey[]
+  max_input_bytes: number
+  updated_by: string
+  updated_at: string
+}
+
+export interface WdlReleaseCheck {
+  id: number
+  revision: number
+  revision_digest: string
+  status: 'passed' | 'failed'
+  policy_version: number
+  policy_snapshot: WdlReleasePolicy
+  checks: Array<{
+    key: WdlReleaseCheckKey
+    passed: boolean
+    label: string
+    evidence: Record<string, any>
+  }>
+  analysis_run_id?: string | null
+  requested_by: string
+  created_at: string
+}
+
+export interface WdlAssetRelease {
+  id: number
+  version: string
+  revision: number
+  revision_digest: string
+  release_check_id: number
+  note: string
+  actor: string
+  created_at: string
 }
 
 export interface WdlTag {

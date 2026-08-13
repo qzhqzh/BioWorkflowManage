@@ -33,7 +33,7 @@ from .resource_catalog import (
     entry_requirements,
     load_active_catalog,
 )
-from .rawdata_catalog import cached_rawdata_catalog
+from .rawdata_index import indexed_rawdata_catalog, link_run_to_indexed_dataset
 
 
 SAFE_SAMPLE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -432,7 +432,7 @@ def _run_timing_payload(run: AnalysisRun) -> dict[str, Any]:
 
 
 def discover_fastq_catalog() -> dict[str, Any]:
-    return cached_rawdata_catalog(settings.ANALYSIS_RAWDATA_ROOT)
+    return indexed_rawdata_catalog(settings.ANALYSIS_RAWDATA_ROOT)
 
 
 def discover_fastq_datasets() -> list[dict[str, Any]]:
@@ -1715,6 +1715,11 @@ def analysis_runs(request):
                 },
                 input_values=input_values,
             )
+            link_run_to_indexed_dataset(
+                run=run,
+                dataset_id=dataset["id"],
+                identity=input_manifest,
+            )
             AnalysisRunEvent.objects.create(run=run, message="运行已进入队列。")
             return Response(
                 analysis_run_payload(run, include_events=True),
@@ -1888,6 +1893,17 @@ def analysis_runs(request):
         },
         input_values=input_values,
     )
+    link_run_to_indexed_dataset(
+        run=run,
+        dataset_id=dataset["id"],
+        identity=input_manifest["primary"],
+    )
+    if control:
+        link_run_to_indexed_dataset(
+            run=run,
+            dataset_id=control["id"],
+            identity=input_manifest["control"],
+        )
     AnalysisRunEvent.objects.create(run=run, message="运行已进入队列。")
     return Response(
         analysis_run_payload(run, include_events=True), status=status.HTTP_201_CREATED
