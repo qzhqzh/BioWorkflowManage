@@ -136,7 +136,7 @@ async function mockAuth(page: Page) {
     body: JSON.stringify({
       user: {
         username: 'zhuqin', is_admin: true, role: 'admin',
-        allowed_sections: ['overview', 'edit', 'tools', 'packages', 'artifacts', 'runs', 'wdl', 'help'],
+        allowed_sections: ['overview', 'edit', 'tools', 'packages', 'artifacts', 'resources', 'rawdata', 'runs', 'wdl', 'help'],
       },
     }),
   }))
@@ -149,13 +149,13 @@ async function mockOperatorAuth(page: Page) {
     body: JSON.stringify({
       user: {
         username: 'chaohuaiyu', is_admin: false, role: 'analysis_operator',
-        allowed_sections: ['runs'],
+        allowed_sections: ['rawdata', 'runs'],
       },
     }),
   }))
 }
 
-test('运行操作员进入其他页面时回到运行分析且只显示该菜单', async ({ page }) => {
+test('运行操作员进入其他页面时回到运行分析且只显示数据与运行菜单', async ({ page }) => {
   const hydrationMessages: string[] = []
   page.on('console', (message) => {
     if (message.text().includes('Hydration')) hydrationMessages.push(message.text())
@@ -175,6 +175,7 @@ test('运行操作员进入其他页面时回到运行分析且只显示该菜�
   await page.goto('/wdl')
 
   await expect(page).toHaveURL(/\/runs$/)
+  await expect(page.getByRole('button', { name: '原始数据' })).toBeVisible()
   await expect(page.getByRole('button', { name: '运行分析' })).toBeVisible()
   await expect(page.getByRole('button', { name: 'WDL 工作台' })).toHaveCount(0)
   await expect(page.getByRole('button', { name: '工具库' })).toHaveCount(0)
@@ -521,6 +522,33 @@ test('运行页选择原始数据和流程后提交并展示排队状态', async
   await expect(page.getByRole('heading', { name: 'HX-ZY-260731-A1' })).toBeVisible()
   await expect(page.getByText('排队中')).toBeVisible()
   await expect(page.getByText('运行已进入队列。')).toBeVisible()
+})
+
+test('原始数据入口指定的数据集会被选中并保留在共享地址中', async ({ page }) => {
+  await mockAuth(page)
+  const secondDataset = {
+    ...dataset,
+    id: 'dataset-2',
+    name: 'HX-ZY-260731-A2',
+    pair_key: 'sample-a2_{R}.fq.gz',
+  }
+  const scopedCatalog = catalog()
+  scopedCatalog.datasets = [dataset, secondDataset]
+  await page.route('**/api/v1/analysis/catalog', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(scopedCatalog),
+  }))
+  await page.route('**/api/v1/analysis-runs', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ results: [] }),
+  }))
+
+  await page.goto('/runs?dataset=dataset-2')
+
+  await expect(page.getByLabel('分析样本')).toHaveValue('dataset-2')
+  await expect(page).toHaveURL(/dataset=dataset-2/)
 })
 
 test('数据库缺失项清晰可见且不会允许提交', async ({ page }) => {

@@ -18,13 +18,14 @@ test('管理员从总览进入子流程创建并返回总览', async ({ page }) 
 
   const navigationLabels = (await page.getByLabel('主要导航').locator('.rail__item').allTextContents())
     .map(label => label.replace(/\s+/g, ''))
-  expect(navigationLabels.slice(0, 8)).toEqual([
+  expect(navigationLabels.slice(0, 9)).toEqual([
     'O总览',
     '⌘编辑器',
     '{}流程库',
     'T工具库',
     'P工具包',
     'R资源库',
+    'D原始数据',
     '▶运行分析',
     'W历史WDL',
   ])

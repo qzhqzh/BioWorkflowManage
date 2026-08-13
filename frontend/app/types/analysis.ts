@@ -77,6 +77,11 @@ export interface AnalysisDatabaseOption {
 
 export interface AnalysisCatalog {
   rawdata_directory: string
+  rawdata_scan?: {
+    limited: boolean
+    scanned_at: string
+    issues: Array<{ code: string; message: string; path?: string }>
+  }
   database_directory: string
   datasets: AnalysisDataset[]
   workflows: AnalysisWorkflow[]

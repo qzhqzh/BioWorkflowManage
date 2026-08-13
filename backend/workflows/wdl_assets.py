@@ -12,7 +12,7 @@ from pathlib import Path
 import WDL
 from django.conf import settings
 from django.db import IntegrityError, transaction
-from django.db.models import Count, Q
+from django.db.models import Count, OuterRef, Q, Subquery
 from django.http import HttpResponse
 from django.utils.text import slugify
 from rest_framework import status
@@ -656,6 +656,33 @@ def _asset_payload(asset: WDLAsset, *, include_detail: bool = False) -> dict:
     latest_payload = (
         _revision_payload(latest, include_content=include_detail) if latest else None
     )
+    analysis = latest_payload.get("analysis", {}) if latest_payload else {}
+    diagnostics = analysis.get("diagnostics", [])
+    error_count = sum(item.get("severity") == "error" for item in diagnostics)
+    warning_count = sum(item.get("severity") == "warning" for item in diagnostics)
+    if not latest or analysis.get("status") != "valid" or error_count:
+        maintenance_status = "error"
+    elif warning_count:
+        maintenance_status = "warning"
+    else:
+        maintenance_status = "ready"
+
+    latest_activity = None
+    latest_activity_id = getattr(asset, "latest_activity_id", None)
+    if latest_activity_id:
+        latest_activity = {
+            "id": latest_activity_id,
+            "action": getattr(asset, "latest_activity_action", ""),
+            "actor": getattr(asset, "latest_activity_actor", ""),
+            "note": getattr(asset, "latest_activity_note", ""),
+            "revision": getattr(asset, "latest_activity_revision", None),
+            "created_at": getattr(asset, "latest_activity_created_at").isoformat(),
+        }
+    elif include_detail:
+        event = asset.audit_events.select_related("revision").first()
+        if event:
+            latest_activity = _audit_payload(event)
+
     payload = {
         "slug": asset.slug,
         "name": asset.name,
@@ -671,6 +698,12 @@ def _asset_payload(asset: WDLAsset, *, include_detail: bool = False) -> dict:
         "updated_at": asset.updated_at.isoformat(),
         "revision_count": asset.source_revisions.count(),
         "file_count": len(latest_payload["files"]) if latest_payload else 0,
+        "maintenance_status": maintenance_status,
+        "maintenance_counts": {
+            "errors": error_count,
+            "warnings": warning_count,
+        },
+        "latest_activity": latest_activity,
         "current_revision": latest_payload,
     }
     if include_detail:
@@ -696,7 +729,23 @@ def _content_error(content) -> str | None:
 def wdl_assets(request):
     request_id = _request_id(request)
     if request.method == "GET":
-        assets = WDLAsset.objects.prefetch_related("tags", *ASSET_REVISION_PREFETCHES)
+        latest_events = WDLAuditEvent.objects.filter(asset_id=OuterRef("pk")).order_by(
+            "-created_at", "-id"
+        )
+        assets = WDLAsset.objects.prefetch_related(
+            "tags", *ASSET_REVISION_PREFETCHES
+        ).annotate(
+            latest_activity_id=Subquery(latest_events.values("id")[:1]),
+            latest_activity_action=Subquery(latest_events.values("action")[:1]),
+            latest_activity_actor=Subquery(latest_events.values("actor")[:1]),
+            latest_activity_note=Subquery(latest_events.values("note")[:1]),
+            latest_activity_revision=Subquery(
+                latest_events.values("revision__version")[:1]
+            ),
+            latest_activity_created_at=Subquery(
+                latest_events.values("created_at")[:1]
+            ),
+        )
         query = request.query_params.get("q", "").strip()
         if query:
             assets = assets.filter(

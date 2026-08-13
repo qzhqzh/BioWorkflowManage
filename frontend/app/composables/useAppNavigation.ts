@@ -3,6 +3,7 @@ import type { AppSection } from '~/composables/useAuth'
 export function appSectionTarget(section: AppSection) {
   if (section === 'overview') return { path: '/overview' }
   if (section === 'packages') return { path: '/wdl-packages' }
+  if (section === 'rawdata') return { path: '/rawdata' }
   if (section === 'runs') return { path: '/runs' }
   if (section === 'resources') return { path: '/resources' }
   if (section === 'wdl') return { path: '/wdl' }

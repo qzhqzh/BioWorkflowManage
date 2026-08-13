@@ -1,4 +1,4 @@
-export type AppSection = 'overview' | 'edit' | 'tools' | 'packages' | 'artifacts' | 'resources' | 'runs' | 'wdl' | 'help'
+export type AppSection = 'overview' | 'edit' | 'tools' | 'packages' | 'artifacts' | 'resources' | 'rawdata' | 'runs' | 'wdl' | 'help'
 
 export type AuthUser = {
   username: string
@@ -15,6 +15,7 @@ export function defaultRouteForUser(user: AuthUser): string {
 
 export function routeSection(path: string, section?: unknown): AppSection {
   if (path.startsWith('/overview')) return 'overview'
+  if (path.startsWith('/rawdata')) return 'rawdata'
   if (path.startsWith('/runs')) return 'runs'
   if (path.startsWith('/resources')) return 'resources'
   if (path.startsWith('/wdl-packages')) return 'packages'

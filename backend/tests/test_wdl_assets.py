@@ -235,6 +235,34 @@ def test_imported_wdl_asset_keeps_analysis_tags_and_audit_history():
     assert [item["slug"] for item in filtered.data["results"]] == [
         response.data["slug"]
     ]
+    listed = filtered.data["results"][0]
+    assert listed["maintenance_status"] == "ready"
+    assert listed["maintenance_counts"] == {"errors": 0, "warnings": 0}
+    assert listed["latest_activity"]["actor"] == "local-user"
+    assert listed["latest_activity"]["action"] == "import"
+    assert listed["latest_activity"]["note"] == "从生产目录导入"
+
+
+@pytest.mark.django_db
+def test_wdl_asset_list_reports_invalid_revision_as_maintenance_error():
+    client = APIClient()
+
+    response = client.post(
+        "/api/v1/wdl-assets",
+        {
+            "name": "需要修复的流程",
+            "filename": "broken.wdl",
+            "content": "version 1.0\nworkflow broken { call missing }\n",
+            "note": "先纳入资产台账",
+        },
+        format="json",
+    )
+
+    assert response.status_code == 201
+    listed = client.get("/api/v1/wdl-assets").data["results"][0]
+    assert listed["maintenance_status"] == "error"
+    assert listed["maintenance_counts"]["errors"] >= 1
+    assert listed["latest_activity"]["note"] == "先纳入资产台账"
 
 
 @pytest.mark.django_db

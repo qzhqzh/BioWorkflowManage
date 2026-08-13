@@ -101,9 +101,10 @@ def test_analysis_operator_can_only_access_analysis_api(settings, seeded_users):
         "username": "chaohuaiyu",
         "is_admin": False,
         "role": "analysis_operator",
-        "allowed_sections": ["runs"],
+        "allowed_sections": ["rawdata", "runs"],
     }
     assert client.get("/api/v1/analysis/catalog").status_code == 200
+    assert client.get("/api/v1/rawdata/catalog").status_code == 200
     assert client.get("/api/v1/analysis-runs").status_code == 200
     assert client.get("/api/v1/wdl-assets").status_code == 403
 
@@ -134,6 +135,7 @@ def test_workflow_maintainer_can_collaborate_on_assets_and_run_analysis(
             "packages",
             "tools",
             "resources",
+            "rawdata",
             "runs",
             "wdl",
             "help",

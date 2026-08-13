@@ -10,6 +10,7 @@ const { navigateSection } = useAppNavigation()
 const availableTags = ref<WdlTag[]>([])
 const searchQuery = ref('')
 const selectedTags = ref<string[]>([])
+const maintenanceFilter = ref<'all' | 'attention' | 'ready'>('all')
 const loadState = ref<'loading' | 'ready' | 'error'>('loading')
 const showImport = ref(false)
 const fileInput = ref<HTMLInputElement>()
@@ -33,6 +34,47 @@ const importDraft = ref({
   sourceRepository: '',
   sourceRevision: '',
 })
+const visibleAssets = computed(() => assets.value.filter((asset) => {
+  if (maintenanceFilter.value === 'attention') return maintenanceStatus(asset) !== 'ready'
+  if (maintenanceFilter.value === 'ready') return maintenanceStatus(asset) === 'ready'
+  return true
+}))
+
+const attentionCount = computed(() => assets.value.filter(
+  asset => maintenanceStatus(asset) !== 'ready',
+).length)
+
+function maintenanceStatus(asset: WdlAsset) {
+  return asset.maintenance_status
+    ?? (asset.current_revision?.analysis.status === 'valid' ? 'ready' : 'error')
+}
+
+function maintenanceLabel(asset: WdlAsset) {
+  if (maintenanceStatus(asset) === 'ready') return '检查通过'
+  if (asset.maintenance_counts?.errors) return `${asset.maintenance_counts.errors} 个错误`
+  if (asset.maintenance_counts?.warnings) return `${asset.maintenance_counts.warnings} 个提醒`
+  return '需处理'
+}
+
+function activityLabel(action: string) {
+  return ({
+    import: '导入源码',
+    edit: '修改源码',
+    format: '格式化',
+    metadata_update: '修改信息',
+    package_link: '更新工具包引用',
+    tool_import: '提取工具',
+  } as Record<string, string>)[action] ?? action
+}
+
+function formatActivityTime(value: string) {
+  return new Intl.DateTimeFormat('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(new Date(value))
+}
 
 async function loadAssets() {
   loadState.value = 'loading'
@@ -235,9 +277,9 @@ onBeforeUnmount(() => {
   <div class="app-shell app-shell--workspace">
     <AppTopbar section="WDL 工作台" current="资产台账">
       <template #status>
-        <span class="save-state">
+        <span class="save-state" :class="{ 'save-state--error': loadState === 'error' }">
           <span class="status-dot" />
-          {{ loadState === 'loading' ? '正在读取…' : `${assets.length} 个历史资产` }}
+          {{ loadState === 'loading' ? '正在读取…' : loadState === 'error' ? '读取失败' : `${assets.length} 个历史资产` }}
         </span>
       </template>
       <template #actions>
@@ -331,10 +373,16 @@ onBeforeUnmount(() => {
       <form class="wdl-assets-toolbar" role="search" @submit.prevent="loadAssets">
         <label class="search-field workspace-search">
           <span aria-hidden="true">⌕</span>
+          <span class="visually-hidden">搜索历史 WDL</span>
           <input v-model="searchQuery" type="search" placeholder="搜索名称、文件或说明" />
         </label>
         <button class="button button--ghost" type="submit">查询</button>
-        <span>{{ assets.length }} 个结果</span>
+        <div class="wdl-maintenance-filter" aria-label="维护状态筛选">
+          <button type="button" :aria-pressed="maintenanceFilter === 'all'" @click="maintenanceFilter = 'all'">全部</button>
+          <button type="button" :aria-pressed="maintenanceFilter === 'attention'" @click="maintenanceFilter = 'attention'">待处理 {{ attentionCount }}</button>
+          <button type="button" :aria-pressed="maintenanceFilter === 'ready'" @click="maintenanceFilter = 'ready'">已通过</button>
+        </div>
+        <span>{{ visibleAssets.length }} 个结果</span>
       </form>
 
       <div v-if="availableTags.length" class="wdl-tag-filter" aria-label="按标签筛选">
@@ -398,20 +446,30 @@ onBeforeUnmount(() => {
         <span v-for="index in 5" :key="index" />
       </div>
 
-      <div v-else-if="assets.length" class="wdl-assets-table-wrap">
+      <div v-else-if="visibleAssets.length" class="wdl-assets-table-wrap">
         <table class="wdl-assets-table">
+          <colgroup>
+            <col class="wdl-assets-col--asset" />
+            <col class="wdl-assets-col--tags" />
+            <col class="wdl-assets-col--structure" />
+            <col class="wdl-assets-col--status" />
+            <col class="wdl-assets-col--activity" />
+            <col class="wdl-assets-col--version" />
+            <col class="wdl-assets-col--action" />
+          </colgroup>
           <thead>
             <tr>
               <th scope="col">资产</th>
               <th scope="col">标签</th>
               <th scope="col">结构</th>
               <th scope="col">检查</th>
+              <th scope="col">最近协作</th>
               <th scope="col">版本</th>
               <th scope="col"><span class="visually-hidden">操作</span></th>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="asset in assets" :key="asset.slug">
+            <tr v-for="asset in visibleAssets" :key="asset.slug">
               <td>
                 <NuxtLink :to="`/wdl/${asset.slug}`">{{ asset.name }}</NuxtLink>
                 <small>{{ asset.source_filename }} · {{ asset.slug }}</small>
@@ -432,10 +490,18 @@ onBeforeUnmount(() => {
               <td>
                 <span
                   class="analysis-status"
-                  :class="`analysis-status--${asset.current_revision?.analysis.status ?? 'invalid'}`"
+                  :class="`analysis-status--${maintenanceStatus(asset)}`"
                 >
-                  {{ asset.current_revision?.analysis.status === 'valid' ? '通过' : '需处理' }}
+                  {{ maintenanceLabel(asset) }}
                 </span>
+              </td>
+              <td class="wdl-latest-activity">
+                <template v-if="asset.latest_activity">
+                  <strong>{{ asset.latest_activity.actor }} · {{ activityLabel(asset.latest_activity.action) }}</strong>
+                  <small>{{ asset.latest_activity.note || `WDL v${asset.latest_activity.revision ?? asset.current_revision?.version ?? '—'}` }}</small>
+                  <time :datetime="asset.latest_activity.created_at">{{ formatActivityTime(asset.latest_activity.created_at) }}</time>
+                </template>
+                <small v-else>暂无记录</small>
               </td>
               <td>
                 <strong>v{{ asset.current_revision?.version ?? '—' }}</strong>
@@ -450,8 +516,8 @@ onBeforeUnmount(() => {
       </div>
 
       <div v-else class="empty-state wdl-assets-empty">
-        <strong>{{ searchQuery || selectedTags.length ? '没有匹配的 WDL' : '还没有历史 WDL' }}</strong>
-        <p>{{ searchQuery || selectedTags.length ? '调整搜索词或标签筛选。' : '从一个正在使用的 WDL 开始导入，系统会保留原始 v1。' }}</p>
+        <strong>{{ searchQuery || selectedTags.length || maintenanceFilter !== 'all' ? '没有匹配的 WDL' : '还没有历史 WDL' }}</strong>
+        <p>{{ searchQuery || selectedTags.length || maintenanceFilter !== 'all' ? '调整搜索词、标签或维护状态。' : '从一个正在使用的 WDL 开始导入，系统会保留原始 v1。' }}</p>
         <button
           v-if="!searchQuery && selectedTags.length === 0"
           class="button button--primary"

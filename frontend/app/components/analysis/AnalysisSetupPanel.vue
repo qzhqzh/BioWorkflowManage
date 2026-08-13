@@ -12,6 +12,7 @@ const props = defineProps<{
   error: string
   initialWorkflow?: string
   initialRevision?: number
+  initialDataset?: string
 }>()
 
 const emit = defineEmits<{
@@ -27,6 +28,7 @@ const emit = defineEmits<{
     sample_gender: string
   }]
 }>()
+const route = useRoute()
 
 const workflowSlug = ref('')
 const datasetId = ref('')
@@ -104,12 +106,14 @@ watch(
         : undefined
       workflowSlug.value = requested?.slug ?? (props.initialWorkflow ? '' : catalog.workflows[0]?.slug ?? '')
     }
-    datasetId.value ||= catalog.datasets[0]?.id ?? ''
+    const requestedDataset = catalog.datasets.find(item => item.id === props.initialDataset)
+    datasetId.value ||= requestedDataset?.id ?? catalog.datasets[0]?.id ?? ''
     referenceId.value ||= catalog.database.references[0]?.id ?? ''
     panelId.value ||= panels.value[0]?.id ?? ''
-    if (!sampleId.value && catalog.datasets[0]) {
-      sampleId.value = catalog.datasets[0].name
-      sampleName.value = catalog.datasets[0].name
+    const initialDataset = requestedDataset ?? catalog.datasets[0]
+    if (!sampleId.value && initialDataset) {
+      sampleId.value = initialDataset.name
+      sampleName.value = initialDataset.name
     }
   },
   { immediate: true },
@@ -122,6 +126,12 @@ watch(datasetId, (value, previous) => {
   if (!sampleId.value || sampleId.value === oldDataset?.name) sampleId.value = dataset.name
   if (!sampleName.value || sampleName.value === oldDataset?.name) sampleName.value = dataset.name
   if (controlDatasetId.value === value) controlDatasetId.value = ''
+  if (typeof route.query.dataset === 'string' && route.query.dataset !== value) {
+    void navigateTo({
+      path: '/runs',
+      query: { ...route.query, dataset: value },
+    }, { replace: true })
+  }
 })
 
 watch(referenceId, () => {

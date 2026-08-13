@@ -11,11 +11,12 @@ ALL_SECTIONS = (
     "packages",
     "tools",
     "resources",
+    "rawdata",
     "runs",
     "wdl",
     "help",
 )
-ANALYSIS_OPERATOR_SECTIONS = ("runs",)
+ANALYSIS_OPERATOR_SECTIONS = ("rawdata", "runs")
 
 
 def is_admin(user) -> bool:
