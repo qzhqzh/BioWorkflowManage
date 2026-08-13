@@ -17,6 +17,7 @@ type ListItem =
 
 const catalog = ref<RawdataCatalog>()
 const loadState = ref<'loading' | 'ready' | 'error'>('loading')
+const scanState = ref<'idle' | 'queueing' | 'queued' | 'error'>('idle')
 const errorMessage = ref('')
 const search = ref('')
 const selectedDirectory = ref('all')
@@ -121,15 +122,23 @@ function formatTime(value: string) {
   }).format(new Date(value))
 }
 
-async function loadCatalog(forceRefresh = false) {
-  loadState.value = 'loading'
+let catalogPollTimer: ReturnType<typeof setTimeout> | undefined
+
+function scheduleCatalogPoll() {
+  if (catalogPollTimer) window.clearTimeout(catalogPollTimer)
+  if (!catalog.value?.index.active_status) return
+  catalogPollTimer = window.setTimeout(() => void loadCatalog(true), 2000)
+}
+
+async function loadCatalog(silent = false) {
+  if (!silent) loadState.value = 'loading'
   errorMessage.value = ''
   try {
-    catalog.value = await $api<RawdataCatalog>('/api/v1/rawdata/catalog', {
-      query: forceRefresh ? { refresh: 1 } : undefined,
-    })
+    catalog.value = await $api<RawdataCatalog>('/api/v1/rawdata/catalog')
     loadState.value = 'ready'
+    if (!catalog.value.index.active_status) scanState.value = 'idle'
     ensureSelection()
+    scheduleCatalogPoll()
   }
   catch (error: any) {
     loadState.value = 'error'
@@ -137,8 +146,26 @@ async function loadCatalog(forceRefresh = false) {
   }
 }
 
+async function requestScan() {
+  if (scanState.value === 'queueing' || catalog.value?.index.active_status) return
+  scanState.value = 'queueing'
+  errorMessage.value = ''
+  try {
+    await $api('/api/v1/rawdata/scans', { method: 'POST' })
+    scanState.value = 'queued'
+    await loadCatalog(true)
+  }
+  catch (error: any) {
+    scanState.value = 'error'
+    errorMessage.value = error?.data?.error?.message ?? '后台扫描排队失败。'
+  }
+}
+
 watch([search, selectedDirectory, statusFilter], ensureSelection)
 onMounted(() => void loadCatalog())
+onBeforeUnmount(() => {
+  if (catalogPollTimer) window.clearTimeout(catalogPollTimer)
+})
 </script>
 
 <template>
@@ -154,12 +181,31 @@ onMounted(() => void loadCatalog())
       <template #status>
         <span v-if="catalog" class="save-state">
           <span class="status-dot" />
-          {{ catalog.root_status === 'ready' ? `扫描于 ${formatTime(catalog.scanned_at)}` : '目录未就绪' }}
+          {{ catalog.index.active_status
+            ? '后台扫描中'
+            : catalog.index.latest_status === 'failed'
+              ? '最近扫描失败'
+              : catalog.index.latest_status === 'limited'
+                ? '清单扫描受限'
+            : catalog.index.stale
+              ? '清单需要更新'
+              : catalog.scanned_at
+                ? `清单更新于 ${formatTime(catalog.scanned_at)}`
+                : '正在建立清单' }}
         </span>
       </template>
       <template #actions>
-        <button class="button button--ghost" type="button" :disabled="loadState === 'loading'" @click="loadCatalog(true)">
-          {{ loadState === 'loading' ? '正在扫描…' : '重新扫描' }}
+        <button
+          class="button button--ghost"
+          type="button"
+          :disabled="loadState === 'loading' || scanState === 'queueing' || Boolean(catalog?.index.active_status)"
+          @click="requestScan"
+        >
+          {{ catalog?.index.active_status
+            ? '扫描进行中'
+            : scanState === 'queueing'
+              ? '正在排队…'
+              : '更新清单' }}
         </button>
         <NuxtLink
           v-if="canRunSelected"
@@ -187,10 +233,10 @@ onMounted(() => void loadCatalog())
         </div>
       </header>
 
-      <div v-if="loadState === 'loading'" class="analysis-page-state">正在扫描原始数据目录…</div>
+      <div v-if="loadState === 'loading'" class="analysis-page-state">正在读取原始数据清单…</div>
       <div v-else-if="loadState === 'error'" class="analysis-page-state analysis-page-state--error" role="alert">
         <strong>{{ errorMessage }}</strong>
-        <button class="button button--ghost" type="button" @click="loadCatalog(true)">重试</button>
+        <button class="button button--ghost" type="button" @click="loadCatalog()">重试</button>
       </div>
       <template v-else-if="catalog">
         <div v-if="catalog.issues.length" class="rawdata-global-issues" role="status">
@@ -199,9 +245,39 @@ onMounted(() => void loadCatalog())
           </p>
         </div>
 
+        <section class="rawdata-index-status" aria-label="原始数据索引状态">
+          <div>
+            <strong>{{ catalog.index.active_status
+              ? '后台正在更新清单'
+              : catalog.index.latest_status === 'failed'
+                ? '最近一次扫描失败'
+                : catalog.index.latest_status === 'limited'
+                  ? '扫描达到安全预算'
+                  : catalog.index.stale
+                    ? '当前清单已过期'
+                    : '清单已同步' }}</strong>
+            <span>
+              {{ catalog.index.active_status
+                ? `已扫描 ${catalog.scanned_entry_count.toLocaleString('zh-CN')} 个目录项；页面继续使用上次成功快照。`
+                : catalog.index.finished_at
+                  ? `完成于 ${formatTime(catalog.index.finished_at)}`
+                  : '首次扫描完成后会显示可运行数据。' }}
+            </span>
+          </div>
+          <details>
+            <summary>扫描策略</summary>
+            <p>最多 {{ catalog.index.policy.max_entries.toLocaleString('zh-CN') }} 个目录项、{{ catalog.index.policy.max_files.toLocaleString('zh-CN') }} 个文件、{{ catalog.index.policy.max_depth }} 层目录；每批 {{ catalog.index.policy.batch_entries.toLocaleString('zh-CN') }} 项。</p>
+          </details>
+        </section>
+
+        <div v-if="catalog.index.repair_suggestions.length" class="rawdata-repair-suggestions">
+          <strong>管理员处理建议</strong>
+          <p v-for="item in catalog.index.repair_suggestions" :key="item">{{ item }}</p>
+        </div>
+
         <div v-if="catalog.root_status !== 'ready'" class="empty-state rawdata-root-empty">
-          <strong>原始数据目录尚未就绪</strong>
-          <p>请确认 Docker Compose 已将宿主机 rawdata 目录挂载到项目工作区，然后重新扫描。</p>
+          <strong>{{ catalog.root_status === 'indexing' ? '正在建立原始数据清单' : '原始数据目录尚未就绪' }}</strong>
+          <p>{{ catalog.root_status === 'indexing' ? '后台索引器会分批扫描目录，页面无需保持打开。' : '请确认 Docker Compose 已将宿主机 rawdata 目录只读挂载到项目工作区。' }}</p>
         </div>
         <div v-else class="rawdata-layout">
           <aside class="rawdata-directories" aria-label="原始数据目录">
@@ -288,12 +364,24 @@ onMounted(() => void loadCatalog())
                 <div><dt>目录</dt><dd>{{ selectedDataset.directory }}</dd></div>
                 <div><dt>总大小</dt><dd>{{ selectedDataset.total_size_label }}</dd></div>
                 <div><dt>配对规则</dt><dd><code>{{ selectedDataset.pair_key }}</code></dd></div>
+                <div v-if="selectedDataset.first_seen_at"><dt>首次发现</dt><dd>{{ formatTime(selectedDataset.first_seen_at) }}</dd></div>
+                <div v-if="selectedDataset.last_changed_at"><dt>最近变化</dt><dd>{{ formatTime(selectedDataset.last_changed_at) }}</dd></div>
+                <div><dt>运行引用</dt><dd>{{ selectedDataset.run_count ?? 0 }} 次</dd></div>
               </dl>
               <section v-if="selectedDataset.issues.length" class="rawdata-inspector-section">
                 <h3>需要处理</h3>
                 <ul class="rawdata-issue-list">
                   <li v-for="issue in selectedDataset.issues" :key="`${issue.code}:${issue.path ?? ''}`">
                     <strong>{{ issue.message }}</strong><code v-if="issue.path">{{ issue.path }}</code>
+                  </li>
+                </ul>
+              </section>
+              <section v-if="selectedDataset.recent_runs?.length" class="rawdata-inspector-section">
+                <h3>最近运行</h3>
+                <ul class="rawdata-run-list">
+                  <li v-for="run in selectedDataset.recent_runs" :key="run.id">
+                    <NuxtLink :to="`/runs?run=${encodeURIComponent(run.id)}`">{{ run.id.slice(0, 8) }}</NuxtLink>
+                    <span>{{ run.status }} · {{ formatTime(run.created_at) }}</span>
                   </li>
                 </ul>
               </section>
@@ -336,8 +424,80 @@ onMounted(() => void loadCatalog())
           </aside>
         </div>
       </template>
-      <footer class="workspace-version">v1 · 开发版</footer>
+      <footer class="workspace-version">v1.0 · 稳定版</footer>
     </main>
     <!-- FINISH REVIEW: critique this page against /home/zhuqin/.agents/skills/impeccable/reference/craft-floor.md -->
   </div>
 </template>
+
+<style scoped>
+.rawdata-index-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  background: var(--color-bg);
+}
+
+.rawdata-index-status > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.rawdata-index-status span,
+.rawdata-index-status details,
+.rawdata-repair-suggestions p,
+.rawdata-run-list span {
+  color: var(--color-muted);
+  font-size: 0.75rem;
+}
+
+.rawdata-index-status summary {
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.rawdata-index-status details p {
+  max-width: 440px;
+  margin: 8px 0 0;
+  line-height: 1.5;
+}
+
+.rawdata-repair-suggestions {
+  margin-bottom: 12px;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--color-warning) 45%, var(--color-border));
+  border-radius: 10px;
+  background: var(--color-warning-soft);
+}
+
+.rawdata-repair-suggestions p {
+  margin: 4px 0 0;
+}
+
+.rawdata-run-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.rawdata-run-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+@media (max-width: 720px) {
+  .rawdata-index-status {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
+</style>

@@ -3,6 +3,7 @@ import { createTwoFilesPatch, diffArrays } from 'diff'
 import AppRail from '~/components/layout/AppRail.vue'
 import AppTopbar from '~/components/layout/AppTopbar.vue'
 import WdlCodeEditor from '~/components/wdl/WdlCodeEditor.vue'
+import WdlCollaborationPanel from '~/components/wdl/WdlCollaborationPanel.vue'
 import WdlFileTree from '~/components/wdl/WdlFileTree.vue'
 import WdlPackageReferencePanel from '~/components/wdl/WdlPackageReferencePanel.vue'
 import type {
@@ -18,7 +19,7 @@ import type {
 const { $api: $fetch } = useNuxtApp()
 const { navigateSection } = useAppNavigation()
 
-type InspectorTab = 'structure' | 'diagnostics' | 'diff' | 'history'
+type InspectorTab = 'structure' | 'diagnostics' | 'collaboration' | 'diff' | 'history'
 type WdlCodeEditorHandle = {
   applyFormattedValue: (value: string) => void
   revealLine: (line: number) => void
@@ -82,6 +83,8 @@ const derivedPackages = ref<Array<{
   latest_version?: { version: string } | null
 }>>([])
 const codeEditor = ref<WdlCodeEditorHandle>()
+const cursorLine = ref(1)
+const collaborationComposerRequest = ref(0)
 const assetNameInput = ref<HTMLInputElement>()
 const assetDescriptionInput = ref<HTMLTextAreaElement>()
 const revisionNoteInput = ref<HTMLInputElement>()
@@ -215,6 +218,16 @@ const actionLabels: Record<string, string> = {
   package_link: '引用工具包',
   metadata_update: '更新信息与标签',
   tool_import: '导入工具草稿',
+  review_requested: '发起评审',
+  review_reassigned: '转交评审',
+  review_approved: '评审通过',
+  review_changes_requested: '要求修改',
+  review_cancelled: '取消评审',
+  review_comment_added: '添加评审评论',
+  review_thread_resolve: '解决讨论',
+  review_thread_reopen: '重新打开讨论',
+  source_conflict: '记录源码冲突',
+  source_conflict_resolved: '解决源码冲突',
 }
 
 function referenceKey(reference: WdlSourcePackageReference) {
@@ -620,6 +633,9 @@ async function refreshAssetAudit() {
     asset.value = {
       ...asset.value,
       audit_events: refreshed.audit_events,
+      attention: refreshed.attention,
+      collaboration: refreshed.collaboration,
+      latest_activity: refreshed.latest_activity,
     }
     selectedEvent.value = refreshed.audit_events?.[0]
   } catch {
@@ -1087,7 +1103,16 @@ function addPackageReference(payload: {
 
 function selectFile(path: string, line?: number) {
   activeFilePath.value = path
-  if (line) void nextTick(() => codeEditor.value?.revealLine(line))
+  if (line) {
+    cursorLine.value = line
+    void nextTick(() => codeEditor.value?.revealLine(line))
+  }
+}
+
+function openCollaborationComposer(line: number) {
+  cursorLine.value = line
+  inspectorTab.value = 'collaboration'
+  collaborationComposerRequest.value += 1
 }
 
 async function importTask(task: NonNullable<typeof analysis.value>['tasks'][number]) {
@@ -1133,6 +1158,9 @@ function handleSaveShortcut(event: KeyboardEvent) {
   } else if (event.shiftKey && event.altKey && event.key.toLowerCase() === 'f') {
     event.preventDefault()
     void formatSource()
+  } else if ((event.ctrlKey || event.metaKey) && event.altKey && event.key.toLowerCase() === 'm') {
+    event.preventDefault()
+    openCollaborationComposer(cursorLine.value)
   }
 }
 
@@ -1401,6 +1429,17 @@ onBeforeRouteLeave(() => {
               <kbd>⇧ Alt E</kbd>
             </button>
             <button
+              class="button button--ghost wdl-comment-button"
+              type="button"
+              aria-label="评论当前行"
+              title="添加行级评论（Ctrl/⌘ + Alt + M）"
+              :disabled="dirty"
+              @click="openCollaborationComposer(cursorLine)"
+            >
+              <span>评论</span>
+              <kbd>Ctrl Alt M</kbd>
+            </button>
+            <button
               v-if="!isActiveFileReadOnly"
               class="button button--ghost wdl-format-button"
               type="button"
@@ -1469,6 +1508,8 @@ onBeforeRouteLeave(() => {
             :aria-label="`${asset.name} WDL 源码`"
             @export="exportWdl"
             @format="formatSource"
+            @comment="openCollaborationComposer"
+            @cursor-line="cursorLine = $event"
           />
           <template #fallback>
             <div class="wdl-editor-loading">正在载入源码编辑器…</div>
@@ -1493,6 +1534,15 @@ onBeforeRouteLeave(() => {
 
       <aside class="wdl-workbench__inspector">
         <div class="panel-tabs panel-tabs--inspector" role="tablist" aria-label="WDL 工作台检查器">
+          <button
+            type="button"
+            role="tab"
+            :aria-selected="inspectorTab === 'collaboration'"
+            :class="{ 'panel-tab--active': inspectorTab === 'collaboration' }"
+            @click="inspectorTab = 'collaboration'"
+          >
+            协作 <span class="tab-count">{{ asset.collaboration?.open_thread_count ?? 0 }}</span>
+          </button>
           <button
             type="button"
             role="tab"
@@ -1645,6 +1695,18 @@ onBeforeRouteLeave(() => {
           </article>
           <p v-if="analysis?.diagnostics.length === 0" class="empty-state">当前版本没有诊断信息。</p>
         </div>
+
+        <WdlCollaborationPanel
+          v-else-if="inspectorTab === 'collaboration' && selectedRevision"
+          :slug="slug"
+          :revision="selectedRevision.version"
+          :file-path="activeFilePath"
+          :anchor-line="cursorLine"
+          :can-comment="!dirty"
+          :composer-request="collaborationComposerRequest"
+          @reveal="selectFile"
+          @changed="refreshAssetAudit"
+        />
 
         <div v-else-if="inspectorTab === 'diff'" class="wdl-inspector-content wdl-format-diff-panel">
           <header>

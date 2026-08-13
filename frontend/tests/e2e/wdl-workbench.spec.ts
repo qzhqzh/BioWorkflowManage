@@ -452,6 +452,98 @@ async function mockWdlApi(page: Page, options: {
     }),
   }))
 
+  let reviews: Array<Record<string, any>> = []
+  let threads: Array<Record<string, any>> = []
+  let releaseChecks: Array<Record<string, any>> = []
+  let releases: Array<Record<string, any>> = []
+  const collaborationPayload = () => ({
+    asset: 'solid-tumor-hg38',
+    revision: revisionVersion,
+    latest_revision: revisionVersion,
+    is_latest: true,
+    reviews,
+    threads,
+    assignees: [{ username: 'zhuqin' }, { username: 'chaohuaiyu' }],
+    me: 'zhuqin',
+    attention: { pending_reviews: 0, open_conflicts: 0, total: 0 },
+    governance: {
+      policy: {
+        version: 1,
+        enabled_checks: ['syntax', 'imports', 'package_pins', 'approved_review', 'resolved_threads', 'small_data_run'],
+        max_input_bytes: 1073741824,
+        updated_by: 'system',
+        updated_at: '2026-08-12T08:00:00Z',
+      },
+      can_manage_policy: true,
+      checks: releaseChecks,
+      releases,
+    },
+  })
+  await page.route('**/api/v1/wdl-assets/solid-tumor-hg38/collaboration*', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(collaborationPayload()),
+  }))
+  await page.route('**/api/v1/wdl-assets/solid-tumor-hg38/reviews', async (route) => {
+    const body = route.request().postDataJSON()
+    reviews = [{
+      id: 1, revision: revisionVersion, status: 'pending', version: 1,
+      requester: 'zhuqin', assignee: body.assignee, request_note: body.note,
+      conclusion: '', concluded_by: '', concluded_at: null,
+      created_at: '2026-08-12T08:00:00Z', updated_at: '2026-08-12T08:00:00Z',
+    }]
+    await route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify(reviews[0]) })
+  })
+  await page.route('**/api/v1/wdl-assets/solid-tumor-hg38/reviews/*', async (route) => {
+    const body = route.request().postDataJSON()
+    reviews = [{
+      ...reviews[0], status: body.action === 'approve' ? 'approved' : 'changes_requested',
+      version: 2, conclusion: body.conclusion, concluded_by: 'zhuqin',
+      concluded_at: '2026-08-12T08:05:00Z', updated_at: '2026-08-12T08:05:00Z',
+    }]
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(reviews[0]) })
+  })
+  await page.route('**/api/v1/wdl-assets/solid-tumor-hg38/review-threads', async (route) => {
+    const body = route.request().postDataJSON()
+    threads = [{
+      id: 1, revision: revisionVersion, file_path: body.file_path, line: body.line,
+      status: 'open', version: 1, created_by: 'zhuqin', resolved_by: '', resolved_at: null,
+      created_at: '2026-08-12T08:00:00Z', updated_at: '2026-08-12T08:00:00Z', stale: false,
+      comments: [{ id: 1, author: 'zhuqin', body: body.body, created_at: '2026-08-12T08:00:00Z' }],
+    }]
+    await route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify(threads[0]) })
+  })
+  await page.route('**/api/v1/wdl-assets/solid-tumor-hg38/review-threads/*', async (route) => {
+    threads = [{
+      ...threads[0], status: 'resolved', version: 2, resolved_by: 'zhuqin',
+      resolved_at: '2026-08-12T08:06:00Z', updated_at: '2026-08-12T08:06:00Z',
+    }]
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(threads[0]) })
+  })
+  await page.route('**/api/v1/wdl-assets/solid-tumor-hg38/release-checks', async (route) => {
+    releaseChecks = [{
+      id: 1, revision: revisionVersion, revision_digest: currentRevision().digest,
+      status: 'passed', policy_version: 1, analysis_run_id: 'run-1', requested_by: 'zhuqin',
+      policy_snapshot: collaborationPayload().governance.policy,
+      created_at: '2026-08-12T08:10:00Z',
+      checks: [
+        { key: 'syntax', passed: true, label: '语法与静态检查通过', evidence: {} },
+        { key: 'approved_review', passed: true, label: '当前 revision 的最近一次评审已通过', evidence: {} },
+        { key: 'small_data_run', passed: true, label: '当前 revision 有成功的小数据运行', evidence: {} },
+      ],
+    }]
+    await route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify(releaseChecks[0]) })
+  })
+  await page.route('**/api/v1/wdl-assets/solid-tumor-hg38/releases', async (route) => {
+    const body = route.request().postDataJSON()
+    releases = [{
+      id: 1, version: body.version, revision: revisionVersion,
+      revision_digest: currentRevision().digest, release_check_id: 1,
+      note: body.note, actor: 'zhuqin', created_at: '2026-08-12T08:12:00Z',
+    }]
+    await route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify(releases[0]) })
+  })
+
   return { metadataRequests, revisionRequests, tagRequests }
 }
 
@@ -470,6 +562,32 @@ test('shows explicit package, tool extraction, and direct-run paths', async ({ p
     'href',
     '/runs?workflow=solid-tumor-hg38&revision=1',
   )
+})
+
+test('completes review, line discussion, and stable release from one collaboration panel', async ({ page }) => {
+  await mockWdlApi(page)
+  await page.goto('/wdl/solid-tumor-hg38')
+  await page.getByRole('tab', { name: /协作/ }).click()
+
+  await page.getByLabel('交接说明').fill('请检查输出和工具包版本')
+  await page.getByRole('button', { name: '发起评审' }).click()
+  await expect(page.getByText('等待评审')).toBeVisible()
+  await page.getByLabel('评审结论').fill('小数据验证与依赖检查通过')
+  await page.getByRole('button', { name: '通过评审' }).click()
+  await expect(page.getByText('已通过')).toBeVisible()
+
+  await page.getByPlaceholder('针对当前行提出问题或说明').fill('确认入口版本声明')
+  await page.getByRole('button', { name: '添加评论' }).click()
+  await expect(page.getByText('确认入口版本声明')).toBeVisible()
+  await page.getByRole('button', { name: '解决' }).click()
+
+  await page.getByRole('button', { name: '运行发布检查' }).click()
+  await expect(page.getByText('当前 revision 有成功的小数据运行')).toBeVisible()
+  await page.getByRole('textbox', { name: '版本', exact: true }).fill('1.0.0')
+  await page.getByLabel('发布备注').fill('首个稳定协作基线')
+  await page.getByRole('button', { name: '发布稳定版本' }).click()
+  await expect(page.getByText('已发布', { exact: true })).toBeVisible()
+  await expect(page.getByText('首个稳定协作基线')).toBeVisible()
 })
 
 test('imports one historical WDL task into an exact tool draft', async ({ page }) => {

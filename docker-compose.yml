@@ -33,6 +33,13 @@ services:
       DJANGO_SEED_DEMO: "${DJANGO_SEED_DEMO:-0}"
       DJANGO_SEED_ALLOW_DEFAULT_PASSWORDS: "${DJANGO_SEED_ALLOW_DEFAULT_PASSWORDS:-0}"
       ANALYSIS_RAWDATA_ROOT: /analysis/rawdata
+      RAWDATA_SCAN_BATCH_ENTRIES: "${RAWDATA_SCAN_BATCH_ENTRIES:-1000}"
+      RAWDATA_SCAN_MAX_FILES: "${RAWDATA_SCAN_MAX_FILES:-20000}"
+      RAWDATA_SCAN_MAX_ENTRIES: "${RAWDATA_SCAN_MAX_ENTRIES:-100000}"
+      RAWDATA_SCAN_MAX_DEPTH: "${RAWDATA_SCAN_MAX_DEPTH:-8}"
+      RAWDATA_SCAN_BATCH_SECONDS: "${RAWDATA_SCAN_BATCH_SECONDS:-2}"
+      RAWDATA_INDEX_INTERVAL_SECONDS: "${RAWDATA_INDEX_INTERVAL_SECONDS:-300}"
+      RAWDATA_INDEX_STALE_SECONDS: "${RAWDATA_INDEX_STALE_SECONDS:-900}"
       ANALYSIS_RAWDATA_EXECUTION_ROOT: ${ANALYSIS_RAWDATA_EXECUTION_ROOT:-/analysis/rawdata}
       ANALYSIS_DATABASE_ROOT: /analysis/databases
       ANALYSIS_DATABASE_CATALOG: /analysis/databases/catalog.json
@@ -51,6 +58,42 @@ services:
       interval: 10s
       timeout: 3s
       retries: 10
+
+  rawdata-indexer:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    restart: unless-stopped
+    command: ["python", "backend/manage.py", "run_rawdata_indexer"]
+    user: "${MINIWDL_UID:-1000}:${MINIWDL_GID:-1000}"
+    read_only: true
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_DB: ${POSTGRES_DB:-bioworkflow}
+      POSTGRES_USER: ${POSTGRES_USER:-bioworkflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?Set DJANGO_SECRET_KEY in .env}
+      ANALYSIS_RAWDATA_ROOT: /analysis/rawdata
+      RAWDATA_SCAN_BATCH_ENTRIES: "${RAWDATA_SCAN_BATCH_ENTRIES:-1000}"
+      RAWDATA_SCAN_MAX_FILES: "${RAWDATA_SCAN_MAX_FILES:-20000}"
+      RAWDATA_SCAN_MAX_ENTRIES: "${RAWDATA_SCAN_MAX_ENTRIES:-100000}"
+      RAWDATA_SCAN_MAX_DEPTH: "${RAWDATA_SCAN_MAX_DEPTH:-8}"
+      RAWDATA_SCAN_BATCH_SECONDS: "${RAWDATA_SCAN_BATCH_SECONDS:-2}"
+      RAWDATA_INDEX_INTERVAL_SECONDS: "${RAWDATA_INDEX_INTERVAL_SECONDS:-300}"
+      RAWDATA_INDEX_STALE_SECONDS: "${RAWDATA_INDEX_STALE_SECONDS:-900}"
+    volumes:
+      - ${ANALYSIS_RAWDATA_HOST_PATH:-./workspace/rawdata}:/analysis/rawdata:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
 
   frontend:
     build:

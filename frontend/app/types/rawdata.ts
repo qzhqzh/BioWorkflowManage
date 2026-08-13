@@ -24,6 +24,15 @@ export interface RawdataDataset {
   files: RawdataFile[]
   total_size: number
   total_size_label: string
+  first_seen_at?: string
+  last_seen_at?: string
+  last_changed_at?: string
+  run_count?: number
+  recent_runs?: Array<{
+    id: string
+    status: string
+    created_at: string
+  }>
 }
 
 export interface RawdataDirectory {
@@ -38,8 +47,8 @@ export interface RawdataDirectory {
 
 export interface RawdataCatalog {
   root_directory: string
-  root_status: 'ready' | 'missing' | 'unreadable'
-  scanned_at: string
+  root_status: 'ready' | 'missing' | 'unreadable' | 'indexing'
+  scanned_at?: string | null
   scan_limited: boolean
   scan_limit: number
   scan_entry_limit: number
@@ -57,4 +66,22 @@ export interface RawdataCatalog {
   datasets: RawdataDataset[]
   unrecognized_files: RawdataFile[]
   issues: RawdataIssue[]
+  index: {
+    latest_scan_id?: string | null
+    latest_status?: 'succeeded' | 'limited' | 'failed' | null
+    snapshot_scan_id?: string | null
+    active_scan_id?: string | null
+    active_status?: 'queued' | 'running' | null
+    queued_at?: string | null
+    started_at?: string | null
+    finished_at?: string | null
+    stale: boolean
+    policy: {
+      max_files: number
+      max_entries: number
+      max_depth: number
+      batch_entries: number
+    }
+    repair_suggestions: string[]
+  }
 }

@@ -449,7 +449,7 @@ onMounted(() => void loadCatalog())
         </aside>
       </div>
 
-      <footer class="analysis-runs-footer" aria-label="版本信息">v1 · 开发版</footer>
+      <footer class="analysis-runs-footer" aria-label="版本信息">v1.0 · 稳定版</footer>
     </main>
   </div>
 </template>

@@ -10,7 +10,7 @@ const { navigateSection } = useAppNavigation()
 const availableTags = ref<WdlTag[]>([])
 const searchQuery = ref('')
 const selectedTags = ref<string[]>([])
-const maintenanceFilter = ref<'all' | 'attention' | 'ready'>('all')
+const maintenanceFilter = ref<'all' | 'mine' | 'attention' | 'ready'>('all')
 const loadState = ref<'loading' | 'ready' | 'error'>('loading')
 const showImport = ref(false)
 const fileInput = ref<HTMLInputElement>()
@@ -35,6 +35,7 @@ const importDraft = ref({
   sourceRevision: '',
 })
 const visibleAssets = computed(() => assets.value.filter((asset) => {
+  if (maintenanceFilter.value === 'mine') return Boolean(asset.attention?.total)
   if (maintenanceFilter.value === 'attention') return maintenanceStatus(asset) !== 'ready'
   if (maintenanceFilter.value === 'ready') return maintenanceStatus(asset) === 'ready'
   return true
@@ -43,6 +44,7 @@ const visibleAssets = computed(() => assets.value.filter((asset) => {
 const attentionCount = computed(() => assets.value.filter(
   asset => maintenanceStatus(asset) !== 'ready',
 ).length)
+const myWorkCount = computed(() => assets.value.filter(asset => asset.attention?.total).length)
 
 function maintenanceStatus(asset: WdlAsset) {
   return asset.maintenance_status
@@ -379,6 +381,7 @@ onBeforeUnmount(() => {
         <button class="button button--ghost" type="submit">查询</button>
         <div class="wdl-maintenance-filter" aria-label="维护状态筛选">
           <button type="button" :aria-pressed="maintenanceFilter === 'all'" @click="maintenanceFilter = 'all'">全部</button>
+          <button type="button" :aria-pressed="maintenanceFilter === 'mine'" @click="maintenanceFilter = 'mine'">等待我处理 {{ myWorkCount }}</button>
           <button type="button" :aria-pressed="maintenanceFilter === 'attention'" @click="maintenanceFilter = 'attention'">待处理 {{ attentionCount }}</button>
           <button type="button" :aria-pressed="maintenanceFilter === 'ready'" @click="maintenanceFilter = 'ready'">已通过</button>
         </div>
@@ -494,6 +497,12 @@ onBeforeUnmount(() => {
                 >
                   {{ maintenanceLabel(asset) }}
                 </span>
+                <small v-if="asset.collaboration?.pending_review">
+                  评审 → {{ asset.collaboration.pending_review.assignee }}
+                </small>
+                <small v-else-if="asset.collaboration?.open_thread_count">
+                  {{ asset.collaboration.open_thread_count }} 个讨论未解决
+                </small>
               </td>
               <td class="wdl-latest-activity">
                 <template v-if="asset.latest_activity">

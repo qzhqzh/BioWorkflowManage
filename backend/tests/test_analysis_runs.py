@@ -27,6 +27,7 @@ from workflows.analysis_runtime import (
     execute_analysis_run,
 )
 from workflows.analysis_runs import _parse_miniwdl_timing
+from workflows.rawdata_index import queue_rawdata_scan, run_rawdata_scan_batch
 from workflows.models import (
     AnalysisRun,
     WDLAsset,
@@ -737,6 +738,23 @@ def analysis_workspace(settings, tmp_path):
     settings.ANALYSIS_DATABASE_CATALOG = catalog_path
     settings.ANALYSIS_RUN_ROOT = runs
     settings.ANALYSIS_RUN_EXECUTION_ROOT = runs
+    settings.RAWDATA_SCAN_BATCH_ENTRIES = 100
+    settings.RAWDATA_SCAN_MAX_FILES = 100
+    settings.RAWDATA_SCAN_MAX_ENTRIES = 100
+    settings.RAWDATA_SCAN_MAX_DEPTH = 8
+    settings.RAWDATA_SCAN_BATCH_SECONDS = 10
+    settings.RAWDATA_SCAN_LEASE_SECONDS = 60
+    scan, _ = queue_rawdata_scan(
+        actor="test",
+        trigger="fixture",
+        root_value=rawdata,
+    )
+    for _ in range(20):
+        scan = run_rawdata_scan_batch(rawdata) or scan
+        scan.refresh_from_db()
+        if scan.finished_at:
+            break
+    assert scan.status == "succeeded"
     return rawdata, databases, runs, catalog
 
 

@@ -14,12 +14,20 @@ from django.conf import settings
 from django.db import IntegrityError, transaction
 from django.db.models import Count, OuterRef, Q, Subquery
 from django.http import HttpResponse
+from django.utils import timezone
 from django.utils.text import slugify
 from rest_framework import status
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 
-from .models import WDLAuditEvent, WDLAsset, WDLSourceFile, WDLSourceRevision, WDLTag
+from .models import (
+    WDLAuditEvent,
+    WDLAsset,
+    WDLSourceConflict,
+    WDLSourceFile,
+    WDLSourceRevision,
+    WDLTag,
+)
 from .wdl_packages import (
     WDLPackageError,
     analyze_wdl_bundle,
@@ -651,7 +659,12 @@ def _audit_payload(event: WDLAuditEvent) -> dict:
     }
 
 
-def _asset_payload(asset: WDLAsset, *, include_detail: bool = False) -> dict:
+def _asset_payload(
+    asset: WDLAsset,
+    *,
+    include_detail: bool = False,
+    user=None,
+) -> dict:
     latest = asset.source_revisions.first()
     latest_payload = (
         _revision_payload(latest, include_content=include_detail) if latest else None
@@ -666,6 +679,52 @@ def _asset_payload(asset: WDLAsset, *, include_detail: bool = False) -> dict:
         maintenance_status = "warning"
     else:
         maintenance_status = "ready"
+
+    username = "local-user"
+    if user is not None and getattr(user, "is_authenticated", False):
+        username = user.get_username() or username
+    review_requests = list(asset.review_requests.all())
+    source_conflicts = list(asset.source_conflicts.all())
+    review_threads = list(asset.review_threads.all())
+    pending_review = next(
+        (
+            item
+            for item in review_requests
+            if item.revision_id == getattr(latest, "id", None)
+            and item.status == "pending"
+        ),
+        None,
+    )
+    assigned_review_count = sum(
+        item.status == "pending" and item.assignee_name == username
+        for item in review_requests
+    )
+    conflict_count = sum(
+        item.resolved_at is None
+        and (
+            item.assigned_to_id == getattr(user, "id", None)
+            if user is not None and getattr(user, "is_authenticated", False)
+            else item.actor == username
+        )
+        for item in source_conflicts
+    )
+    diagnostic_count = (
+        error_count
+        if error_count
+        and (
+            asset.created_by == username
+            or bool(getattr(user, "is_staff", False))
+            or bool(getattr(user, "is_superuser", False))
+        )
+        else 0
+    )
+    attention_reasons = []
+    if assigned_review_count:
+        attention_reasons.append("review")
+    if conflict_count:
+        attention_reasons.append("conflict")
+    if diagnostic_count:
+        attention_reasons.append("diagnostic")
 
     latest_activity = None
     latest_activity_id = getattr(asset, "latest_activity_id", None)
@@ -703,6 +762,31 @@ def _asset_payload(asset: WDLAsset, *, include_detail: bool = False) -> dict:
             "errors": error_count,
             "warnings": warning_count,
         },
+        "attention": {
+            "total": assigned_review_count + conflict_count + diagnostic_count,
+            "reviews": assigned_review_count,
+            "conflicts": conflict_count,
+            "diagnostics": diagnostic_count,
+            "reasons": attention_reasons,
+        },
+        "collaboration": {
+            "pending_review": (
+                {
+                    "id": pending_review.id,
+                    "status": pending_review.status,
+                    "assignee": pending_review.assignee_name,
+                    "requester": pending_review.requester_name,
+                    "version": pending_review.version,
+                }
+                if pending_review
+                else None
+            ),
+            "open_thread_count": sum(
+                item.status == "open"
+                and item.revision_id == getattr(latest, "id", None)
+                for item in review_threads
+            ),
+        },
         "latest_activity": latest_activity,
         "current_revision": latest_payload,
     }
@@ -733,7 +817,11 @@ def wdl_assets(request):
             "-created_at", "-id"
         )
         assets = WDLAsset.objects.prefetch_related(
-            "tags", *ASSET_REVISION_PREFETCHES
+            "tags",
+            "review_requests",
+            "source_conflicts",
+            "review_threads",
+            *ASSET_REVISION_PREFETCHES,
         ).annotate(
             latest_activity_id=Subquery(latest_events.values("id")[:1]),
             latest_activity_action=Subquery(latest_events.values("action")[:1]),
@@ -760,10 +848,13 @@ def wdl_assets(request):
         tags = [item for item in request.query_params.getlist("tag") if item]
         if tags:
             assets = assets.filter(tags__name__in=tags).distinct()
-        return _with_request_id(
-            Response({"results": [_asset_payload(item) for item in assets]}),
-            request_id,
-        )
+        payloads = [
+            _asset_payload(item, user=getattr(request, "user", None))
+            for item in assets
+        ]
+        if request.query_params.get("work_queue") == "mine":
+            payloads = [item for item in payloads if item["attention"]["total"]]
+        return _with_request_id(Response({"results": payloads}), request_id)
 
     try:
         files, entrypoint = _request_bundle(request)
@@ -848,7 +939,14 @@ def wdl_assets(request):
             },
         )
     return _with_request_id(
-        Response(_asset_payload(asset, include_detail=True), status=status.HTTP_201_CREATED),
+        Response(
+            _asset_payload(
+                asset,
+                include_detail=True,
+                user=getattr(request, "user", None),
+            ),
+            status=status.HTTP_201_CREATED,
+        ),
         request_id,
     )
 
@@ -857,7 +955,13 @@ def wdl_assets(request):
 def wdl_asset_detail(request, slug: str):
     request_id = _request_id(request)
     asset = (
-        WDLAsset.objects.prefetch_related("tags", *ASSET_REVISION_PREFETCHES)
+        WDLAsset.objects.prefetch_related(
+            "tags",
+            "review_requests",
+            "source_conflicts",
+            "review_threads",
+            *ASSET_REVISION_PREFETCHES,
+        )
         .filter(slug=slug)
         .first()
     )
@@ -871,7 +975,14 @@ def wdl_asset_detail(request, slug: str):
         )
     if request.method == "GET":
         return _with_request_id(
-            Response(_asset_payload(asset, include_detail=True)), request_id
+            Response(
+                _asset_payload(
+                    asset,
+                    include_detail=True,
+                    user=getattr(request, "user", None),
+                )
+            ),
+            request_id,
         )
 
     base_metadata_version = request.data.get("base_metadata_version")
@@ -934,7 +1045,9 @@ def wdl_asset_detail(request, slug: str):
                             },
                         },
                         "current_asset": _asset_payload(
-                            asset, include_detail=True
+                            asset,
+                            include_detail=True,
+                            user=getattr(request, "user", None),
                         ),
                     },
                     status=status.HTTP_409_CONFLICT,
@@ -1032,12 +1145,23 @@ def wdl_asset_detail(request, slug: str):
             )
         asset = (
             WDLAsset.objects.prefetch_related(
-                "tags", *ASSET_REVISION_PREFETCHES
+                "tags",
+                "review_requests",
+                "source_conflicts",
+                "review_threads",
+                *ASSET_REVISION_PREFETCHES,
             )
             .get(pk=asset.pk)
         )
     return _with_request_id(
-        Response(_asset_payload(asset, include_detail=True)), request_id
+        Response(
+            _asset_payload(
+                asset,
+                include_detail=True,
+                user=getattr(request, "user", None),
+            )
+        ),
+        request_id,
     )
 
 
@@ -1128,6 +1252,7 @@ def wdl_asset_revisions(request, slug: str):
         return _package_error_response(error, request_id)
 
     actor = _actor(request)
+    user = getattr(request, "user", None)
     note = str(request.data.get("note") or "").strip()
     with transaction.atomic():
         locked = WDLAsset.objects.select_for_update().get(pk=asset.pk)
@@ -1139,6 +1264,51 @@ def wdl_asset_revisions(request, slug: str):
             or latest.version != base_version
             or latest.digest != base_digest
         ):
+            if latest is not None:
+                assigned_to = (
+                    user
+                    if user is not None and getattr(user, "is_authenticated", False)
+                    else None
+                )
+                conflict_query = (
+                    Q(assigned_to=assigned_to) if assigned_to else Q(actor=actor)
+                )
+                conflict = (
+                    WDLSourceConflict.objects.select_for_update()
+                    .filter(asset=locked, resolved_at__isnull=True)
+                    .filter(conflict_query)
+                    .first()
+                )
+                if conflict is None:
+                    conflict = WDLSourceConflict.objects.create(
+                        asset=locked,
+                        current_revision=latest,
+                        actor=actor,
+                        assigned_to=assigned_to,
+                        base_version=base_version,
+                        base_digest=str(base_digest),
+                        note=note,
+                    )
+                else:
+                    conflict.current_revision = latest
+                    conflict.actor = actor
+                    conflict.assigned_to = assigned_to
+                    conflict.base_version = base_version
+                    conflict.base_digest = str(base_digest)
+                    conflict.note = note
+                    conflict.save()
+                WDLAuditEvent.objects.create(
+                    asset=locked,
+                    revision=latest,
+                    action="source_conflict",
+                    actor=actor,
+                    note=note,
+                    changes={
+                        "conflict_id": conflict.id,
+                        "base_version": base_version,
+                        "current_version": latest.version,
+                    },
+                )
             return _with_request_id(
                 Response(
                     {
@@ -1249,6 +1419,30 @@ def wdl_asset_revisions(request, slug: str):
                 },
             },
         )
+        resolved_at = timezone.now()
+        resolved_conflict_ids = list(
+            WDLSourceConflict.objects.select_for_update()
+            .filter(asset=locked, resolved_at__isnull=True)
+            .filter(
+                Q(assigned_to=user)
+                if user is not None and getattr(user, "is_authenticated", False)
+                else Q(actor=actor)
+            )
+            .values_list("id", flat=True)
+        )
+        if resolved_conflict_ids:
+            WDLSourceConflict.objects.filter(id__in=resolved_conflict_ids).update(
+                resolved_at=resolved_at,
+                updated_at=resolved_at,
+            )
+            WDLAuditEvent.objects.create(
+                asset=locked,
+                revision=revision,
+                action="source_conflict_resolved",
+                actor=actor,
+                note=note,
+                changes={"conflict_ids": resolved_conflict_ids},
+            )
     return _with_request_id(
         Response(
             _revision_payload(revision, include_content=True),

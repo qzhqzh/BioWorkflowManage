@@ -12,6 +12,7 @@ from . import (
     tool_runs,
     views,
     wdl_assets,
+    wdl_collaboration,
     wdl_graph_proposals,
     wdl_tool_packages,
 )
@@ -30,6 +31,7 @@ views.health.view_class.permission_classes = [AllowAny]
 
 for analysis_view in (
     rawdata_catalog.rawdata_catalog,
+    rawdata_catalog.rawdata_scans,
     analysis_runs.analysis_catalog,
     analysis_runs.analysis_runs,
     analysis_runs.analysis_run_detail,
@@ -105,6 +107,7 @@ urlpatterns = [
     path("integration/software", integration_api.integration_software),
     path("analysis/catalog", analysis_runs.analysis_catalog),
     path("rawdata/catalog", rawdata_catalog.rawdata_catalog),
+    path("rawdata/scans", rawdata_catalog.rawdata_scans),
     path("resource-catalog", resource_catalog_api.resource_catalog),
     path("analysis-runs", analysis_runs.analysis_runs),
     path("analysis-runs/<uuid:run_id>", analysis_runs.analysis_run_detail),
@@ -189,6 +192,39 @@ urlpatterns = [
     ),
     path("wdl-assets/<slug:slug>/export", wdl_assets.export_wdl_asset),
     path("wdl-assets/<slug:slug>/tasks/import", wdl_assets.import_wdl_task),
+    path(
+        "wdl-assets/<slug:slug>/collaboration",
+        wdl_collaboration.wdl_asset_collaboration,
+    ),
+    path(
+        "wdl-assets/<slug:slug>/reviews",
+        wdl_collaboration.wdl_review_requests,
+    ),
+    path(
+        "wdl-assets/<slug:slug>/reviews/<int:review_id>",
+        wdl_collaboration.wdl_review_request_detail,
+    ),
+    path(
+        "wdl-assets/<slug:slug>/review-threads",
+        wdl_collaboration.wdl_review_threads,
+    ),
+    path(
+        "wdl-assets/<slug:slug>/review-threads/<int:thread_id>",
+        wdl_collaboration.wdl_review_thread_detail,
+    ),
+    path(
+        "wdl-assets/<slug:slug>/review-threads/<int:thread_id>/comments",
+        wdl_collaboration.wdl_review_thread_comments,
+    ),
+    path("wdl-release-policy", wdl_collaboration.wdl_release_policy),
+    path(
+        "wdl-assets/<slug:slug>/release-checks",
+        wdl_collaboration.wdl_release_checks,
+    ),
+    path(
+        "wdl-assets/<slug:slug>/releases",
+        wdl_collaboration.wdl_asset_releases,
+    ),
     path("editor/workflows", views.workflow_documents),
     path(
         "editor/workflows/<slug:slug>/tool-package-source",
