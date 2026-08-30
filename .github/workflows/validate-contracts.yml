@@ -202,6 +202,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: [contracts-and-golden, backend]
     timeout-minutes: 25
+    env:
+      POSTGRES_PASSWORD: "ci-database-password"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
