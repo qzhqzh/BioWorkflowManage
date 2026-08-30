@@ -106,6 +106,18 @@ urlpatterns = [
         integration_api.integration_analysis_run_output_download,
     ),
     path(
+        "integration/analysis-runs/<uuid:run_id>/artifact-exports",
+        integration_api.integration_analysis_run_artifact_exports,
+    ),
+    path(
+        "integration/artifact-exports/<uuid:export_id>",
+        integration_api.integration_artifact_export_detail,
+    ),
+    path(
+        "integration/artifact-exports/<uuid:export_id>/acknowledge",
+        integration_api.integration_artifact_export_acknowledge,
+    ),
+    path(
         "integration/tool-test-runs/preflight",
         integration_api.integration_tool_test_preflight,
     ),

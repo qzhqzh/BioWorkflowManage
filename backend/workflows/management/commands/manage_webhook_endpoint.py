@@ -10,6 +10,7 @@ from django.db import transaction
 
 from workflows.models import ServiceAccount, WebhookEndpoint
 from workflows.webhooks import (
+    ARTIFACT_EXPORT_EVENT_TYPE,
     TERMINAL_EVENT_TYPE,
     WebhookError,
     resolve_webhook_target,
@@ -75,12 +76,18 @@ class Command(BaseCommand):
         event_types = requested_events or (
             current.event_types if current else [TERMINAL_EVENT_TYPE]
         )
+        supported_events = {
+            TERMINAL_EVENT_TYPE,
+            ARTIFACT_EXPORT_EVENT_TYPE,
+        }
         if (
             not isinstance(event_types, list)
             or not event_types
-            or set(event_types) != {TERMINAL_EVENT_TYPE}
+            or not set(event_types) <= supported_events
         ):
-            raise CommandError(f"当前只支持 --event {TERMINAL_EVENT_TYPE}。")
+            raise CommandError(
+                "--event 只支持 " + "、".join(sorted(supported_events)) + "。"
+            )
         may_reveal_secret = current is None or bool(options["rotate_secret"])
         signing_key = str(settings.WEBHOOK_SIGNING_KEY or "").encode("utf-8")
         if may_reveal_secret and len(signing_key) < 32:

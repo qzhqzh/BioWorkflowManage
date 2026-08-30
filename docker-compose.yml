@@ -83,12 +83,17 @@ services:
       ANALYSIS_OBJECT_STAGE_MAX_ITEMS: "${ANALYSIS_OBJECT_STAGE_MAX_ITEMS:-64}"
       ANALYSIS_OBJECT_STAGE_MAX_OBJECT_BYTES: "${ANALYSIS_OBJECT_STAGE_MAX_OBJECT_BYTES:-1099511627776}"
       ANALYSIS_OBJECT_STAGE_MAX_RUN_BYTES: "${ANALYSIS_OBJECT_STAGE_MAX_RUN_BYTES:-2199023255552}"
+      ANALYSIS_ARTIFACT_EXPORT_PROFILE_DIR: /run/secrets/bioworkflow/artifact-export
+      ANALYSIS_ARTIFACT_EXPORT_MANIFEST_MAX_BYTES: "${ANALYSIS_ARTIFACT_EXPORT_MANIFEST_MAX_BYTES:-1048576}"
+      ANALYSIS_ARTIFACT_RETENTION_MIN_DAYS: "${ANALYSIS_ARTIFACT_RETENTION_MIN_DAYS:-30}"
+      ANALYSIS_ARTIFACT_RETENTION_MAX_DAYS: "${ANALYSIS_ARTIFACT_RETENTION_MAX_DAYS:-3650}"
     volumes:
       - ${ANALYSIS_RAWDATA_HOST_PATH:-./workspace/rawdata}:/analysis/rawdata:ro
       - ${ANALYSIS_DATABASE_HOST_PATH:-./workspace/databases}:/analysis/databases:ro
       - ${ANALYSIS_RUN_HOST_PATH:-./data/analysis-runs}:/analysis/runs:ro
       - ${ANALYSIS_INPUT_STAGING_HOST_PATH:-./data/input-staging}:/analysis/input-staging:ro
       - ${ANALYSIS_OBJECT_STORAGE_SECRETS_HOST_PATH:-./secrets/object-storage}:/run/secrets/bioworkflow/object-storage:ro
+      - ${ANALYSIS_ARTIFACT_EXPORT_SECRETS_HOST_PATH:-./secrets/artifact-export}:/run/secrets/bioworkflow/artifact-export:ro
     depends_on:
       db:
         condition: service_healthy
@@ -162,6 +167,79 @@ services:
       db:
         condition: service_healthy
       backend:
+        condition: service_healthy
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  artifact-exporter:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    restart: unless-stopped
+    command: ["python", "backend/manage.py", "run_artifact_exporter"]
+    user: "${MINIWDL_UID:-1000}:${MINIWDL_GID:-1000}"
+    read_only: true
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_DB: ${POSTGRES_DB:-bioworkflow}
+      POSTGRES_USER: ${POSTGRES_USER:-bioworkflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?Set DJANGO_SECRET_KEY in .env}
+      ANALYSIS_RUN_ROOT: /analysis/runs
+      ANALYSIS_RUN_EXECUTION_ROOT: ${ANALYSIS_RUN_EXECUTION_ROOT:-/analysis/runs}
+      ANALYSIS_ARTIFACT_EXPORT_ROOT: /analysis/exports
+      ANALYSIS_ARTIFACT_EXPORT_PROFILE_DIR: /run/secrets/bioworkflow/artifact-export
+      ANALYSIS_ARTIFACT_EXPORT_TIMEOUT_SECONDS: "${ANALYSIS_ARTIFACT_EXPORT_TIMEOUT_SECONDS:-3600}"
+      ANALYSIS_ARTIFACT_EXPORT_POLL_SECONDS: "${ANALYSIS_ARTIFACT_EXPORT_POLL_SECONDS:-2}"
+      ANALYSIS_ARTIFACT_EXPORT_LEASE_SECONDS: "${ANALYSIS_ARTIFACT_EXPORT_LEASE_SECONDS:-3660}"
+      ANALYSIS_ARTIFACT_EXPORT_MAX_ATTEMPTS: "${ANALYSIS_ARTIFACT_EXPORT_MAX_ATTEMPTS:-5}"
+      ANALYSIS_ARTIFACT_EXPORT_BACKOFF_BASE_SECONDS: "${ANALYSIS_ARTIFACT_EXPORT_BACKOFF_BASE_SECONDS:-5}"
+      ANALYSIS_ARTIFACT_EXPORT_BACKOFF_MAX_SECONDS: "${ANALYSIS_ARTIFACT_EXPORT_BACKOFF_MAX_SECONDS:-3600}"
+      ANALYSIS_ARTIFACT_EXPORT_CHUNK_BYTES: "${ANALYSIS_ARTIFACT_EXPORT_CHUNK_BYTES:-8388608}"
+      ANALYSIS_ARTIFACT_EXPORT_MANIFEST_MAX_BYTES: "${ANALYSIS_ARTIFACT_EXPORT_MANIFEST_MAX_BYTES:-1048576}"
+      ANALYSIS_OUTPUT_MANIFEST_MAX_DEPTH: "${ANALYSIS_OUTPUT_MANIFEST_MAX_DEPTH:-32}"
+      ANALYSIS_OUTPUT_VALUE_MAX_BYTES: "${ANALYSIS_OUTPUT_VALUE_MAX_BYTES:-65536}"
+    volumes:
+      - ${ANALYSIS_RUN_HOST_PATH:-./data/analysis-runs}:/analysis/runs:ro
+      - ${ANALYSIS_ARTIFACT_EXPORT_HOST_PATH:-./data/artifact-exports}:/analysis/exports
+      - ${ANALYSIS_ARTIFACT_EXPORT_SECRETS_HOST_PATH:-./secrets/artifact-export}:/run/secrets/bioworkflow/artifact-export:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  artifact-cleaner:
+    profiles: ["maintenance"]
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    command: ["python", "backend/manage.py", "cleanup_analysis_outputs"]
+    user: "${MINIWDL_UID:-1000}:${MINIWDL_GID:-1000}"
+    read_only: true
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_DB: ${POSTGRES_DB:-bioworkflow}
+      POSTGRES_USER: ${POSTGRES_USER:-bioworkflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?Set DJANGO_SECRET_KEY in .env}
+      ANALYSIS_RUN_ROOT: /analysis/runs
+      ANALYSIS_RUN_EXECUTION_ROOT: ${ANALYSIS_RUN_EXECUTION_ROOT:-/analysis/runs}
+      ANALYSIS_ARTIFACT_CLEANUP_LEASE_SECONDS: "${ANALYSIS_ARTIFACT_CLEANUP_LEASE_SECONDS:-3600}"
+    volumes:
+      - ${ANALYSIS_RUN_HOST_PATH:-./data/analysis-runs}:/analysis/runs
+    depends_on:
+      db:
         condition: service_healthy
     tmpfs:
       - /tmp

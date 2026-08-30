@@ -8,10 +8,11 @@
 
 ## 升级顺序
 
-升级包含数据库迁移 `0023` 至 `0029`，新增 WDL 协作、原始数据索引、WDL 发布证据表、
-共享登录限速桶、稳定分析产品契约和 Webhook Outbox/投递审计表，并约束同一用户在同一资产上
-只能保留一个待解决源码冲突。
-迁移只新增表与约束，不改写已有 WDL revision、运行记录或原始数据。
+升级包含数据库迁移 `0023` 至 `0031`，新增 WDL 协作、原始数据索引、WDL 发布证据表、
+共享登录限速桶、稳定分析产品契约、Webhook Outbox/投递审计、对象输入协调器，以及 Artifact
+Export/结果保留审计表，并约束同一用户在同一资产上只能保留一个待解决源码冲突。
+迁移不改写已有 WDL revision、运行记录或原始数据；`0031` 只为既有终态 Outbox 行按原
+`status_version` 回填稳定 deduplication key，不改变 event ID、payload 或 delivery。
 迁移不会自动把历史 WorkflowVersion 暴露为分析产品；管理员必须按
 [`14-integration-api-and-mcp.md`](14-integration-api-and-mcp.md) 显式发布产品契约。
 
@@ -21,7 +22,7 @@ docker compose exec -T db pg_dump -U "${POSTGRES_USER:-bioworkflow}" \
   -d "${POSTGRES_DB:-bioworkflow}" -Fc > /path/to/backup/bioworkflow-before-stable.dump
 
 # 2. 停止会创建运行记录或索引记录的 worker
-docker compose stop analysis-worker rawdata-indexer webhook-dispatcher
+docker compose stop analysis-worker rawdata-indexer artifact-exporter webhook-dispatcher
 docker compose --profile wdl-host-runtime stop analysis-worker-host
 
 # worker 停止后确认没有 queued/preparing 运行；有则通过运行页/API 取消，升级后重新投递
@@ -43,8 +44,8 @@ docker compose --profile wdl-runtime run --rm --no-deps analysis-worker \
 # docker compose --profile wdl-host-runtime run --rm --no-deps analysis-worker-host \
 #   python backend/manage.py backfill_analysis_output_manifests --actor stable-upgrade
 
-# 5. 启动页面、后台索引、Webhook dispatcher 和所选执行 worker
-docker compose up -d frontend gateway rawdata-indexer webhook-dispatcher
+# 5. 启动页面、后台索引、Artifact Exporter、Webhook dispatcher 和所选执行 worker
+docker compose up -d frontend gateway rawdata-indexer artifact-exporter webhook-dispatcher
 docker compose --profile wdl-host-runtime up -d analysis-worker-host
 ```
 
@@ -97,6 +98,19 @@ SHA-256 的小对象完成 preflight 与真实运行。
 只可在停止所有 analysis worker 且确认没有排队/活跃任务后处理 `sha256/` 持久缓存，保留
 `.leases/` 并且不得删除 Docker volume。
 
+启用 Artifact Export 前创建目标与 profile 目录，并确保 Exporter UID 对目标目录可写：
+
+```bash
+install -d -m 0750 ./data/artifact-exports ./secrets/artifact-export
+chown -R "${MINIWDL_UID:-1000}:${MINIWDL_GID:-1000}" ./data/artifact-exports
+chmod 0640 ./secrets/artifact-export/*.json
+```
+
+profile 只允许部署侧配置，不能写入任务 JSON。先用小结果验证 export 到 `succeeded`、目标
+`manifest.json` SHA-256 与 API `manifest_digest` 一致，再启用需要确认的生产交付。结果清理只通过
+`maintenance` profile 的 `cleanup_analysis_outputs` 显式执行，默认 dry-run；未交付、未确认或仍在
+保留期的运行不会被领取，且命令不删除 Docker volume 或远端交付副本。
+
 Workflow 列表现在默认每页 50、最大 100，并返回 `total`/`has_next`/`summary`。前端已显式翻页；
 任何直接调用 `/api/v1/editor/workflows` 且假设无参数返回全集的旧客户端，必须在发布前改为传
 `page`/`page_size` 并循环到 `has_next=false`。
@@ -115,6 +129,7 @@ Workflow 列表现在默认每页 50、最大 100，并返回 `total`/`has_next`
 docker compose ps
 docker compose exec backend python backend/manage.py showmigrations workflows
 docker compose exec backend python backend/manage.py webhook_delivery_stats
+docker compose exec backend python backend/manage.py artifact_export_stats
 curl -fsS http://127.0.0.1:${APP_PORT:-8082}/api/v1/ready
 ```
 
@@ -128,8 +143,8 @@ curl -fsS http://127.0.0.1:${APP_PORT:-8082}/api/v1/ready
 
 ## 回滚
 
-应用回滚前停止 `analysis-worker`、`analysis-worker-host`、`rawdata-indexer` 与
-`webhook-dispatcher`。代码可回到
+应用回滚前停止 `analysis-worker`、`analysis-worker-host`、`rawdata-indexer`、
+`artifact-exporter` 与 `webhook-dispatcher`。代码可回到
 上一稳定 tag；新增表对旧代码无影响，因此正常回滚不执行逆向 migration，也不删除任何
 表或 Docker volume。若必须恢复数据库，使用升级前的 `pg_dump` 在独立数据库中验证后再
 切换，不能直接覆盖唯一生产副本。

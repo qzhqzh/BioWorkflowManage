@@ -139,6 +139,8 @@ jobs:
           uv run pytest
           backend/tests/test_webhooks.py::test_postgresql_delivery_claim_and_lease_fencing
           backend/tests/test_object_inputs.py::test_postgresql_input_staging_slot_is_serialized
+          backend/tests/test_artifact_exports.py::test_postgresql_artifact_export_claim_and_lease_fencing
+          backend/tests/test_artifact_exports.py::test_cleanup_claim_skips_more_than_fifty_blocked_retention_rows
 
   frontend:
     name: Frontend quality gates

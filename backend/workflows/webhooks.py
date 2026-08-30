@@ -27,6 +27,7 @@ from django.utils import timezone
 
 from .models import (
     AnalysisRun,
+    ArtifactExport,
     IntegrationOutboxEvent,
     WebhookDelivery,
     WebhookDeliveryAttempt,
@@ -35,6 +36,7 @@ from .models import (
 
 
 TERMINAL_EVENT_TYPE = "analysis.run.terminal"
+ARTIFACT_EXPORT_EVENT_TYPE = "analysis.artifact_export.completed"
 TERMINAL_STATUSES = {
     AnalysisRun.Status.SUCCEEDED,
     AnalysisRun.Status.FAILED,
@@ -493,10 +495,11 @@ def enqueue_terminal_event(run: AnalysisRun) -> IntegrationOutboxEvent | None:
     event, created = IntegrationOutboxEvent.objects.get_or_create(
         run=run,
         event_type=TERMINAL_EVENT_TYPE,
-        status_version=run.status_version,
+        deduplication_key=f"status:{run.status_version}",
         defaults={
             "id": event_id,
             "service_account_id": run.service_account_id,
+            "status_version": run.status_version,
             "occurred_at": occurred_at,
             "payload": _terminal_event_payload(
                 run,
@@ -507,9 +510,17 @@ def enqueue_terminal_event(run: AnalysisRun) -> IntegrationOutboxEvent | None:
     )
     if not created:
         return event
+    _create_webhook_deliveries(event, TERMINAL_EVENT_TYPE)
+    return event
+
+
+def _create_webhook_deliveries(
+    event: IntegrationOutboxEvent,
+    event_type: str,
+) -> None:
     endpoints = list(
         WebhookEndpoint.objects.filter(
-            service_account_id=run.service_account_id,
+            service_account_id=event.service_account_id,
             is_active=True,
         )
     )
@@ -523,10 +534,80 @@ def enqueue_terminal_event(run: AnalysisRun) -> IntegrationOutboxEvent | None:
         )
         for endpoint in endpoints
         if isinstance(endpoint.event_types, list)
-        and TERMINAL_EVENT_TYPE in endpoint.event_types
+        and event_type in endpoint.event_types
     ]
     if deliveries:
         WebhookDelivery.objects.bulk_create(deliveries)
+
+
+def _artifact_export_event_payload(
+    export: ArtifactExport,
+    *,
+    event_id: uuid.UUID,
+    occurred_at,
+) -> dict[str, Any]:
+    run = export.run
+    external_ref = {
+        "client_id": export.service_account.client_id,
+        "external_run_id": run.external_run_id,
+    }
+    if run.external_analysis_id:
+        external_ref["external_analysis_id"] = run.external_analysis_id
+    return {
+        "schema_version": "1.0.0",
+        "event_id": str(event_id),
+        "event_type": ARTIFACT_EXPORT_EVENT_TYPE,
+        "occurred_at": occurred_at.isoformat(),
+        "data": {
+            "artifact_export_id": str(export.id),
+            "run_id": str(run.id),
+            "external_ref": external_ref,
+            "status_version": int(run.status_version),
+            "state": export.state,
+            "manifest_digest": export.manifest_digest,
+            "manifest_location": export.manifest_location,
+            "requires_ack": export.requires_ack,
+            "links": {
+                "artifact_export": (
+                    f"/api/v1/integration/artifact-exports/{export.id}"
+                ),
+                "manifest": f"/api/v1/integration/artifact-exports/{export.id}",
+                "acknowledge": (
+                    f"/api/v1/integration/artifact-exports/{export.id}/acknowledge"
+                ),
+                "run": f"/api/v1/integration/analysis-runs/{run.id}",
+            },
+        },
+    }
+
+
+def enqueue_artifact_export_event(
+    export: ArtifactExport,
+) -> IntegrationOutboxEvent:
+    if export.state != ArtifactExport.State.SUCCEEDED:
+        raise ValueError("only succeeded ArtifactExport rows can emit an event")
+    if not transaction.get_connection().in_atomic_block:
+        raise RuntimeError("artifact export Outbox event must be created inside a transaction")
+    occurred_at = timezone.now()
+    event_id = uuid.uuid4()
+    event, created = IntegrationOutboxEvent.objects.get_or_create(
+        run=export.run,
+        event_type=ARTIFACT_EXPORT_EVENT_TYPE,
+        deduplication_key=f"export:{export.id}",
+        defaults={
+            "id": event_id,
+            "service_account_id": export.service_account_id,
+            "status_version": export.run.status_version,
+            "occurred_at": occurred_at,
+            "payload": _artifact_export_event_payload(
+                export,
+                event_id=event_id,
+                occurred_at=occurred_at,
+            ),
+        },
+    )
+    if created:
+        _create_webhook_deliveries(event, ARTIFACT_EXPORT_EVENT_TYPE)
     return event
 
 

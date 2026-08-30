@@ -30,7 +30,7 @@ from .directory_identity import (
     DirectoryIdentityLimitError,
     scan_directory_identity,
 )
-from .models import AnalysisRun, AnalysisRunEvent
+from .models import AnalysisOutputRetention, AnalysisRun, AnalysisRunEvent
 
 
 class ResourceSnapshotBudgetError(ValueError):
@@ -1942,14 +1942,39 @@ def _assert_preserved_output_evidence(
             raise ValueError(f"升级后输出 {key or '<unknown>'} 未保留原完整性证据。")
 
 
+def _retention_blocks_output_backfill(
+    retention: AnalysisOutputRetention | None,
+) -> bool:
+    return retention is not None and (
+        retention.state
+        in {
+            AnalysisOutputRetention.State.CLEANING,
+            AnalysisOutputRetention.State.CLEANED,
+        }
+        or retention.quarantined_at is not None
+    )
+
+
 def backfill_output_manifest(run: AnalysisRun, *, source: str) -> bool:
     """Upgrade historical output evidence without accepting changed artifacts."""
 
+    retention = AnalysisOutputRetention.objects.filter(run_id=run.pk).first()
+    if _retention_blocks_output_backfill(retention):
+        run.output_status = AnalysisRun.OutputStatus.UNAVAILABLE
+        return False
     if output_manifest_is_current(run.output_manifest):
         if run.output_status == AnalysisRun.OutputStatus.COMPLETE:
             return True
         with transaction.atomic():
             locked = AnalysisRun.objects.select_for_update().get(pk=run.pk)
+            locked_retention = (
+                AnalysisOutputRetention.objects.select_for_update()
+                .filter(run=locked)
+                .first()
+            )
+            if _retention_blocks_output_backfill(locked_retention):
+                run.output_status = AnalysisRun.OutputStatus.UNAVAILABLE
+                return False
             if not output_manifest_is_current(locked.output_manifest):
                 return False
             if locked.output_status != AnalysisRun.OutputStatus.COMPLETE:
@@ -2035,6 +2060,14 @@ def backfill_output_manifest(run: AnalysisRun, *, source: str) -> bool:
 
     with transaction.atomic():
         locked = AnalysisRun.objects.select_for_update().get(pk=run.pk)
+        locked_retention = (
+            AnalysisOutputRetention.objects.select_for_update()
+            .filter(run=locked)
+            .first()
+        )
+        if _retention_blocks_output_backfill(locked_retention):
+            run.output_status = AnalysisRun.OutputStatus.UNAVAILABLE
+            return False
         if not output_manifest_is_current(locked.output_manifest):
             if locked.status != AnalysisRun.Status.SUCCEEDED or not locked.work_directory:
                 return False
@@ -2101,8 +2134,14 @@ def assert_output_snapshot_storage_writable() -> None:
         ) from error
 
 
-def public_output_manifest(run: AnalysisRun) -> list[dict[str, Any]]:
+def public_output_manifest(
+    run: AnalysisRun,
+    *,
+    output_available: bool | None = None,
+) -> list[dict[str, Any]]:
     results = []
+    if output_available is None:
+        output_available = run.output_status != AnalysisRun.OutputStatus.UNAVAILABLE
     manifest = run.output_manifest if isinstance(run.output_manifest, dict) else {}
     items = manifest.get("items")
     if not isinstance(items, list):
@@ -2141,6 +2180,7 @@ def public_output_manifest(run: AnalysisRun) -> list[dict[str, Any]]:
                 public["reason"] = reason
         if (
             has_integrity_v2
+            and output_available
             and output_manifest_file_item_is_verified(item)
         ):
             public["download_url"] = (

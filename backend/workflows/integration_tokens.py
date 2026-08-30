@@ -16,6 +16,8 @@ SERVICE_SCOPES = frozenset(
         "analysis:cancel",
         "analysis:retry",
         "analysis:download",
+        "analysis:export",
+        "analysis:acknowledge",
         "workflow:read",
         "library:read",
         "task:test",

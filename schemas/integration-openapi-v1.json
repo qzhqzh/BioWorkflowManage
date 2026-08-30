@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "BioWorkflowManage Integration API",
-    "version": "1.3.0",
-    "description": "第三方 MES、运营平台、报告系统与 AI Agent 使用的固定分析产品、Task 测试及资产查询接口。所有写操作均受 Service Token scope、可移植输入引用、幂等键和审计约束。"
+    "version": "1.4.0",
+    "description": "第三方 MES、运营平台、报告系统与 AI Agent 使用的固定分析产品、Task 测试、异步结果导出及资产查询接口。所有写操作均受 Service Token scope、可移植输入引用、幂等键和审计约束。"
   },
   "servers": [{"url": "/api/v1/integration"}],
   "security": [{"serviceToken": []}],
@@ -156,7 +156,43 @@
         "summary": "校验成功时输出证据后流式下载文件",
         "x-required-scope": "analysis:download",
         "parameters": [{"$ref": "#/components/parameters/RunId"}, {"name": "key", "in": "query", "required": true, "schema": {"type": "string"}}],
-        "responses": {"200": {"description": "文件流"}, "404": {"$ref": "#/components/responses/Error"}, "409": {"$ref": "#/components/responses/Error"}}
+        "responses": {"200": {"description": "文件流"}, "404": {"$ref": "#/components/responses/Error"}, "409": {"$ref": "#/components/responses/Error"}, "410": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/analysis-runs/{run_id}/artifact-exports": {
+      "get": {
+        "operationId": "listArtifactExports",
+        "summary": "列出当前 Service Account 为该运行创建的 Artifact Export",
+        "x-required-scope": "analysis:read",
+        "parameters": [{"$ref": "#/components/parameters/RunId"}],
+        "responses": {"200": {"description": "Artifact Export 列表", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ArtifactExportList"}}}}, "401": {"$ref": "#/components/responses/Error"}, "403": {"$ref": "#/components/responses/Error"}, "404": {"$ref": "#/components/responses/Error"}}
+      },
+      "post": {
+        "operationId": "createArtifactExport",
+        "summary": "幂等创建异步 S3/MinIO 或受管目录结果导出",
+        "x-required-scope": "analysis:export",
+        "parameters": [{"$ref": "#/components/parameters/RunId"}, {"$ref": "#/components/parameters/IdempotencyKey"}],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ArtifactExportRequest"}}}},
+        "responses": {"201": {"description": "已创建 Artifact Export", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ArtifactExport"}}}}, "200": {"description": "幂等重放", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ArtifactExport"}}}}, "400": {"$ref": "#/components/responses/Error"}, "401": {"$ref": "#/components/responses/Error"}, "403": {"$ref": "#/components/responses/Error"}, "409": {"$ref": "#/components/responses/Error"}, "413": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/artifact-exports/{export_id}": {
+      "get": {
+        "operationId": "getArtifactExport",
+        "summary": "读取 Artifact Export 状态、清单位置和保留门禁",
+        "x-required-scope": "analysis:read",
+        "parameters": [{"$ref": "#/components/parameters/ExportId"}],
+        "responses": {"200": {"description": "Artifact Export", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ArtifactExport"}}}}, "401": {"$ref": "#/components/responses/Error"}, "403": {"$ref": "#/components/responses/Error"}, "404": {"$ref": "#/components/responses/Error"}}
+      }
+    },
+    "/artifact-exports/{export_id}/acknowledge": {
+      "post": {
+        "operationId": "acknowledgeArtifactExport",
+        "summary": "按交付清单 SHA-256 幂等确认结果已被目标系统接收",
+        "x-required-scope": "analysis:acknowledge",
+        "parameters": [{"$ref": "#/components/parameters/ExportId"}],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ArtifactExportAcknowledgement"}}}},
+        "responses": {"200": {"description": "已确认或幂等重放", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ArtifactExport"}}}}, "400": {"$ref": "#/components/responses/Error"}, "401": {"$ref": "#/components/responses/Error"}, "403": {"$ref": "#/components/responses/Error"}, "404": {"$ref": "#/components/responses/Error"}, "409": {"$ref": "#/components/responses/Error"}}
       }
     },
     "/tool-test-runs/preflight": {
@@ -205,6 +241,26 @@
           "204": {"description": "事件已接收，无响应体"}
         }
       }
+    },
+    "artifactExportCompleted": {
+      "post": {
+        "operationId": "receiveArtifactExportCompleted",
+        "summary": "接收 Artifact Export 完成事件",
+        "description": "事件只携带交付清单摘要、目标位置和 API 链接，不内嵌分析结果文件或清单 items。接收方按 event_id 去重，并在 requires_ack=true 时使用 manifest_digest 调用确认接口。",
+        "parameters": [
+          {"name": "X-BioWorkflow-Delivery-ID", "in": "header", "required": true, "schema": {"type": "string", "format": "uuid"}},
+          {"name": "X-BioWorkflow-Event-ID", "in": "header", "required": true, "schema": {"type": "string", "format": "uuid"}},
+          {"name": "X-BioWorkflow-Timestamp", "in": "header", "required": true, "schema": {"type": "string", "pattern": "^[0-9]{10,}$"}},
+          {"name": "X-BioWorkflow-Secret-Version", "in": "header", "required": true, "schema": {"type": "string", "pattern": "^[1-9][0-9]*$"}},
+          {"name": "X-BioWorkflow-Signature", "in": "header", "required": true, "schema": {"type": "string", "pattern": "^v1=[0-9a-f]{64}$"}}
+        ],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ArtifactExportCompletedEvent"}}}},
+        "responses": {
+          "200": {"description": "事件已接收或已幂等处理"},
+          "202": {"description": "事件已进入接收方队列"},
+          "204": {"description": "事件已接收，无响应体"}
+        }
+      }
     }
   },
   "components": {
@@ -213,6 +269,7 @@
     },
     "parameters": {
       "RunId": {"name": "run_id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}},
+      "ExportId": {"name": "export_id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}},
       "IdempotencyKey": {"name": "Idempotency-Key", "in": "header", "required": true, "schema": {"type": "string", "maxLength": 128}},
       "RequestId": {"name": "X-Request-ID", "in": "header", "required": false, "schema": {"type": "string", "maxLength": 128}}
     },
@@ -429,6 +486,233 @@
         "properties": {
           "view": {"type": "string", "const": "summary"},
           "results": {"type": "array", "maxItems": 200, "items": {"$ref": "#/components/schemas/AnalysisRun"}}
+        }
+      },
+      "ArtifactExportRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["target"],
+        "properties": {
+          "target": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["profile"],
+            "properties": {
+              "profile": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", "description": "部署侧 Artifact Export profile；请求体不接受目录、endpoint 或任何凭据。"}
+            }
+          },
+          "requires_ack": {"type": "boolean", "default": true},
+          "retain_until": {"oneOf": [{"type": "string", "format": "date-time"}, {"type": "null"}]}
+        }
+      },
+      "ArtifactExportAcknowledgement": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["manifest_digest"],
+        "properties": {
+          "manifest_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+          "external_receipt": {"type": "string", "maxLength": 128}
+        }
+      },
+      "ArtifactExportTarget": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "profile", "root_alias"],
+            "properties": {
+              "type": {"const": "managed_directory"},
+              "profile": {"type": "string"},
+              "root_alias": {"type": "string"},
+              "public_uri_prefix": {"type": "string"}
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "profile", "endpoint_origin", "bucket", "prefix"],
+            "properties": {
+              "type": {"const": "s3"},
+              "profile": {"type": "string"},
+              "endpoint_origin": {"type": "string", "format": "uri"},
+              "bucket": {"type": "string"},
+              "prefix": {"type": "string"}
+            }
+          }
+        ]
+      },
+      "ArtifactLocation": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "profile", "root_alias", "relative_path", "uri", "size", "sha256"],
+            "properties": {
+              "type": {"const": "managed_directory"},
+              "profile": {"type": "string"},
+              "root_alias": {"type": "string"},
+              "relative_path": {"type": "string"},
+              "uri": {"type": "string"},
+              "size": {"type": "integer", "minimum": 0},
+              "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "profile", "bucket", "key", "uri", "size", "sha256"],
+            "properties": {
+              "type": {"const": "s3_object"},
+              "profile": {"type": "string"},
+              "bucket": {"type": "string"},
+              "key": {"type": "string"},
+              "uri": {"type": "string"},
+              "size": {"type": "integer", "minimum": 0},
+              "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+              "etag": {"type": "string"},
+              "version_id": {"type": "string"}
+            }
+          }
+        ]
+      },
+      "ArtifactDeliveryItem": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["key", "name", "semantic_type", "wdl_type", "required", "kind"],
+        "properties": {
+          "key": {"type": "string"},
+          "name": {"type": "string"},
+          "label": {"type": "string"},
+          "semantic_type": {"type": "string"},
+          "wdl_type": {"type": "string"},
+          "required": {"type": "boolean"},
+          "kind": {"type": "string", "enum": ["file", "value"]},
+          "filename": {"type": "string"},
+          "size": {"type": "integer", "minimum": 0},
+          "content_type": {"type": "string"},
+          "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+          "value": {},
+          "destination": {"$ref": "#/components/schemas/ArtifactLocation"}
+        }
+      },
+      "ArtifactDeliveryManifest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["schema_version", "export_id", "run_id", "source_manifest_digest", "target", "completed_at", "items", "summary"],
+        "properties": {
+          "schema_version": {"type": "integer", "const": 1},
+          "export_id": {"type": "string", "format": "uuid"},
+          "run_id": {"type": "string", "format": "uuid"},
+          "source_manifest_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+          "target": {"$ref": "#/components/schemas/ArtifactExportTarget"},
+          "completed_at": {"type": "string", "format": "date-time"},
+          "items": {"type": "array", "minItems": 1, "items": {"$ref": "#/components/schemas/ArtifactDeliveryItem"}},
+          "summary": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["file_count", "item_count", "total_bytes"],
+            "properties": {
+              "file_count": {"type": "integer", "minimum": 0},
+              "item_count": {"type": "integer", "minimum": 1},
+              "total_bytes": {"type": "integer", "minimum": 0}
+            }
+          }
+        }
+      },
+      "ArtifactExport": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "run_id", "state", "target", "source_manifest_digest", "manifest_digest", "manifest_location", "manifest", "requires_ack", "acknowledged_at", "attempt_count", "replay_count", "next_attempt_at", "completed_at", "error", "retention", "created_at", "updated_at", "links"],
+        "properties": {
+          "id": {"type": "string", "format": "uuid"},
+          "run_id": {"type": "string", "format": "uuid"},
+          "state": {"type": "string", "enum": ["pending", "exporting", "succeeded", "dead_letter"]},
+          "target": {"$ref": "#/components/schemas/ArtifactExportTarget"},
+          "source_manifest_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+          "manifest_digest": {"oneOf": [{"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}, {"type": "null"}]},
+          "manifest_location": {"oneOf": [{"$ref": "#/components/schemas/ArtifactLocation"}, {"type": "null"}]},
+          "manifest": {"oneOf": [{"$ref": "#/components/schemas/ArtifactDeliveryManifest"}, {"type": "null"}]},
+          "requires_ack": {"type": "boolean"},
+          "acknowledged_at": {"oneOf": [{"type": "string", "format": "date-time"}, {"type": "null"}]},
+          "attempt_count": {"type": "integer", "minimum": 0},
+          "replay_count": {"type": "integer", "minimum": 0},
+          "next_attempt_at": {"oneOf": [{"type": "string", "format": "date-time"}, {"type": "null"}]},
+          "completed_at": {"oneOf": [{"type": "string", "format": "date-time"}, {"type": "null"}]},
+          "error": {
+            "oneOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["code", "message", "retryable"],
+                "properties": {"code": {"type": "string"}, "message": {"type": "string"}, "retryable": {"type": "boolean"}}
+              },
+              {"type": "null"}
+            ]
+          },
+          "retention": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["state", "retain_until", "cleanup_eligible", "cleanup_blockers", "quarantined_at", "cleaned_at"],
+            "properties": {
+              "state": {"type": "string", "enum": ["protected", "cleaning", "cleaned", "failed"]},
+              "retain_until": {"type": "string", "format": "date-time"},
+              "cleanup_eligible": {"type": "boolean"},
+              "cleanup_blockers": {"type": "array", "items": {"type": "string"}},
+              "quarantined_at": {"oneOf": [{"type": "string", "format": "date-time"}, {"type": "null"}]},
+              "cleaned_at": {"oneOf": [{"type": "string", "format": "date-time"}, {"type": "null"}]}
+            }
+          },
+          "created_at": {"type": "string", "format": "date-time"},
+          "updated_at": {"type": "string", "format": "date-time"},
+          "links": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["self", "acknowledge", "run"],
+            "properties": {"self": {"type": "string"}, "acknowledge": {"type": "string"}, "run": {"type": "string"}}
+          }
+        }
+      },
+      "ArtifactExportList": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "轻量列表；每项 manifest 固定为 null，完整交付清单通过 Artifact Export 详情读取。",
+        "required": ["view", "run_id", "results"],
+        "properties": {
+          "view": {"type": "string", "const": "summary"},
+          "run_id": {"type": "string", "format": "uuid"},
+          "results": {"type": "array", "maxItems": 200, "items": {"$ref": "#/components/schemas/ArtifactExport"}}
+        }
+      },
+      "ArtifactExportCompletedEvent": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["schema_version", "event_id", "event_type", "occurred_at", "data"],
+        "properties": {
+          "schema_version": {"type": "string", "const": "1.0.0"},
+          "event_id": {"type": "string", "format": "uuid"},
+          "event_type": {"type": "string", "const": "analysis.artifact_export.completed"},
+          "occurred_at": {"type": "string", "format": "date-time"},
+          "data": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["artifact_export_id", "run_id", "external_ref", "status_version", "state", "manifest_digest", "manifest_location", "requires_ack", "links"],
+            "properties": {
+              "artifact_export_id": {"type": "string", "format": "uuid"},
+              "run_id": {"type": "string", "format": "uuid"},
+              "external_ref": {"$ref": "#/components/schemas/ExternalRef"},
+              "status_version": {"type": "integer", "minimum": 1},
+              "state": {"type": "string", "const": "succeeded"},
+              "manifest_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+              "manifest_location": {"$ref": "#/components/schemas/ArtifactLocation"},
+              "requires_ack": {"type": "boolean"},
+              "links": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["artifact_export", "manifest", "acknowledge", "run"],
+                "properties": {"artifact_export": {"type": "string"}, "manifest": {"type": "string"}, "acknowledge": {"type": "string"}, "run": {"type": "string"}}
+              }
+            }
+          }
         }
       },
       "AnalysisRunTerminalEvent": {
