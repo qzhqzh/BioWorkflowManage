@@ -182,7 +182,8 @@ profile 文件不得提交到 Git；默认目录 `./secrets/object-storage` 已�
 前缀分别配置成两个全局白名单。HTTP endpoint
 默认拒绝，私网地址必须显式 `allow_private_network=true`，loopback/link-local/site-local/multicast/
 unspecified/reserved 地址始终拒绝；`allowed_cidrs` 可进一步收窄出口。应用会把每次请求固定到本次已审核的
-解析地址，拒绝跳转到其他 origin，并限制单进程残留 HEAD 调用数量；生产环境仍应在主机防火墙或
+解析地址，拒绝跳转到其他 origin；HEAD 在可终止的隔离子进程中执行，超时后先回收子进程再释放
+并发槽。生产环境仍应在主机防火墙或
 容器网络策略中做第二层出口白名单。profile 只挂载给 backend 与 analysis-worker，不挂载给 miniwdl task 容器，凭据不会
 进入 `AnalysisRun.request_payload`、日志、API 响应或 Webhook。
 
@@ -193,7 +194,7 @@ unspecified/reserved 地址始终拒绝；`allowed_cidrs` 可进一步收窄出�
 `OBJECT_INPUT_STAGE_BUSY` / `OBJECT_INPUT_STAGE_CAPACITY`，网络或硬超时为可重试的
 `OBJECT_INPUT_UNAVAILABLE` / `OBJECT_INPUT_STAGE_TIMEOUT`。profile/前缀授权失败分别为
 `OBJECT_INPUT_PROFILE_FORBIDDEN` / `OBJECT_INPUT_KEY_FORBIDDEN`，预检并发槽耗尽为
-`OBJECT_INPUT_HEAD_BUSY`。外部系统只按 `code`、`category` 和
+`OBJECT_INPUT_HEAD_BUSY`，预检硬超时为 `OBJECT_INPUT_HEAD_TIMEOUT`。外部系统只按 `code`、`category` 和
 `retryable` 分支，不解析中文 message。
 
 ### 3.2 运行列表摘要

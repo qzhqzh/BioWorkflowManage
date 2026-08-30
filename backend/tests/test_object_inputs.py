@@ -218,29 +218,42 @@ def test_object_connections_use_only_pinned_addresses():
     assert create_connection.call_args.args[0] == ("203.0.113.10", 80)
 
 
-def test_object_head_timeout_threads_are_bounded(monkeypatch):
+def test_object_head_timeout_terminates_process_and_releases_slot(monkeypatch):
     from workflows import object_inputs
 
-    release = threading.Event()
+    def block_forever():
+        while True:
+            time.sleep(60)
+
     monkeypatch.setattr(object_inputs, "_HEAD_CALL_SLOTS", threading.BoundedSemaphore(1))
+    started = time.monotonic()
     with pytest.raises(ObjectInputError) as timed_out:
-        _bounded_call(lambda: release.wait(timeout=2), 0.01)
+        _bounded_call(block_forever, 0.01)
     assert timed_out.value.code == "OBJECT_INPUT_HEAD_TIMEOUT"
+    assert time.monotonic() - started < 1
+    assert _bounded_call(lambda: "ready", 0.5) == "ready"
 
-    with pytest.raises(ObjectInputError) as busy:
-        _bounded_call(lambda: None, 0.01)
-    assert busy.value.code == "OBJECT_INPUT_HEAD_BUSY"
 
-    release.set()
-    for _ in range(100):
-        try:
-            assert _bounded_call(lambda: "ready", 0.05) == "ready"
-            break
-        except ObjectInputError as error:
-            assert error.code == "OBJECT_INPUT_HEAD_BUSY"
-            time.sleep(0.01)
-    else:
-        pytest.fail("HEAD call slot was not released")
+def test_object_head_process_preserves_stable_errors():
+    expected = ObjectInputError(
+        "OBJECT_INPUT_PROFILE_FORBIDDEN",
+        "forbidden",
+        retryable=False,
+        details={"profile": "test"},
+        http_status=403,
+    )
+
+    def fail():
+        raise expected
+
+    with pytest.raises(ObjectInputError) as caught:
+        _bounded_call(fail, 0.5)
+
+    assert caught.value.code == expected.code
+    assert str(caught.value) == str(expected)
+    assert caught.value.retryable is False
+    assert caught.value.details == expected.details
+    assert caught.value.http_status == expected.http_status
 
 
 def test_object_staging_rejects_symlink_ancestor(settings, tmp_path):

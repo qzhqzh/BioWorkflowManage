@@ -3,8 +3,8 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import multiprocessing
 import os
-import queue
 import re
 import shutil
 import signal
@@ -65,6 +65,7 @@ STAGING_DIRECTORY_FLAGS = (
 _HEAD_CALL_SLOTS = threading.BoundedSemaphore(
     max(1, int(settings.ANALYSIS_OBJECT_HEAD_MAX_CONCURRENT))
 )
+_HEAD_PROCESS_CONTEXT = multiprocessing.get_context("fork")
 
 
 class ObjectInputError(RuntimeError):
@@ -457,6 +458,40 @@ def _s3_client(profile: ObjectStorageProfile, addresses: tuple[str, ...]):
     return _pin_client_connections(client, profile, addresses)
 
 
+def _head_process_entry(callback: Callable[[], Any], connection) -> None:
+    try:
+        connection.send(("success", callback()))
+    except ObjectInputError as error:
+        connection.send(
+            (
+                "object_error",
+                {
+                    "code": error.code,
+                    "message": str(error),
+                    "retryable": error.retryable,
+                    "details": error.details,
+                    "http_status": error.http_status,
+                },
+            )
+        )
+    except BaseException:
+        connection.send(("internal_error", None))
+    finally:
+        connection.close()
+
+
+def _stop_head_process(process) -> None:
+    if process.pid is None:
+        return
+    process.join(timeout=0)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=0.1)
+    if process.is_alive():
+        process.kill()
+        process.join()
+
+
 def _bounded_call(callback: Callable[[], Any], timeout: float) -> Any:
     if not _HEAD_CALL_SLOTS.acquire(blocking=False):
         raise ObjectInputError(
@@ -465,34 +500,63 @@ def _bounded_call(callback: Callable[[], Any], timeout: float) -> Any:
             retryable=True,
             http_status=503,
         )
-    results: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
-
-    def invoke() -> None:
-        try:
-            results.put((True, callback()))
-        except BaseException as error:
-            results.put((False, error))
-        finally:
-            _HEAD_CALL_SLOTS.release()
-
-    thread = threading.Thread(target=invoke, name="object-input-head", daemon=True)
+    deadline = time.monotonic() + max(0.1, timeout)
+    receive_connection = None
+    send_connection = None
+    process = None
     try:
-        thread.start()
-    except BaseException:
-        _HEAD_CALL_SLOTS.release()
-        raise
-    thread.join(timeout=max(0.1, timeout))
-    if thread.is_alive():
+        receive_connection, send_connection = _HEAD_PROCESS_CONTEXT.Pipe(duplex=False)
+        process = _HEAD_PROCESS_CONTEXT.Process(
+            target=_head_process_entry,
+            args=(callback, send_connection),
+            name="object-input-head",
+            daemon=True,
+        )
+        process.start()
+        send_connection.close()
+        send_connection = None
+        remaining = max(0, deadline - time.monotonic())
+        if not receive_connection.poll(remaining):
+            raise ObjectInputError(
+                "OBJECT_INPUT_HEAD_TIMEOUT",
+                "对象存储预检超过时间上限。",
+                retryable=True,
+                http_status=503,
+            )
+        try:
+            status, value = receive_connection.recv()
+        except EOFError as error:
+            raise ObjectInputError(
+                "OBJECT_INPUT_UNAVAILABLE",
+                "对象存储预检进程异常退出。",
+                retryable=True,
+                http_status=503,
+            ) from error
+        if status == "success":
+            return value
+        if status == "object_error":
+            raise ObjectInputError(
+                value["code"],
+                value["message"],
+                retryable=value["retryable"],
+                details=value["details"],
+                http_status=value["http_status"],
+            )
         raise ObjectInputError(
-            "OBJECT_INPUT_HEAD_TIMEOUT",
-            "对象存储预检超过时间上限。",
+            "OBJECT_INPUT_UNAVAILABLE",
+            "对象存储预检进程执行失败。",
             retryable=True,
             http_status=503,
         )
-    succeeded, value = results.get_nowait()
-    if succeeded:
-        return value
-    raise value
+    finally:
+        if send_connection is not None:
+            send_connection.close()
+        if receive_connection is not None:
+            receive_connection.close()
+        if process is not None:
+            _stop_head_process(process)
+            process.close()
+        _HEAD_CALL_SLOTS.release()
 
 
 def _normalized_etag(value: Any) -> str:
@@ -691,7 +755,7 @@ def inspect_object_reference(
 ) -> tuple[str, dict[str, Any], dict[str, Any]]:
     reference = _reference(value, input_name=input_name)
 
-    def inspect() -> tuple[ObjectStorageProfile, dict[str, Any]]:
+    def inspect() -> dict[str, Any]:
         profile = _load_profile(reference["profile"])
         _authorize_reference(profile, reference, client_id=client_id)
         addresses = _validate_endpoint(profile)
@@ -709,9 +773,14 @@ def inspect_object_reference(
             close = getattr(client, "close", None) if client is not None else None
             if callable(close):
                 close()
-        return profile, response
+        return {
+            "ContentLength": response.get("ContentLength"),
+            "ETag": response.get("ETag"),
+            "VersionId": response.get("VersionId"),
+            "DeleteMarker": response.get("DeleteMarker") is True,
+        }
 
-    _, response = _bounded_call(
+    response = _bounded_call(
         inspect,
         float(settings.ANALYSIS_OBJECT_HEAD_TIMEOUT_SECONDS),
     )
