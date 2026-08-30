@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 import uuid
 from unittest.mock import patch
 
+import boto3
 import pytest
+from botocore.awsrequest import AWSHTTPConnection
 from django.db import close_old_connections, connection
 
 from workflows.analysis_runtime import process_analysis_run
@@ -16,6 +19,10 @@ from workflows.models import (
     WorkflowVersion,
 )
 from workflows.object_inputs import (
+    _bounded_call,
+    _pinned_connection_class,
+    _reference,
+    _request_parameters,
     _target_path,
     _try_claim_staging_lease,
     _validate_endpoint,
@@ -57,6 +64,8 @@ def _profile(**values) -> ObjectStorageProfile:
         "endpoint_url": "https://objects.example.test",
         "region": "us-east-1",
         "allowed_buckets": ("inputs",),
+        "allowed_client_ids": ("okb",),
+        "allowed_key_prefixes": {},
         "access_key_id": "access-key-marker",
         "secret_access_key": "secret-key-marker",
         "session_token": "",
@@ -85,6 +94,110 @@ def test_object_endpoint_blocks_link_local_and_unapproved_private_addresses():
     ):
         _validate_endpoint(_profile())
     assert private_error.value.code == "OBJECT_INPUT_ENDPOINT_FORBIDDEN"
+
+    site_local = [(10, 1, 6, "", ("fec0::1", 443, 0, 0))]
+    with (
+        patch("workflows.object_inputs.socket.getaddrinfo", return_value=site_local),
+        pytest.raises(ObjectInputError) as site_local_error,
+    ):
+        _validate_endpoint(_profile(allow_private_network=True))
+    assert site_local_error.value.code == "OBJECT_INPUT_ENDPOINT_FORBIDDEN"
+
+
+def test_object_reference_rejects_surrogate_key_and_quotes_if_match():
+    reference = {
+        "type": "s3_object",
+        "profile": "test",
+        "bucket": "inputs",
+        "key": "incoming/read.fastq.gz",
+        "etag": '"abc123"',
+        "size": 1,
+        "sha256": "sha256:" + "0" * 64,
+    }
+    normalized = _reference(reference, input_name="read")
+    parameters = _request_parameters(normalized, _profile(), conditional=True)
+    assert normalized["etag"] == "abc123"
+    assert parameters["IfMatch"] == '"abc123"'
+
+    reference["key"] = "bad" + chr(0xD800)
+    with pytest.raises(ObjectInputError) as caught:
+        _reference(reference, input_name="read")
+    assert caught.value.code == "OBJECT_INPUT_REFERENCE_INVALID"
+
+
+def test_object_if_match_reaches_botocore_wire_with_quotes():
+    class StopRequestError(Exception):
+        pass
+
+    reference = {
+        "bucket": "inputs",
+        "key": "incoming/read.fastq.gz",
+        "version_id": "version-1",
+        "etag": "abc123",
+    }
+    seen_headers = {}
+    client = boto3.client(
+        "s3",
+        endpoint_url="http://objects.example.test",
+        region_name="us-east-1",
+        aws_access_key_id="test-access-key",
+        aws_secret_access_key="test-secret-key",
+    )
+
+    def capture(request, **_kwargs):
+        seen_headers.update(request.headers)
+        raise StopRequestError
+
+    client.meta.events.register("before-send.s3.GetObject", capture)
+    try:
+        with pytest.raises(StopRequestError):
+            client.get_object(
+                **_request_parameters(reference, _profile(), conditional=True)
+            )
+    finally:
+        client.close()
+
+    assert seen_headers["If-Match"] == b'"abc123"'
+
+
+def test_object_connections_use_only_pinned_addresses():
+    connection_class = _pinned_connection_class(
+        AWSHTTPConnection,
+        ("203.0.113.10",),
+    )
+    connection = connection_class("objects.example.test", 80)
+    sentinel = object()
+    with patch(
+        "workflows.object_inputs.urllib3_connection.create_connection",
+        return_value=sentinel,
+    ) as create_connection:
+        assert connection._new_conn() is sentinel
+    assert create_connection.call_args.args[0] == ("203.0.113.10", 80)
+
+
+def test_object_head_timeout_threads_are_bounded(monkeypatch):
+    from workflows import object_inputs
+
+    release = threading.Event()
+    monkeypatch.setattr(object_inputs, "_HEAD_CALL_SLOTS", threading.BoundedSemaphore(1))
+    with pytest.raises(ObjectInputError) as timed_out:
+        _bounded_call(lambda: release.wait(timeout=2), 0.01)
+    assert timed_out.value.code == "OBJECT_INPUT_HEAD_TIMEOUT"
+
+    with pytest.raises(ObjectInputError) as busy:
+        _bounded_call(lambda: None, 0.01)
+    assert busy.value.code == "OBJECT_INPUT_HEAD_BUSY"
+
+    release.set()
+    for _ in range(100):
+        try:
+            assert _bounded_call(lambda: "ready", 0.05) == "ready"
+            break
+        except ObjectInputError as error:
+            assert error.code == "OBJECT_INPUT_HEAD_BUSY"
+            time.sleep(0.01)
+    else:
+        pytest.fail("HEAD call slot was not released")
 
 
 def test_object_staging_rejects_symlink_ancestor(settings, tmp_path):
@@ -157,3 +270,23 @@ def test_postgresql_input_staging_slot_is_serialized(settings, tmp_path):
     assert all(not worker.is_alive() for worker in workers)
     outcomes = sorted(results.get_nowait() for _ in workers)
     assert outcomes == [(False, "busy"), (True, "")]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_staging_claim_cleans_only_inactive_lease_temp_directory(settings, tmp_path):
+    staging = tmp_path / "staging"
+    stale_id = uuid.uuid4()
+    stale_directory = staging / ".leases" / str(stale_id)
+    stale_directory.mkdir(parents=True)
+    (stale_directory / "orphan.part").write_bytes(b"orphan")
+    settings.ANALYSIS_INPUT_STAGING_ROOT = staging
+    settings.ANALYSIS_OBJECT_STAGE_MAX_CONCURRENT_RUNS = 2
+    settings.ANALYSIS_OBJECT_STAGE_MAX_RESERVED_BYTES = 1024
+    settings.ANALYSIS_OBJECT_STAGE_MIN_FREE_BYTES = 0
+    InputStagingCoordinator.objects.get_or_create(pk=1)
+
+    lease, reason = _try_claim_staging_lease(_run("stale-cleanup"), reserved_bytes=1)
+
+    assert lease is not None
+    assert reason == ""
+    assert not stale_directory.exists()

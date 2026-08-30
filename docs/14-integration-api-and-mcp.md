@@ -167,6 +167,8 @@ File 输入也可以使用 S3/MinIO 兼容对象引用；Directory 仍只接受�
   "endpoint_url": "https://minio.example.internal",
   "region": "us-east-1",
   "allowed_buckets": ["validated-inputs"],
+  "allowed_client_ids": ["mes-production"],
+  "allowed_key_prefixes": {"validated-inputs": ["tenant-a/"]},
   "allowed_cidrs": ["10.20.0.0/16"],
   "allow_private_network": true,
   "access_key_id": "<read-only access key>",
@@ -174,10 +176,12 @@ File 输入也可以使用 S3/MinIO 兼容对象引用；Directory 仍只接受�
 }
 ```
 
-profile 文件不得提交到 Git；默认目录 `./secrets/object-storage` 已忽略。HTTP endpoint 默认拒绝，
-私网地址必须显式 `allow_private_network=true`，link-local/multicast/unspecified 地址始终拒绝；
-`allowed_cidrs` 可进一步收窄出口。生产环境还应在主机防火墙或容器网络策略中仅放行这些
-endpoint。profile 只挂载给 backend 与 analysis-worker，不挂载给 miniwdl task 容器，凭据不会
+profile 文件不得提交到 Git；默认目录 `./secrets/object-storage` 已忽略。每个 profile 必须通过
+`allowed_client_ids` 绑定 Service Account，可再按 bucket 配置 `allowed_key_prefixes`。HTTP endpoint
+默认拒绝，私网地址必须显式 `allow_private_network=true`，link-local/site-local/multicast/unspecified/
+reserved 地址始终拒绝；`allowed_cidrs` 可进一步收窄出口。应用会把每次请求固定到本次已审核的
+解析地址，拒绝跳转到其他 origin，并限制单进程残留 HEAD 调用数量；生产环境仍应在主机防火墙或
+容器网络策略中做第二层出口白名单。profile 只挂载给 backend 与 analysis-worker，不挂载给 miniwdl task 容器，凭据不会
 进入 `AnalysisRun.request_payload`、日志、API 响应或 Webhook。
 
 对象输入使用稳定错误码：引用/profile 无效为 `OBJECT_INPUT_REFERENCE_INVALID` /
@@ -185,7 +189,9 @@ endpoint。profile 只挂载给 backend 与 analysis-worker，不挂载给 miniw
 `OBJECT_INPUT_ENDPOINT_FORBIDDEN`，身份变化为 `OBJECT_INPUT_CHANGED`，摘要不符为
 `OBJECT_INPUT_DIGEST_MISMATCH`，暂存篡改为 `OBJECT_INPUT_STAGING_CHANGED`，并发/容量等待超时为
 `OBJECT_INPUT_STAGE_BUSY` / `OBJECT_INPUT_STAGE_CAPACITY`，网络或硬超时为可重试的
-`OBJECT_INPUT_UNAVAILABLE` / `OBJECT_INPUT_STAGE_TIMEOUT`。外部系统只按 `code`、`category` 和
+`OBJECT_INPUT_UNAVAILABLE` / `OBJECT_INPUT_STAGE_TIMEOUT`。profile/前缀授权失败分别为
+`OBJECT_INPUT_PROFILE_FORBIDDEN` / `OBJECT_INPUT_KEY_FORBIDDEN`，预检并发槽耗尽为
+`OBJECT_INPUT_HEAD_BUSY`。外部系统只按 `code`、`category` 和
 `retryable` 分支，不解析中文 message。
 
 ### 3.2 运行列表摘要
@@ -571,3 +577,7 @@ SHA-256 字节上限由
 singleton row 串行分配，Worker 崩溃后 lease 到期自动回收。`ANALYSIS_INPUT_STAGING_HOST_PATH`
 必须由 Worker UID 可写，并同时以只读方式挂载给 backend 和 miniwdl Docker daemon；主机运行
 profile 还应把 `ANALYSIS_INPUT_STAGING_EXECUTION_ROOT` 设置为同一个宿主绝对路径。
+每个暂存 lease 使用独立的 `.leases/<lease-id>` 临时目录；过期 lease 的孤儿普通文件会在下一次
+分配槽位时按数据库活动 lease 白名单清理。内容寻址文件每次执行仍会对对应对象身份做条件 GET
+并完整计算 SHA-256，缓存命中不能绕过对象删除、撤权或“对象身份→摘要”的真实性校验；FASTQ/
+FASTA 语义和 R1/R2 首条 read ID 会在暂存后、启动 miniwdl 前再次校验。

@@ -233,7 +233,7 @@
         "type": "object",
         "required": ["root_alias", "relative_path"],
         "properties": {
-          "type": {"type": "string", "const": "managed_path", "description": "可选；省略时保持 1.2 及更早版本兼容。"},
+          "type": {"type": "string", "description": "推荐使用 managed_path；为兼容 1.2 及更早调用方，也接受并忽略既有自定义值。"},
           "root_alias": {"type": "string", "enum": ["rawdata", "database"]},
           "relative_path": {"type": "string"},
           "sha256": {
@@ -264,7 +264,7 @@
           "version_id": {"type": "string", "minLength": 1, "maxLength": 1024},
           "etag": {"type": "string", "minLength": 1, "maxLength": 1024},
           "size": {"type": "integer", "minimum": 1},
-          "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+          "sha256": {"type": "string", "pattern": "^sha256:[0-9a-fA-F]{64}$"}
         }
       },
       "InputReference": {
@@ -272,6 +272,14 @@
         "oneOf": [
           {"$ref": "#/components/schemas/ManagedResource"},
           {"$ref": "#/components/schemas/S3ObjectReference"}
+        ]
+      },
+      "InputValue": {
+        "description": "由固定契约解释的标量、File/Directory 引用或递归数组/Pair（Pair 使用两个元素的数组）。",
+        "anyOf": [
+          {"$ref": "#/components/schemas/InputReference"},
+          {"type": "array", "items": {"$ref": "#/components/schemas/InputValue"}},
+          {"type": ["string", "number", "boolean", "null"]}
         ]
       },
       "DatabaseSelection": {
@@ -347,7 +355,7 @@
           "workflow": {"$ref": "#/components/schemas/WorkflowVersionRef"},
           "analysis_product": {"$ref": "#/components/schemas/AnalysisProductRef"},
           "subject": {"type": "object", "required": ["sample_id"], "properties": {"sample_id": {"type": "string", "maxLength": 128}}},
-          "inputs": {"type": "object", "additionalProperties": true, "description": "按分析契约提供输入；File 值使用 InputReference，数组与 Pair 可递归包含 InputReference。"},
+          "inputs": {"type": "object", "additionalProperties": {"$ref": "#/components/schemas/InputValue"}, "description": "按分析契约提供输入；File 值使用 InputReference，数组与 Pair 可递归包含 InputReference。"},
           "database": {"$ref": "#/components/schemas/DatabaseSelection"},
           "metadata": {"type": "object", "additionalProperties": true}
         }
@@ -362,7 +370,7 @@
         "properties": {
           "workflow": {"$ref": "#/components/schemas/WorkflowVersionRef"},
           "analysis_product": {"$ref": "#/components/schemas/AnalysisProductRef"},
-          "inputs": {"type": "object", "additionalProperties": true, "description": "按分析契约提供输入；File 值使用 InputReference，数组与 Pair 可递归包含 InputReference。"},
+          "inputs": {"type": "object", "additionalProperties": {"$ref": "#/components/schemas/InputValue"}, "description": "按分析契约提供输入；File 值使用 InputReference，数组与 Pair 可递归包含 InputReference。"},
           "database": {"$ref": "#/components/schemas/DatabaseSelection"},
           "metadata": {"type": "object", "additionalProperties": true}
         }
@@ -372,7 +380,7 @@
         "required": ["tool", "inputs"],
         "properties": {
           "tool": {"type": "object", "required": ["tool_id", "version", "expected_digest"], "properties": {"tool_id": {"type": "string"}, "version": {"type": "string"}, "expected_digest": {"type": "string"}}},
-          "inputs": {"type": "object", "additionalProperties": true, "description": "File 值使用 InputReference；凭据仅来自部署侧 profile。"}
+          "inputs": {"type": "object", "additionalProperties": {"$ref": "#/components/schemas/InputValue"}, "description": "File 值使用 InputReference；凭据仅来自部署侧 profile。"}
         }
       },
       "ToolTestSubmission": {
@@ -381,7 +389,7 @@
         "properties": {
           "external_ref": {"$ref": "#/components/schemas/ExternalRef"},
           "tool": {"type": "object", "required": ["tool_id", "version", "expected_digest"], "properties": {"tool_id": {"type": "string"}, "version": {"type": "string"}, "expected_digest": {"type": "string"}}},
-          "inputs": {"type": "object", "additionalProperties": true, "description": "File 值使用 InputReference；凭据仅来自部署侧 profile。"},
+          "inputs": {"type": "object", "additionalProperties": {"$ref": "#/components/schemas/InputValue"}, "description": "File 值使用 InputReference；凭据仅来自部署侧 profile。"},
           "label": {"type": "string", "maxLength": 256}
         }
       },

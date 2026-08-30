@@ -35,6 +35,7 @@ from .object_inputs import (
     ObjectInputError,
     object_manifest_items,
     stage_run_object_inputs,
+    verify_run_object_inputs,
 )
 from .webhooks import enqueue_terminal_event
 from .wdl_packages import normalize_package_path
@@ -998,6 +999,14 @@ def execute_analysis_run(
                 f"analysis run {run.id} lease was lost during resource verification"
             )
 
+    _verify_run_resource_manifests(
+        run,
+        checkpoint=resource_checkpoint,
+        snapshot_budget=ResourceSnapshotBudget(
+            deadline_seconds=settings.ANALYSIS_WORKER_RESOURCE_MANIFEST_TIMEOUT_SECONDS,
+            checkpoint=resource_checkpoint,
+        ),
+    )
     staged_object_count = stage_run_object_inputs(
         run,
         checkpoint=resource_checkpoint,
@@ -1009,14 +1018,6 @@ def execute_analysis_run(
             kind="input",
             details={"object_count": staged_object_count},
         )
-    _verify_run_resource_manifests(
-        run,
-        checkpoint=resource_checkpoint,
-        snapshot_budget=ResourceSnapshotBudget(
-            deadline_seconds=settings.ANALYSIS_WORKER_RESOURCE_MANIFEST_TIMEOUT_SECONDS,
-            checkpoint=resource_checkpoint,
-        ),
-    )
     run_directory = root / str(run.id)
     _update_run(run, work_directory=str(run_directory))
     run_directory.mkdir(parents=False, exist_ok=False)
@@ -1087,6 +1088,7 @@ def execute_analysis_run(
     result: dict[str, Any] | None = None
     failure_message = ""
     for attempt in range(1, retry_count + 2):
+        verify_run_object_inputs(run, checkpoint=resource_checkpoint)
         paths = _attempt_paths(run_directory, attempt)
         arguments = [
             executable,

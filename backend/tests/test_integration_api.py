@@ -95,7 +95,12 @@ def _fastq_bytes(mate: int, *, read_id="read-001") -> bytes:
     return buffer.getvalue()
 
 
-def _write_object_profile(profile_dir: Path, *, name="lab-minio") -> tuple[str, str]:
+def _write_object_profile(
+    profile_dir: Path,
+    *,
+    name="lab-minio",
+    allowed_client_ids=("okb",),
+) -> tuple[str, str]:
     access_key = "test-access-key-not-for-storage"
     secret_key = "test-secret-key-not-for-storage"
     (profile_dir / f"{name}.json").write_text(
@@ -104,6 +109,8 @@ def _write_object_profile(profile_dir: Path, *, name="lab-minio") -> tuple[str, 
                 "endpoint_url": "https://objects.example.test",
                 "region": "us-east-1",
                 "allowed_buckets": ["validated-inputs"],
+                "allowed_client_ids": list(allowed_client_ids),
+                "allowed_key_prefixes": {"validated-inputs": ["incoming/"]},
                 "access_key_id": access_key,
                 "secret_access_key": secret_key,
             }
@@ -697,8 +704,8 @@ def test_analysis_product_deactivation_during_submission_blocks_run(
     }
     real_preflight = integration_api_module._preflight_workflow
 
-    def deactivate_after_preflight(request_body):
-        result = real_preflight(request_body)
+    def deactivate_after_preflight(request_body, *, client_id):
+        result = real_preflight(request_body, client_id=client_id)
         AnalysisProduct.objects.filter(pk=product_version.product_id).update(
             is_active=False
         )
@@ -1000,7 +1007,8 @@ def test_s3_inputs_share_auditable_manifest_and_stage_without_credentials(
         assert staged.stat().st_mode & 0o222 == 0
     assert len(fake_client.get_calls) == 2
     assert all(call["VersionId"] == "version-1" for call in fake_client.get_calls)
-    assert all(call["IfMatch"].startswith("etag-") for call in fake_client.get_calls)
+    assert all(call["IfMatch"].startswith('"etag-') for call in fake_client.get_calls)
+    assert all(call["IfMatch"].endswith('"') for call in fake_client.get_calls)
 
     first = run.request_payload["input_resource_manifest"]["objects"][0]
     staged = Path(settings.ANALYSIS_INPUT_STAGING_ROOT) / first["staging_relative_path"]
@@ -1097,6 +1105,13 @@ def test_s3_input_changes_and_conditional_get_fail_closed(
         stage_run_object_inputs(run)
     assert caught.value.code == "OBJECT_INPUT_CHANGED"
 
+    manifest_item = run.request_payload["input_resource_manifest"]["objects"][0]
+    cached = Path(settings.ANALYSIS_INPUT_STAGING_ROOT) / manifest_item[
+        "staging_relative_path"
+    ]
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    cached.write_bytes(read1)
+    cached.chmod(0o444)
     corrupt_client = _FakeS3Client({"incoming/S001_R1.fastq.gz": read1})
 
     def corrupt_get(**kwargs):
@@ -1114,6 +1129,147 @@ def test_s3_input_changes_and_conditional_get_fail_closed(
     ):
         stage_run_object_inputs(run)
     assert digest_error.value.code == "OBJECT_INPUT_DIGEST_MISMATCH"
+    assert len(corrupt_client.get_calls) == 1
+
+
+@pytest.mark.django_db
+def test_s3_profile_enforces_service_account_and_key_prefix(
+    integration_workspace,
+    settings,
+):
+    version = _workflow_version()
+    content = _fastq_bytes(1)
+    _write_object_profile(Path(settings.ANALYSIS_OBJECT_STORAGE_PROFILE_DIR))
+
+    _, _, _, other_client = _token_client(client_id="other")
+    other_body = _submission(version, external_run_id="other-client-object")
+    other_body["external_ref"]["client_id"] = "other"
+    other_body["inputs"]["read1"] = _object_reference(
+        content,
+        key="incoming/S001_R1.fastq.gz",
+    )
+    forbidden_profile = other_client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        other_body,
+        format="json",
+    )
+    assert forbidden_profile.status_code == 403
+    assert forbidden_profile.data["error"]["code"] == "OBJECT_INPUT_PROFILE_FORBIDDEN"
+
+    _, _, _, client = _token_client()
+    key_body = _submission(version, external_run_id="outside-prefix-object")
+    key_body["inputs"]["read1"] = _object_reference(
+        content,
+        key="private/S001_R1.fastq.gz",
+    )
+    forbidden_key = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        key_body,
+        format="json",
+    )
+    assert forbidden_key.status_code == 403
+    assert forbidden_key.data["error"]["code"] == "OBJECT_INPUT_KEY_FORBIDDEN"
+
+
+@pytest.mark.django_db
+def test_s3_reference_with_surrogate_key_returns_stable_validation_error(
+    integration_workspace,
+    settings,
+):
+    _, _, _, client = _token_client()
+    version = _workflow_version()
+    content = _fastq_bytes(1)
+    _write_object_profile(Path(settings.ANALYSIS_OBJECT_STORAGE_PROFILE_DIR))
+    body = _submission(version, external_run_id="surrogate-object-key")
+    body["inputs"]["read1"] = _object_reference(
+        content,
+        key="incoming/" + chr(0xD800) + ".fastq.gz",
+    )
+
+    response = client.generic(
+        "POST",
+        "/api/v1/integration/analysis-runs/preflight",
+        json.dumps(body).encode("ascii"),
+        content_type="application/json",
+    )
+
+    assert response.status_code == 400
+    assert response.data["error"]["code"] == "OBJECT_INPUT_REFERENCE_INVALID"
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("case", "expected_code"),
+    [
+        ("invalid-gzip", "FASTQ_GZIP_INVALID"),
+        ("mismatched-pair", "FASTQ_PAIR_MISMATCH"),
+    ],
+)
+def test_s3_stage_validates_remote_fastq_content(
+    integration_workspace,
+    settings,
+    case,
+    expected_code,
+):
+    _, _, _, client = _token_client()
+    version = _workflow_version()
+    read1 = b"not-a-gzip-stream" if case == "invalid-gzip" else _fastq_bytes(1)
+    read2 = _fastq_bytes(
+        2,
+        read_id="different-read" if case == "mismatched-pair" else "read-001",
+    )
+    objects = {
+        "incoming/S001_R1.fastq.gz": read1,
+        "incoming/S001_R2.fastq.gz": read2,
+    }
+    _write_object_profile(Path(settings.ANALYSIS_OBJECT_STORAGE_PROFILE_DIR))
+    body = _submission(version, external_run_id=f"remote-fastq-{case}")
+    body["inputs"] = {
+        "read1": _object_reference(read1, key="incoming/S001_R1.fastq.gz"),
+        "read2": _object_reference(read2, key="incoming/S001_R2.fastq.gz"),
+    }
+    fake_client = _FakeS3Client(objects)
+    with (
+        patch("workflows.object_inputs._validate_endpoint"),
+        patch("workflows.object_inputs._s3_client", return_value=fake_client),
+    ):
+        created = client.post(
+            "/api/v1/integration/analysis-runs",
+            body,
+            format="json",
+            HTTP_IDEMPOTENCY_KEY=f"remote-fastq-{case}",
+        )
+    assert created.status_code == 201, created.data
+    run = AnalysisRun.objects.get(pk=created.data["id"])
+    run.status = AnalysisRun.Status.PREPARING
+    run.lease_token = uuid.uuid4()
+    run.save(update_fields=["status", "lease_token", "updated_at"])
+
+    with (
+        patch("workflows.object_inputs._validate_endpoint"),
+        patch("workflows.object_inputs._s3_client", return_value=fake_client),
+        pytest.raises(ObjectInputError) as caught,
+    ):
+        stage_run_object_inputs(run)
+
+    assert caught.value.code == expected_code
+
+
+@pytest.mark.django_db
+def test_managed_input_keeps_legacy_custom_type_compatible(integration_workspace):
+    _, _, _, client = _token_client()
+    version = _workflow_version()
+    body = _submission(version, external_run_id="legacy-managed-type")
+    body["inputs"]["read1"]["type"] = "legacy_rawdata_file"
+
+    response = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        body,
+        format="json",
+    )
+
+    assert response.status_code == 200, response.data
+    assert response.data["ready"] is True
 
 
 @pytest.mark.django_db
@@ -2337,6 +2493,20 @@ def test_openapi_contract_covers_every_integration_route():
     assert {"profile", "bucket", "key", "size", "sha256"} <= set(
         s3_reference["required"]
     )
+    input_value = payload["components"]["schemas"]["InputValue"]
+    assert input_value["anyOf"][0]["$ref"] == "#/components/schemas/InputReference"
+    assert input_value["anyOf"][1]["items"]["$ref"] == (
+        "#/components/schemas/InputValue"
+    )
+    for schema_name in (
+        "AnalysisSubmission",
+        "AnalysisPreflight",
+        "ToolTestPreflight",
+        "ToolTestSubmission",
+    ):
+        assert payload["components"]["schemas"][schema_name]["properties"]["inputs"][
+            "additionalProperties"
+        ]["$ref"] == "#/components/schemas/InputValue"
     assert "404" in paths["/analysis-runs/preflight"]["post"]["responses"]
     assert "404" in paths["/analysis-runs"]["post"]["responses"]
     assert "analysisRunTerminal" in payload["webhooks"]
