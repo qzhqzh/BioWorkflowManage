@@ -14,12 +14,17 @@ from typing import Any, Iterable
 
 from jsonschema import Draft202012Validator
 
+from validate_reference_connector_contract import (
+    validate_reference_connector_contract,
+)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMAS = ROOT / "schemas"
 FIXTURE = ROOT / "examples" / "phase1-fastp"
 VALIDATION_FIXTURE = ROOT / "examples" / "validation"
 ANALYSIS_NODE_PACKAGE = ROOT / "deploy" / "analysis-node"
+REFERENCE_CONNECTOR = ROOT / "examples" / "reference_connector"
 
 STAGES = (
     "parse",
@@ -284,6 +289,69 @@ def main() -> None:
         raise AssertionError("Compile manifest is missing required artifacts")
 
     validate_report(report, catalog)
+    connector_digest = validate_reference_connector_contract(
+        load_json(SCHEMAS / "integration-openapi-v1.json"),
+        load_json(REFERENCE_CONNECTOR / "contract-surface.json"),
+    )
+    connector_config = load_json(REFERENCE_CONNECTOR / "config.example.json")
+    connector_compose_config = load_json(
+        REFERENCE_CONNECTOR / "config.compose.example.json"
+    )
+    connector_offline_config = load_json(
+        REFERENCE_CONNECTOR / "config.offline.example.json"
+    )
+    connector_order = load_json(REFERENCE_CONNECTOR / "mes-order.example.json")
+    connector_smoke_config = load_json(
+        REFERENCE_CONNECTOR / "config.analysis-node-smoke.example.json"
+    )
+    connector_smoke_order = load_json(
+        REFERENCE_CONNECTOR / "analysis-node-smoke-order.example.json"
+    )
+    connector_postman = load_json(
+        REFERENCE_CONNECTOR
+        / "postman"
+        / "Reference-Connector.postman_collection.json"
+    )
+    if connector_config.get("schema_version") != "1.0.0":
+        raise AssertionError("Reference Connector example config version is invalid")
+    if connector_config.get("state") != {
+        "database": "state/connector.sqlite3",
+        "result_directory": "results",
+    }:
+        raise AssertionError("Reference Connector direct-run state paths are invalid")
+    if connector_compose_config.get("listen", {}).get("host") != "0.0.0.0":
+        raise AssertionError("Reference Connector source Compose listen host is invalid")
+    if connector_offline_config.get("listen", {}).get("host") != "127.0.0.1":
+        raise AssertionError("Reference Connector offline listen host is invalid")
+    for document in (connector_compose_config, connector_offline_config):
+        state = document.get("state", {})
+        if not all(
+            str(state.get(field) or "").startswith("/var/lib/reference-connector/")
+            for field in ("database", "result_directory")
+        ):
+            raise AssertionError("Reference Connector container state paths are invalid")
+    if connector_smoke_config.get("mapping", {}).get("analysis_product") != {
+        "analysis_code": "analysis-node-smoke",
+        "contract_version": "1.0.0",
+    }:
+        raise AssertionError("Reference Connector clean-node config is invalid")
+    if not all(
+        isinstance(document.get("order"), dict)
+        for document in (connector_order, connector_smoke_order)
+    ):
+        raise AssertionError("Reference Connector MES order fixture is invalid")
+    if (
+        connector_postman.get("info", {}).get("schema")
+        != "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    ):
+        raise AssertionError("Reference Connector Postman collection is invalid")
+    postman_variables = connector_postman.get("variable")
+    if not isinstance(postman_variables, list) or any(
+        item.get("key") == "connector_token" and item.get("value")
+        for item in postman_variables
+        if isinstance(item, dict)
+    ):
+        raise AssertionError("Reference Connector Postman token must remain empty")
 
     wdl = (FIXTURE / "expected" / "workflow.wdl").read_text(encoding="utf-8")
     for fragment in (
@@ -300,6 +368,7 @@ def main() -> None:
     print(f"Workflow semantic digest: {semantic_digest}")
     print(f"Compiler IR digest: {ir_digest}")
     print(f"Diagnostic catalog entries: {len(catalog)}")
+    print(f"Reference Connector contract projection: {connector_digest}")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,162 @@
+{
+  "info": {
+    "_postman_id": "0f02dfeb-c567-49dd-b8c6-7e7b82343c83",
+    "name": "BioWorkflowManage Reference Connector",
+    "description": "MES to Reference Connector flow. Secrets remain Postman environment variables.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{connector_token}}",
+        "type": "string"
+      }
+    ]
+  },
+  "variable": [
+    {
+      "key": "connector_url",
+      "value": "http://127.0.0.1:8090"
+    },
+    {
+      "key": "connector_token",
+      "value": ""
+    },
+    {
+      "key": "external_run_id",
+      "value": "MES-20260830-001"
+    },
+    {
+      "key": "output_key",
+      "value": "reference.result"
+    },
+    {
+      "key": "export_profile",
+      "value": "mes-results"
+    }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "request": {
+        "auth": {
+          "type": "noauth"
+        },
+        "method": "GET",
+        "header": [],
+        "url": "{{connector_url}}/health"
+      }
+    },
+    {
+      "name": "Products",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{connector_url}}/v1/products"
+      }
+    },
+    {
+      "name": "Submit MES order",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"order\": {\"execution_id\": \"{{external_run_id}}\", \"analysis_id\": \"ANALYSIS-20260830-001\"},\n  \"sample\": {\"code\": \"S001\"},\n  \"files\": {\"read1\": \"project/S001_R1.fastq.gz\", \"read2\": \"project/S001_R2.fastq.gz\"},\n  \"product\": {\"code\": \"PANEL001\"},\n  \"batch\": {\"id\": \"BATCH-001\"},\n  \"analysis\": {\"reference_id\": \"hg19\", \"panel_id\": \"tumor-120-v4\"}\n}"
+        },
+        "url": "{{connector_url}}/v1/orders"
+      }
+    },
+    {
+      "name": "Local order status",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{connector_url}}/v1/orders/{{external_run_id}}"
+      }
+    },
+    {
+      "name": "Reconcile with Analysis Node",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{}"
+        },
+        "url": "{{connector_url}}/v1/orders/{{external_run_id}}/reconcile"
+      }
+    },
+    {
+      "name": "Collect verified small results",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{}"
+        },
+        "url": "{{connector_url}}/v1/orders/{{external_run_id}}/results"
+      }
+    },
+    {
+      "name": "Create large-result export",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"profile\":\"{{export_profile}}\",\"requires_ack\":true}"
+        },
+        "url": "{{connector_url}}/v1/orders/{{external_run_id}}/exports"
+      }
+    },
+    {
+      "name": "Download verified small output",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{connector_url}}/v1/orders/{{external_run_id}}/outputs/{{output_key}}"
+      }
+    },
+    {
+      "name": "Verify and acknowledge export",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{}"
+        },
+        "url": "{{connector_url}}/v1/orders/{{external_run_id}}/complete-export"
+      }
+    }
+  ]
+}

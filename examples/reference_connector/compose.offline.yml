@@ -1,0 +1,51 @@
+services:
+  reference-connector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PYTHON_BASE: "${ANALYSIS_NODE_SMOKE_TASK_IMAGE:-bioworkflowmanage/smoke-task:1.0.0}"
+    image: bioworkflowmanage/reference-connector:local
+    pull_policy: never
+    command:
+      - python
+      - -m
+      - reference_connector
+      - --config
+      - /etc/reference-connector/config.json
+      - serve
+    working_dir: /opt/reference-connector
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: /opt/reference-connector
+      BIOWORKFLOW_TOKEN: "${BIOWORKFLOW_TOKEN:?set BIOWORKFLOW_TOKEN}"
+      BIOWORKFLOW_WEBHOOK_SECRET: "${BIOWORKFLOW_WEBHOOK_SECRET:?set BIOWORKFLOW_WEBHOOK_SECRET}"
+      REFERENCE_CONNECTOR_INBOUND_TOKEN: "${REFERENCE_CONNECTOR_INBOUND_TOKEN:?set REFERENCE_CONNECTOR_INBOUND_TOKEN}"
+      NO_PROXY: "127.0.0.1,localhost,::1"
+      no_proxy: "127.0.0.1,localhost,::1"
+    network_mode: host
+    volumes:
+      - ./config.json:/etc/reference-connector/config.json:ro
+      - connector-state:/var/lib/reference-connector
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "from urllib.request import urlopen; urlopen('http://127.0.0.1:8090/health', timeout=3).read()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  connector-state:

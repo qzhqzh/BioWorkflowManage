@@ -23,6 +23,7 @@
 17. [WDL 协作与原始数据体验迭代](17-wdl-rawdata-iteration.md)
 18. [稳定版本发布与升级](18-stable-release.md)
 19. [Analysis Node 独立交付与第三方部署](19-analysis-node-deployment.md)
+20. [Reference Connector 与 MES 兼容性套件](20-reference-connector.md)
 
 ## Architecture Decision Records
 
@@ -96,4 +97,4 @@ GitHub Actions 配置：`.github/workflows/validate-contracts.yml`。
 
 在 Phase 1 编译规范之外，项目已补充认证、执行调度、历史 WDL、第三方 Integration API
 与受限 AI Agent MCP、WDL 多人协作、原始数据后台索引和稳定发布治理；对应运行边界以
-第 12 至 19 章为准。
+第 12 至 20 章为准。

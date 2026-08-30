@@ -1,0 +1,25 @@
+{
+  "order": {
+    "execution_id": "MES-20260830-001",
+    "analysis_id": "ANALYSIS-20260830-001"
+  },
+  "sample": {
+    "code": "S001",
+    "patient_name": "仅保留在 MES，不会被 Connector 转发"
+  },
+  "files": {
+    "read1": "project/S001_R1.fastq.gz",
+    "read2": "project/S001_R2.fastq.gz"
+  },
+  "product": {
+    "code": "PANEL001",
+    "customer_private_field": "仅保留在 Connector 边界内"
+  },
+  "batch": {
+    "id": "BATCH-001"
+  },
+  "analysis": {
+    "reference_id": "hg19",
+    "panel_id": "tumor-120-v4"
+  }
+}

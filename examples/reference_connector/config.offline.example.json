@@ -1,0 +1,64 @@
+{
+  "schema_version": "1.0.0",
+  "listen": {
+    "host": "127.0.0.1",
+    "port": 8090,
+    "max_request_bytes": 1048576
+  },
+  "analysis_api": {
+    "base_url": "https://analysis-node.example.com/api/v1/integration",
+    "timeout_seconds": 15,
+    "recovery_attempts": 2,
+    "max_download_bytes": 536870912
+  },
+  "state": {
+    "database": "/var/lib/reference-connector/connector.sqlite3",
+    "result_directory": "/var/lib/reference-connector/results"
+  },
+  "mapping": {
+    "schema_version": "1.0.0",
+    "client_id": "mes-reference",
+    "analysis_product": {
+      "analysis_code": "dna-panel",
+      "contract_version": "1.0.0",
+      "expected_contract_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "fields": {
+      "external_run_id": "order.execution_id",
+      "external_analysis_id": "order.analysis_id",
+      "sample_id": "sample.code"
+    },
+    "inputs": {
+      "read1": {
+        "path": "files.read1",
+        "kind": "managed_file",
+        "root_alias": "rawdata"
+      },
+      "read2": {
+        "path": "files.read2",
+        "kind": "managed_file",
+        "root_alias": "rawdata"
+      }
+    },
+    "metadata": {
+      "product_code": {
+        "path": "product.code",
+        "required": true
+      },
+      "batch_id": {
+        "path": "batch.id",
+        "required": false
+      }
+    },
+    "database": {
+      "reference_id": {
+        "path": "analysis.reference_id",
+        "required": true
+      },
+      "panel_id": {
+        "path": "analysis.panel_id",
+        "required": false
+      }
+    }
+  }
+}

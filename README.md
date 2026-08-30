@@ -43,6 +43,8 @@ BioWorkflowManage 是面向生物信息学流程工程化的可视化 Workflow �
 - 独立 miniwdl 隔离执行环境、真实容器 smoke 和数据案例预检；
 - Service Account、稳定分析产品目录、幂等第三方投递、受管路径与 S3/MinIO 不可变输入、取消/重跑、语义化输出、
   S3/MinIO/受管目录异步结果交付与确认，以及持久 Outbox 签名 Webhook；
+- 可独立部署的 Reference Connector、MES 字段白名单映射、超时找回、回调去重、结果摘要校验和
+  Python/Java/curl/Postman 接入示例；
 - 通过受限 MCP 查询分析产品/流程/软件并独立测试固定 WorkflowVersion 或 ToolVersion；
 - 工具、流程、WDL 与子流程的不可变版本；
 - 子流程以固定 `slug + version + digest` 的黑盒节点复用，并编译为 WDL
@@ -102,6 +104,8 @@ WDL 协作、原始数据索引和稳定升级见
 [`docs/18-stable-release.md`](docs/18-stable-release.md)。
 第三方服务器上的 Headless/Console 离线组件交付、签名验证、安装诊断与回滚见
 [`docs/19-analysis-node-deployment.md`](docs/19-analysis-node-deployment.md)。
+MES/运营平台的参考适配器、部署方式、错误矩阵和联调检查表见
+[`docs/20-reference-connector.md`](docs/20-reference-connector.md)。
 
 ## Phase 1: Workflow Compiler Foundation
 

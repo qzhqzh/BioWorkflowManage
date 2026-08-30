@@ -59,9 +59,10 @@ jobs:
       - name: Install dependencies and run package gates
         run: |
           uv sync --frozen
-          uvx --from ruff==0.15.14 ruff check backend scripts deploy/analysis-node/lib
+          uvx --from ruff==0.15.14 ruff check backend scripts deploy/analysis-node/lib examples/reference_connector
           uv run pytest \
             backend/tests/test_analysis_node_deploy.py \
+            backend/tests/test_reference_connector.py \
             backend/tests/test_analysis_runs.py::test_browser_rejects_unsigned_published_workflow_when_required \
             backend/tests/test_analysis_runs.py::test_browser_rejects_legacy_wdl_when_signed_packages_are_required \
             backend/tests/test_analysis_runs.py::test_worker_rejects_legacy_queued_unsigned_workflow_version \
@@ -241,6 +242,8 @@ jobs:
           fi
           test -z "$(docker image ls --all --quiet)"
           "$package/bin/analysis-node" verify-bundle
+          PYTHONPATH="$package/reference-connector" \
+            python -m reference_connector --help >/dev/null
           "$package/bin/analysis-node" init
           "$package/bin/analysis-node" preflight
           "$package/bin/analysis-node" load-images
@@ -257,6 +260,174 @@ jobs:
               --profile isolated-runtime \
               "$@"
           }
+          connector_compose() {
+            docker compose \
+              --project-name "reference-connector-release-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+              --project-directory "$package/reference-connector" \
+              --env-file "$package/images.env" \
+              --file "$package/reference-connector/compose.offline.yml" \
+              "$@"
+          }
+          connector_external_id="connector-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          connector_probe_dir="$install_root/data/workspace/rawdata/.reference-connector-$connector_external_id"
+          connector_probe_file="$connector_probe_dir/probe.txt"
+          connector_token_prefix=""
+          connector_started="0"
+          cleanup_reference_connector_smoke() {
+            if [[ "$connector_started" == "1" ]]; then
+              connector_compose down || true
+            fi
+            if [[ -n "$connector_token_prefix" ]]; then
+              analysis_compose exec -T backend python backend/manage.py manage_service_account \
+                --client-id mes-reference \
+                --revoke-prefix "$connector_token_prefix" \
+                --actor release-gate >/dev/null || true
+            fi
+            if [[ -f "$connector_probe_file" ]]; then
+              chmod u+w "$connector_probe_file" || true
+              rm -f "$connector_probe_file"
+            fi
+            if [[ -d "$connector_probe_dir" ]]; then
+              chmod u+w "$connector_probe_dir" || true
+              rmdir "$connector_probe_dir" || true
+            fi
+          }
+          trap cleanup_reference_connector_smoke EXIT
+          mkdir -m 0750 "$connector_probe_dir"
+          printf 'analysis-node-input\n' > "$connector_probe_file"
+          chmod 0440 "$connector_probe_file"
+          connector_config="$package/reference-connector/config.json"
+          connector_order="$RUNNER_TEMP/reference-connector-order-$VERSION.json"
+          jq \
+            --arg base "http://127.0.0.1:18082/api/v1/integration" \
+            --arg database "/var/lib/reference-connector/connector.sqlite3" \
+            --arg results "/var/lib/reference-connector/results" \
+            '.analysis_api.base_url = $base
+             | .listen.host = "127.0.0.1"
+             | .state.database = $database
+             | .state.result_directory = $results' \
+            "$package/reference-connector/config.analysis-node-smoke.example.json" \
+            > "$connector_config"
+          jq \
+            --arg external_id "$connector_external_id" \
+            --arg probe ".reference-connector-$connector_external_id/probe.txt" \
+            '.order.execution_id = $external_id
+             | .order.analysis_id = $external_id
+             | .files.probe = $probe' \
+            "$package/reference-connector/analysis-node-smoke-order.example.json" \
+            > "$connector_order"
+          issued=$(analysis_compose exec -T backend python backend/manage.py manage_service_account \
+            --client-id mes-reference \
+            --name "Reference Connector release gate" \
+            --scope workflow:read \
+            --scope analysis:submit \
+            --scope analysis:read \
+            --scope analysis:download \
+            --issue-token \
+            --token-name release-gate \
+            --expires-days 1 \
+            --actor release-gate)
+          connector_token_prefix=$(sed -n 's/^TOKEN_PREFIX=//p' <<< "$issued")
+          connector_upstream_token=$(sed -n 's/^TOKEN=//p' <<< "$issued")
+          test -n "$connector_token_prefix"
+          test -n "$connector_upstream_token"
+          export BIOWORKFLOW_TOKEN="$connector_upstream_token"
+          export BIOWORKFLOW_WEBHOOK_SECRET
+          BIOWORKFLOW_WEBHOOK_SECRET=$(python -c \
+            'import base64,secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode())')
+          export REFERENCE_CONNECTOR_INBOUND_TOKEN
+          REFERENCE_CONNECTOR_INBOUND_TOKEN=$(python -c \
+            'import secrets; print(secrets.token_urlsafe(32))')
+          connector_compose build
+          connector_compose up -d
+          connector_started="1"
+          for _ in {1..30}; do
+            if curl --fail --silent --show-error \
+              http://127.0.0.1:8090/health >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl --fail --silent --show-error \
+            http://127.0.0.1:8090/health >/dev/null
+          connector_api() {
+            curl --fail-with-body --silent --show-error \
+              --header "Authorization: Bearer $REFERENCE_CONNECTOR_INBOUND_TOKEN" \
+              --header "Content-Type: application/json" \
+              "$@"
+          }
+          products=$(connector_api http://127.0.0.1:8090/v1/products)
+          connector_contract_digest=$(jq -r \
+            '.results[]
+             | select(.analysis_code == "analysis-node-smoke" and .contract_version == "1.0.0")
+             | .contract_digest' <<< "$products")
+          [[ "$connector_contract_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          jq --arg digest "$connector_contract_digest" \
+            '.mapping.analysis_product.expected_contract_digest = $digest' \
+            "$connector_config" > "$connector_config.pinned"
+          mv "$connector_config.pinned" "$connector_config"
+          connector_compose up -d --force-recreate
+          for _ in {1..30}; do
+            if curl --fail --silent --show-error \
+              http://127.0.0.1:8090/health >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          submitted=$(connector_api \
+            --request POST \
+            --data-binary "@$connector_order" \
+            http://127.0.0.1:8090/v1/orders)
+          connector_run_id=$(jq -r '.id // empty' <<< "$submitted")
+          test -n "$connector_run_id"
+          replayed=$(connector_api \
+            --request POST \
+            --data-binary "@$connector_order" \
+            http://127.0.0.1:8090/v1/orders)
+          test "$(jq -r '.id // empty' <<< "$replayed")" = "$connector_run_id"
+          connector_status=""
+          for _ in {1..150}; do
+            if current=$(connector_api \
+              --request POST \
+              --data '{}' \
+              "http://127.0.0.1:8090/v1/orders/$connector_external_id/reconcile"); then
+              connector_status=$(jq -r '.status // empty' <<< "$current")
+              if [[ "$connector_status" == succeeded ]]; then
+                break
+              fi
+              if [[ "$connector_status" == failed || "$connector_status" == canceled ]]; then
+                echo "Reference Connector smoke reached $connector_status" >&2
+                exit 1
+              fi
+            fi
+            sleep 2
+          done
+          test "$connector_status" = succeeded
+          collected=$(connector_api \
+            --request POST \
+            --data '{}' \
+            "http://127.0.0.1:8090/v1/orders/$connector_external_id/results")
+          collected_again=$(connector_api \
+            --request POST \
+            --data '{}' \
+            "http://127.0.0.1:8090/v1/orders/$connector_external_id/results")
+          connector_result_digest=$(jq -r '.result_digest // empty' <<< "$collected")
+          test -n "$connector_result_digest"
+          test "$(jq -r '.result_digest // empty' <<< "$collected_again")" = "$connector_result_digest"
+          connector_download_url=$(jq -r '.outputs[0].download_url // empty' <<< "$collected")
+          connector_expected_sha256=$(jq -r '.outputs[0].sha256 // empty' <<< "$collected")
+          test -n "$connector_download_url"
+          [[ "$connector_expected_sha256" =~ ^sha256:[0-9a-f]{64}$ ]]
+          connector_download="$RUNNER_TEMP/reference-connector-result-$VERSION.txt"
+          connector_api \
+            --output "$connector_download" \
+            "http://127.0.0.1:8090$connector_download_url"
+          python -c \
+            'from pathlib import Path; import hashlib,sys; body = Path(sys.argv[1]).read_bytes(); assert body.strip() == b"analysis-node-ok"; assert "sha256:" + hashlib.sha256(body).hexdigest() == sys.argv[2]' \
+            "$connector_download" "$connector_expected_sha256"
+          cleanup_reference_connector_smoke
+          trap - EXIT
+          unset BIOWORKFLOW_TOKEN BIOWORKFLOW_WEBHOOK_SECRET REFERENCE_CONNECTOR_INBOUND_TOKEN
           analysis_compose exec -T backend python backend/manage.py shell -c \
             'from workflows.models import WorkflowDocument; WorkflowDocument.objects.update_or_create(slug="release-restore-sentinel", defaults={"name": "before-backup"})'
           backup_json=$("$package/bin/analysis-node" --json backup)

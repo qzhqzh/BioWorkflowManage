@@ -20,6 +20,7 @@ from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_SOURCE = PROJECT_ROOT / "deploy" / "analysis-node"
+REFERENCE_CONNECTOR_SOURCE = PROJECT_ROOT / "examples" / "reference_connector"
 RELEASE_IMAGES = PACKAGE_SOURCE / "release-images.json"
 PACKAGE_FILES = (
     ".env.example",
@@ -33,6 +34,33 @@ PACKAGE_FILES = (
     "nginx-headless.conf",
     "release-images.json",
     "workflow-package-manifest.schema.json",
+)
+REFERENCE_CONNECTOR_FILES = (
+    ".dockerignore",
+    ".gitignore",
+    "Dockerfile",
+    "README.md",
+    "analysis-node-smoke-order.example.json",
+    "clients/MesConnectorClient.java",
+    "clients/python_mes_client.py",
+    "compose.example.yml",
+    "compose.offline.yml",
+    "config.compose.example.json",
+    "config.example.json",
+    "config.offline.example.json",
+    "config.analysis-node-smoke.example.json",
+    "contract-surface.json",
+    "curl-flow.md",
+    "mes-order.example.json",
+    "postman/Reference-Connector.postman_collection.json",
+    "reference_connector/__init__.py",
+    "reference_connector/__main__.py",
+    "reference_connector/api.py",
+    "reference_connector/config.py",
+    "reference_connector/connector.py",
+    "reference_connector/mapping.py",
+    "reference_connector/server.py",
+    "reference_connector/store.py",
 )
 REQUIRED_ROLES = (
     "backend",
@@ -175,6 +203,32 @@ def _copy_package(target: Path) -> None:
     shutil.copy2(
         PROJECT_ROOT / "docs" / "14-integration-api-and-mcp.md",
         target / "14-integration-api-and-mcp.md",
+    )
+    connector_guide = (
+        PROJECT_ROOT / "docs" / "20-reference-connector.md"
+    ).read_text(encoding="utf-8")
+    (target / "20-reference-connector.md").write_text(
+        connector_guide.replace(
+            "../examples/reference_connector/",
+            "reference-connector/",
+        ),
+        encoding="utf-8",
+    )
+    connector_target = target / "reference-connector"
+    connector_target.mkdir()
+    for relative_name in REFERENCE_CONNECTOR_FILES:
+        source = REFERENCE_CONNECTOR_SOURCE / relative_name
+        if source.is_symlink() or not source.is_file():
+            raise BundleError(
+                "Reference Connector 白名单文件不存在或不是普通文件："
+                f"{relative_name}"
+            )
+        destination = connector_target / relative_name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+    (connector_target / "INTEGRATION-GUIDE.md").write_text(
+        connector_guide.replace("../examples/reference_connector/", ""),
+        encoding="utf-8",
     )
     for generated in (
         target / "images.env.example",

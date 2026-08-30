@@ -108,7 +108,68 @@ jobs:
         run: uv sync --frozen
 
       - name: Lint backend
-        run: uvx --from ruff==0.15.14 ruff check backend scripts deploy/analysis-node/lib
+        run: >-
+          uvx --from ruff==0.15.14 ruff check
+          backend scripts deploy/analysis-node/lib examples/reference_connector
+
+      - name: Set up Java 17 for Connector example
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Compile Java 17 Connector client example
+        run: |
+          mkdir -p "$RUNNER_TEMP/reference-connector-java"
+          javac -d "$RUNNER_TEMP/reference-connector-java" \
+            examples/reference_connector/clients/MesConnectorClient.java
+          if REFERENCE_CONNECTOR_URL=http://127.attacker.example \
+            REFERENCE_CONNECTOR_INBOUND_TOKEN=connector-client-test-token \
+            java -cp "$RUNNER_TEMP/reference-connector-java" \
+              MesConnectorClient status test-run \
+              > /dev/null 2> "$RUNNER_TEMP/reference-connector-java/http-error.log"; then
+            echo "Java Connector client accepted a non-loopback HTTP origin" >&2
+            exit 1
+          fi
+          grep -q 'must use HTTPS' \
+            "$RUNNER_TEMP/reference-connector-java/http-error.log"
+
+      - name: Verify source Connector Compose is reachable from the host
+        env:
+          BIOWORKFLOW_TOKEN: connector-compose-test-token
+          BIOWORKFLOW_WEBHOOK_SECRET: cmVmZXJlbmNlLWNvbm5lY3Rvci13ZWJob29rLWtleSE
+          REFERENCE_CONNECTOR_INBOUND_TOKEN: connector-compose-inbound-token-32
+        run: |
+          connector_root="$PWD/examples/reference_connector"
+          cp "$connector_root/config.compose.example.json" \
+            "$connector_root/config.compose.json"
+          connector_compose() {
+            docker compose \
+              --project-name reference-connector-ci \
+              --project-directory "$connector_root" \
+              --file "$connector_root/compose.example.yml" \
+              "$@"
+          }
+          cleanup_connector() {
+            status=$?
+            if [[ "$status" -ne 0 ]]; then
+              connector_compose logs --no-color || true
+            fi
+            connector_compose down || true
+            rm -f "$connector_root/config.compose.json"
+            return "$status"
+          }
+          trap cleanup_connector EXIT
+          connector_compose up --build -d
+          for _ in {1..30}; do
+            if curl --fail --silent --show-error \
+              http://127.0.0.1:8090/health >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl --fail --silent --show-error \
+            http://127.0.0.1:8090/health >/dev/null
 
       - name: Run backend tests
         run: uv run pytest backend/tests

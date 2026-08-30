@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "openapi_version": "1.5.0",
+  "parameters": [
+    "IdempotencyKey",
+    "RequestId",
+    "RunId"
+  ],
+  "operations": [
+    {
+      "method": "get",
+      "operation_id": "getIntegrationOpenAPI",
+      "path": "/openapi"
+    },
+    {
+      "method": "get",
+      "operation_id": "listAnalysisProducts",
+      "path": "/analysis-products"
+    },
+    {
+      "method": "get",
+      "operation_id": "getAnalysisProductVersion",
+      "path": "/analysis-products/{analysis_code}/versions/{contract_version}"
+    },
+    {
+      "method": "post",
+      "operation_id": "preflightAnalysisRun",
+      "path": "/analysis-runs/preflight"
+    },
+    {
+      "method": "post",
+      "operation_id": "submitAnalysisRun",
+      "path": "/analysis-runs"
+    },
+    {
+      "method": "get",
+      "operation_id": "findAnalysisRunByExternalRef",
+      "path": "/analysis-runs/by-external-ref"
+    },
+    {
+      "method": "get",
+      "operation_id": "getAnalysisRun",
+      "path": "/analysis-runs/{run_id}"
+    },
+    {
+      "method": "get",
+      "operation_id": "listAnalysisOutputs",
+      "path": "/analysis-runs/{run_id}/outputs"
+    },
+    {
+      "method": "get",
+      "operation_id": "downloadAnalysisOutput",
+      "path": "/analysis-runs/{run_id}/outputs/download"
+    },
+    {
+      "method": "post",
+      "operation_id": "createArtifactExport",
+      "path": "/analysis-runs/{run_id}/artifact-exports"
+    },
+    {
+      "method": "get",
+      "operation_id": "getArtifactExport",
+      "path": "/artifact-exports/{export_id}"
+    },
+    {
+      "method": "post",
+      "operation_id": "acknowledgeArtifactExport",
+      "path": "/artifact-exports/{export_id}/acknowledge"
+    }
+  ],
+  "schemas": [
+    "AnalysisPreflight",
+    "AnalysisOutputList",
+    "AnalysisProductVersion",
+    "AnalysisRun",
+    "AnalysisRunTerminalEvent",
+    "AnalysisSubmission",
+    "ArtifactExport",
+    "ArtifactExportCompletedEvent",
+    "ArtifactExportRequest",
+    "ErrorEnvelope"
+  ],
+  "webhooks": [
+    "analysisRunTerminal",
+    "artifactExportCompleted"
+  ],
+  "projection_digest": "sha256:9eb7dbddceebb9e0f817ef703e99fe3a55b314d0886711a95eb78e80b502692b"
+}
