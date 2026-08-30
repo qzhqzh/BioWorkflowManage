@@ -8,8 +8,9 @@
 
 ## 升级顺序
 
-升级包含数据库迁移 `0023` 至 `0028`，新增 WDL 协作、原始数据索引、WDL 发布证据表、
-共享登录限速桶和稳定分析产品契约，并约束同一用户在同一资产上只能保留一个待解决源码冲突。
+升级包含数据库迁移 `0023` 至 `0029`，新增 WDL 协作、原始数据索引、WDL 发布证据表、
+共享登录限速桶、稳定分析产品契约和 Webhook Outbox/投递审计表，并约束同一用户在同一资产上
+只能保留一个待解决源码冲突。
 迁移只新增表与约束，不改写已有 WDL revision、运行记录或原始数据。
 迁移不会自动把历史 WorkflowVersion 暴露为分析产品；管理员必须按
 [`14-integration-api-and-mcp.md`](14-integration-api-and-mcp.md) 显式发布产品契约。
@@ -20,7 +21,7 @@ docker compose exec -T db pg_dump -U "${POSTGRES_USER:-bioworkflow}" \
   -d "${POSTGRES_DB:-bioworkflow}" -Fc > /path/to/backup/bioworkflow-before-stable.dump
 
 # 2. 停止会创建运行记录或索引记录的 worker
-docker compose stop analysis-worker rawdata-indexer
+docker compose stop analysis-worker rawdata-indexer webhook-dispatcher
 docker compose --profile wdl-host-runtime stop analysis-worker-host
 
 # worker 停止后确认没有 queued/preparing 运行；有则通过运行页/API 取消，升级后重新投递
@@ -42,8 +43,8 @@ docker compose --profile wdl-runtime run --rm --no-deps analysis-worker \
 # docker compose --profile wdl-host-runtime run --rm --no-deps analysis-worker-host \
 #   python backend/manage.py backfill_analysis_output_manifests --actor stable-upgrade
 
-# 5. 启动页面、后台索引和所选执行 worker
-docker compose up -d frontend gateway rawdata-indexer
+# 5. 启动页面、后台索引、Webhook dispatcher 和所选执行 worker
+docker compose up -d frontend gateway rawdata-indexer webhook-dispatcher
 docker compose --profile wdl-host-runtime up -d analysis-worker-host
 ```
 
@@ -75,6 +76,11 @@ FASTQ/压缩 FASTA 会在交给 gzip 解压器前先按 `ANALYSIS_INPUT_GZIP_HEA
 默认 Compose gateway 为 1；外层再有 TLS 反向代理时通常为 2，部署者应按真实链路核对，避免信任
 客户端伪造的 `X-Forwarded-For`。
 
+生产 Webhook 部署应在升级前生成并安全保存独立 `WEBHOOK_SIGNING_KEY`，确保 backend 运维命令
+与所有 `webhook-dispatcher` 实例使用同一个值。默认只允许公网 HTTPS；内网 endpoint 必须通过
+`.env` 的 `WEBHOOK_PRIVATE_HOST_ALLOWLIST` 精确放行，不能使用通配符。迁移后先注册测试 endpoint，
+完成一次终态运行并确认 `webhook_delivery_stats` 中 delivery 进入 `delivered`，再启用生产订阅。
+
 Workflow 列表现在默认每页 50、最大 100，并返回 `total`/`has_next`/`summary`。前端已显式翻页；
 任何直接调用 `/api/v1/editor/workflows` 且假设无参数返回全集的旧客户端，必须在发布前改为传
 `page`/`page_size` 并循环到 `has_next=false`。
@@ -92,6 +98,7 @@ Workflow 列表现在默认每页 50、最大 100，并返回 `total`/`has_next`
 ```bash
 docker compose ps
 docker compose exec backend python backend/manage.py showmigrations workflows
+docker compose exec backend python backend/manage.py webhook_delivery_stats
 curl -fsS http://127.0.0.1:${APP_PORT:-8082}/api/v1/ready
 ```
 
@@ -105,7 +112,8 @@ curl -fsS http://127.0.0.1:${APP_PORT:-8082}/api/v1/ready
 
 ## 回滚
 
-应用回滚前停止 `analysis-worker`、`analysis-worker-host` 与 `rawdata-indexer`。代码可回到
+应用回滚前停止 `analysis-worker`、`analysis-worker-host`、`rawdata-indexer` 与
+`webhook-dispatcher`。代码可回到
 上一稳定 tag；新增表对旧代码无影响，因此正常回滚不执行逆向 migration，也不删除任何
 表或 Docker volume。若必须恢复数据库，使用升级前的 `pg_dump` 在独立数据库中验证后再
 切换，不能直接覆盖唯一生产副本。

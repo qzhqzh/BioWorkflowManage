@@ -2041,6 +2041,12 @@ def test_openapi_contract_covers_every_integration_route():
     assert workflow_ref.get("additionalProperties", True) is not False
     assert "404" in paths["/analysis-runs/preflight"]["post"]["responses"]
     assert "404" in paths["/analysis-runs"]["post"]["responses"]
+    assert "analysisRunTerminal" in payload["webhooks"]
+    assert (
+        payload["webhooks"]["analysisRunTerminal"]["post"]["requestBody"]
+        ["content"]["application/json"]["schema"]["$ref"]
+        == "#/components/schemas/AnalysisRunTerminalEvent"
+    )
     served = APIClient().get("/api/v1/integration/openapi")
     assert served.status_code == 200
     assert served.data["info"]["version"] == payload["info"]["version"]

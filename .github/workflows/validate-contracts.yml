@@ -98,6 +98,47 @@ jobs:
       - name: Check for missing migrations
         run: uv run python backend/manage.py makemigrations --check --dry-run
 
+  postgres-webhook-concurrency:
+    name: PostgreSQL webhook concurrency
+    runs-on: ubuntu-latest
+    env:
+      POSTGRES_HOST: 127.0.0.1
+      POSTGRES_DB: bioworkflow
+      POSTGRES_USER: bioworkflow
+      POSTGRES_PASSWORD: ci-only-password
+    services:
+      postgres:
+        image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+        env:
+          POSTGRES_DB: bioworkflow
+          POSTGRES_USER: bioworkflow
+          POSTGRES_PASSWORD: ci-only-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U bioworkflow -d bioworkflow"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install Python dependencies
+        run: uv sync --frozen
+
+      - name: Verify claim exclusion and lease fencing
+        run: >-
+          uv run pytest
+          backend/tests/test_webhooks.py::test_postgresql_delivery_claim_and_lease_fencing
+
   frontend:
     name: Frontend quality gates
     runs-on: ubuntu-latest

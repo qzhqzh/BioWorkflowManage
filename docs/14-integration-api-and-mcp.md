@@ -315,7 +315,129 @@ v2 输出清单按单项放行：若某个值、目录或文件无法固化，�
 升级前的历史清单只有 `schema_version=1`、没有 `integrity_version=2` 时不提供下载地址；下载
 请求稳定返回 409 `ANALYSIS_OUTPUT_UNVERIFIED`，完成发布手册中的受控回填后才恢复下载。
 
-## 6. AI Agent MCP
+## 6. 事务 Outbox 与签名 Webhook
+
+Webhook 只通知 `succeeded`、`failed`、`canceled` 三种终态。状态更新、不可变
+`IntegrationOutboxEvent` 和当时已激活订阅对应的 `WebhookDelivery` 在同一数据库事务中提交；
+`analysis-worker` 和 HTTP 请求都不访问外部网络。独立 `webhook-dispatcher` 领取 delivery，
+因此接收方故障不会改变 `AnalysisRun.status`、`output_status` 或错误结论。
+
+### 6.1 注册与密钥
+
+先在所有 backend/dispatcher 实例配置稳定且独立保存的 `WEBHOOK_SIGNING_KEY`。未显式配置时
+会从 `DJANGO_SECRET_KEY` 做域隔离派生，以兼容现有部署；生产环境仍建议使用独立随机值。更换
+部署主密钥会改变所有 endpoint 的派生密钥，必须按接收方迁移窗口协调，不能直接覆盖。
+
+```bash
+docker compose exec backend python backend/manage.py manage_webhook_endpoint \
+  --client-id mes-prod \
+  --name terminal \
+  --url https://mes.example.com/hooks/bioworkflow \
+  --event analysis.run.terminal \
+  --actor deployment
+```
+
+命令只在新建或 `--rotate-secret` 时显示一次 `SIGNING_SECRET`。数据库只保存 endpoint UUID、
+随机 salt 和版本，签名密钥由部署主密钥派生，不保存明文。接收方切换新密钥后可执行：
+
+```bash
+docker compose exec backend python backend/manage.py manage_webhook_endpoint \
+  --client-id mes-prod --name terminal --rotate-secret --actor security-rotation
+```
+
+每个 delivery 在终态事务中固化当时的目标 URL、salt 和密钥版本；之后修改 endpoint 只影响新事件，
+不会把历史待投递事件静默改投其他地址。轮换期间接收方应短暂同时接受仍在队列中的旧版本密钥。
+
+### 6.2 事件与验签
+
+Webhook body 不包含输出正文或文件；接收方收到通知后使用现有详情/输出清单 API 拉取结果：
+
+```json
+{
+  "schema_version": "1.0.0",
+  "event_id": "0ca8c5a0-8856-4adb-8964-c40020fed36e",
+  "event_type": "analysis.run.terminal",
+  "occurred_at": "2026-08-30T06:00:00+00:00",
+  "data": {
+    "run_id": "d275913e-2102-44b2-9d0a-79fc8b48d37f",
+    "run_kind": "workflow",
+    "external_ref": {
+      "client_id": "mes-prod",
+      "external_run_id": "MES-20260830-001"
+    },
+    "analysis_product": {
+      "analysis_code": "dna-panel",
+      "contract_version": "1.0.0",
+      "contract_digest": "sha256:..."
+    },
+    "status": "succeeded",
+    "status_version": 4,
+    "output_status": "complete",
+    "finished_at": "2026-08-30T06:00:00+00:00",
+    "error": null,
+    "links": {
+      "run": "/api/v1/integration/analysis-runs/d275913e-2102-44b2-9d0a-79fc8b48d37f",
+      "outputs": "/api/v1/integration/analysis-runs/d275913e-2102-44b2-9d0a-79fc8b48d37f/outputs"
+    }
+  }
+}
+```
+
+每次请求携带：
+
+- `X-BioWorkflow-Delivery-ID`：同一 endpoint 的自动重试和人工重放保持不变；
+- `X-BioWorkflow-Event-ID`：跨投递去重键，与 body `event_id` 相同；
+- `X-BioWorkflow-Timestamp`：Unix 秒；
+- `X-BioWorkflow-Secret-Version`：endpoint 密钥版本；
+- `X-BioWorkflow-Signature`：`v1=<hex HMAC-SHA256>`。
+
+签名原文是 UTF-8/bytes 拼接：
+
+```text
+delivery_id + "." + event_id + "." + timestamp + "." + canonical_json_body
+```
+
+`canonical_json_body` 使用 key 排序、无多余空白的 UTF-8 JSON。接收方必须先对原始 body 做
+constant-time HMAC 比较，再检查 timestamp（建议 ±300 秒），持久化去重 `event_id`，最后仅在
+`status_version` 不旧于本地已处理版本时推进状态。OpenAPI 3.1 顶层 `webhooks.analysisRunTerminal`
+定义了完整 header 与 body 契约。
+
+### 6.3 重试、死信、重放与指标
+
+dispatcher 对网络错误和非 2xx 响应执行至少一次投递。间隔按
+`WEBHOOK_BACKOFF_BASE_SECONDS * 2^(attempt-1)` 指数增长，并受
+`WEBHOOK_BACKOFF_MAX_SECONDS` 限制；达到 `WEBHOOK_MAX_ATTEMPTS` 后进入 `dead_letter`。
+`WEBHOOK_DELIVERY_TIMEOUT_SECONDS` 是覆盖 DNS、连接、TLS、响应 header 和有限响应 body 的
+单次 wall-clock 总时限，不是可被慢速滴流持续续期的 idle timeout。worker 租约过期会以同一个
+delivery ID 重试，因此接收方必须去重。
+
+```bash
+# 查看 pending/delivering/delivered/dead_letter 数量、到期数和最老 pending 年龄
+docker compose exec backend python backend/manage.py webhook_delivery_stats
+
+# 查找指定 Service Account 最近的死信及其 delivery ID（最多返回 200 条）
+docker compose exec backend python backend/manage.py webhook_delivery_stats \
+  --state dead_letter --client-id mes-prod --limit 50
+
+# 修复接收方后人工重放；保留原 delivery ID 和所有历史 attempt 审计
+docker compose exec backend python backend/manage.py replay_webhook_delivery \
+  --delivery-id <uuid> --actor operator@example.com
+```
+
+每次 attempt 固化开始/结束时间、HTTP 状态、有限响应摘要和稳定错误码；目标一旦解析成功，
+签名 timestamp 与固定 IP 会在发送前落库，因此发送后进程崩溃也保留审计证据。DNS 在解析前
+失败的 attempt 对应字段为空。重放只把 delivery 重新排队，不清空历史 attempt，不修改分析运行。
+原有轮询、事件增量和结果接口始终可用。
+
+### 6.4 SSRF 与网络边界
+
+- 默认只允许 HTTPS，不跟随 3xx redirect；
+- 注册和每次投递都解析全部 A/AAAA，任一地址为私网、环回、link-local、site-local、组播或保留地址即失败；
+- 连接使用本次已验证的 IP，同时以原 hostname 做 Host/SNI 和证书校验，关闭 DNS 重绑定窗口；
+- 私有化部署确需内网目标时，只能在 `WEBHOOK_PRIVATE_HOST_ALLOWLIST` 精确列出 hostname/IP；
+- 仅本地受控测试才在 `WEBHOOK_ALLOWED_HTTP_HOSTS` 精确允许 HTTP hostname；该白名单不自动放行私网地址。
+
+## 7. AI Agent MCP
 
 MCP 是对 Integration API 的 stdio 适配层，不直接访问 ORM，也不能绕过 Service Token
 scope。启动命令：
@@ -360,16 +482,18 @@ uv run python backend/manage_mcp.py
 刻意不开放：编辑/发布 WDL 或 Tool、修改软件知识、管理用户/Token、任意绝对路径、宿主
 命令、Docker 管理和直接数据库访问。AI 测试应使用小数据，先 preflight，再 submit。
 
-## 7. 升级与验证
+## 8. 升级与验证
 
 迁移到包含 `0021_serviceaccount_servicetoken_and_more` 至
-`0028_analysisproduct_analysisproductversion_and_more` 的版本前先停止两种 Worker，避免
-代码与数据库 Schema 短暂不一致：
+`0029_integrationoutboxevent_webhookdelivery_and_more` 的版本前先停止分析 Worker 与
+Webhook dispatcher，避免代码与数据库 Schema 短暂不一致：
 
 ```bash
 docker compose --profile wdl-runtime stop analysis-worker
 docker compose --profile wdl-host-runtime stop analysis-worker-host
+docker compose stop webhook-dispatcher
 docker compose up -d --build backend
+docker compose up -d --build webhook-dispatcher
 docker compose --profile wdl-host-runtime up -d --build analysis-worker-host
 docker compose restart gateway
 ```
