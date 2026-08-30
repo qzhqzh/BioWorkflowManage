@@ -805,17 +805,34 @@ def _snapshot_output_file(
     snapshot_budget: OutputSnapshotBudget,
 ) -> dict[str, Any]:
     snapshot_root = run_root / ".verified-outputs"
-    if snapshot_root.is_symlink():
-        raise ValueError("输出快照目录不能是符号链接。")
-    snapshot_root.mkdir(mode=0o750, exist_ok=True)
-    snapshot_root = snapshot_root.resolve()
-    snapshot_root.relative_to(run_root)
-
-    temporary_path: Path | None = None
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    run_root_descriptor = os.open(run_root, directory_flags)
+    snapshot_directory_descriptor = -1
+    temporary_name: str | None = None
     temporary_handle: BinaryIO | None = None
     try:
+        try:
+            os.mkdir(".verified-outputs", mode=0o750, dir_fd=run_root_descriptor)
+        except FileExistsError:
+            pass
+        snapshot_directory_descriptor = os.open(
+            ".verified-outputs",
+            directory_flags,
+            dir_fd=run_root_descriptor,
+        )
+        snapshot_descriptor_path = Path(
+            f"/proc/self/fd/{snapshot_directory_descriptor}"
+        )
         digest = hashlib.sha256()
-        with _open_regular_readonly(path) as source:
+        with _open_regular_readonly(
+            path,
+            containment_root=run_root,
+        ) as source:
             before = os.fstat(source.fileno())
             if not stat_module.S_ISREG(before.st_mode):
                 raise ValueError("输出不是普通文件。")
@@ -824,7 +841,11 @@ def _snapshot_output_file(
             cached = snapshot_budget.cached(source_key)
             if cached is not None:
                 after = os.fstat(source.fileno())
-                current = os.stat(path, follow_symlinks=False)
+                with _open_regular_readonly(
+                    path,
+                    containment_root=run_root,
+                ) as current_handle:
+                    current = os.fstat(current_handle.fileno())
                 if (
                     source_identity != _file_identity(after)
                     or source_identity != _file_identity(current)
@@ -842,18 +863,21 @@ def _snapshot_output_file(
                     )
                 ),
             )
-            if shutil.disk_usage(snapshot_root).free < before.st_size + minimum_free:
+            if (
+                shutil.disk_usage(snapshot_descriptor_path).free
+                < before.st_size + minimum_free
+            ):
                 raise OutputSnapshotBudgetError(
                     "output_snapshot_storage_insufficient",
                     "输出快照存储空间不足。",
                 )
             temporary_handle = tempfile.NamedTemporaryFile(
                 mode="w+b",
-                dir=snapshot_root,
+                dir=snapshot_descriptor_path,
                 prefix=".snapshot-",
                 delete=False,
             )
-            temporary_path = Path(temporary_handle.name)
+            temporary_name = Path(temporary_handle.name).name
             remaining = before.st_size
             while remaining:
                 snapshot_budget.checkpoint()
@@ -869,7 +893,11 @@ def _snapshot_output_file(
             os.fsync(temporary_handle.fileno())
             os.fchmod(temporary_handle.fileno(), 0o444)
             after = os.fstat(source.fileno())
-            current = os.stat(path, follow_symlinks=False)
+            with _open_regular_readonly(
+                path,
+                containment_root=run_root,
+            ) as current_handle:
+                current = os.fstat(current_handle.fileno())
         snapshot_budget.checkpoint()
         if (
             source_identity != _file_identity(after)
@@ -891,36 +919,46 @@ def _snapshot_output_file(
         ):
             raise ValueError("输出快照与内容地址不一致。")
 
-        snapshot_path = snapshot_root / digest.hexdigest()
+        snapshot_name = digest.hexdigest()
+        snapshot_path = snapshot_root / snapshot_name
         lock_flags = (
             os.O_RDWR
             | os.O_CREAT
             | getattr(os, "O_NOFOLLOW", 0)
             | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NONBLOCK", 0)
         )
         lock_descriptor = os.open(
-            snapshot_root / ".publish.lock",
+            ".publish.lock",
             lock_flags,
             0o600,
+            dir_fd=snapshot_directory_descriptor,
         )
         created = False
         try:
+            if not stat_module.S_ISREG(os.fstat(lock_descriptor).st_mode):
+                raise ValueError("输出快照发布锁无效。")
             fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
             try:
-                os.link(temporary_path, snapshot_path)
+                os.link(
+                    temporary_name,
+                    snapshot_name,
+                    src_dir_fd=snapshot_directory_descriptor,
+                    dst_dir_fd=snapshot_directory_descriptor,
+                    follow_symlinks=False,
+                )
                 created = True
             except FileExistsError:
                 pass
-            temporary_path.unlink()
-            temporary_path = None
-            directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-            directory_descriptor = os.open(snapshot_root, directory_flags)
-            try:
-                os.fsync(directory_descriptor)
-            finally:
-                os.close(directory_descriptor)
+            os.unlink(temporary_name, dir_fd=snapshot_directory_descriptor)
+            temporary_name = None
+            os.fsync(snapshot_directory_descriptor)
             if created:
-                target_stat = os.stat(snapshot_path, follow_symlinks=False)
+                target_stat = os.stat(
+                    snapshot_name,
+                    dir_fd=snapshot_directory_descriptor,
+                    follow_symlinks=False,
+                )
                 if (
                     snapshot_after.st_size != target_stat.st_size
                     or snapshot_after.st_mtime_ns != target_stat.st_mtime_ns
@@ -935,7 +973,11 @@ def _snapshot_output_file(
                     | getattr(os, "O_NOFOLLOW", 0)
                     | getattr(os, "O_NONBLOCK", 0)
                 )
-                descriptor = os.open(snapshot_path, flags)
+                descriptor = os.open(
+                    snapshot_name,
+                    flags,
+                    dir_fd=snapshot_directory_descriptor,
+                )
                 with os.fdopen(descriptor, "rb") as snapshot_handle:
                     snapshot_before = os.fstat(snapshot_handle.fileno())
                     if (
@@ -972,18 +1014,14 @@ def _snapshot_output_file(
         except Exception:
             if created:
                 try:
-                    snapshot_path.unlink()
+                    os.unlink(
+                        snapshot_name,
+                        dir_fd=snapshot_directory_descriptor,
+                    )
                 except OSError:
                     pass
                 try:
-                    directory_descriptor = os.open(
-                        snapshot_root,
-                        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-                    )
-                    try:
-                        os.fsync(directory_descriptor)
-                    finally:
-                        os.close(directory_descriptor)
+                    os.fsync(snapshot_directory_descriptor)
                 except OSError:
                     pass
             raise
@@ -993,11 +1031,17 @@ def _snapshot_output_file(
     finally:
         if temporary_handle is not None:
             temporary_handle.close()
-        if temporary_path is not None:
+        if temporary_name is not None and snapshot_directory_descriptor >= 0:
             try:
-                temporary_path.unlink()
+                os.unlink(
+                    temporary_name,
+                    dir_fd=snapshot_directory_descriptor,
+                )
             except FileNotFoundError:
                 pass
+        if snapshot_directory_descriptor >= 0:
+            os.close(snapshot_directory_descriptor)
+        os.close(run_root_descriptor)
 
 
 def _directory_manifest(
@@ -1053,7 +1097,10 @@ def open_verified_output(
     source_identity = item.get("source_identity")
     if not isinstance(source_identity, dict):
         raise ValueError("输出缺少源文件完整性信息。")
-    with _open_regular_readonly(source_path) as source:
+    with _open_regular_readonly(
+        source_path,
+        containment_root=root,
+    ) as source:
         source_stat = os.fstat(source.fileno())
         if not stat_module.S_ISREG(source_stat.st_mode):
             raise ValueError("输出源不是普通文件。")
@@ -1061,13 +1108,16 @@ def open_verified_output(
             raise ValueError("输出源文件身份已变化。")
 
     path = _local_run_path(str(item["path"]))
-    snapshot_root = (root / ".verified-outputs").resolve()
+    snapshot_root = root / ".verified-outputs"
     path.relative_to(snapshot_root)
     expected_sha256 = str(item.get("sha256") or "")
     expected_name = expected_sha256.removeprefix("sha256:")
     if not expected_name or path.parent != snapshot_root or path.name != expected_name:
         raise ValueError("输出快照路径与内容地址不一致。")
-    handle = _open_regular_readonly(path)
+    handle = _open_regular_readonly(
+        path,
+        containment_root=root,
+    )
     try:
         file_stat = os.fstat(handle.fileno())
         if not stat_module.S_ISREG(file_stat.st_mode):

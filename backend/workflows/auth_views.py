@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import threading
+import time
 from datetime import timedelta
 
 from django.conf import settings
@@ -21,6 +23,32 @@ from .models import LoginRateLimitBucket
 from .request_ids import request_id, with_request_id
 
 
+_LOGIN_THROTTLE_PRUNE_INTERVAL_SECONDS = 60 * 60
+_LOGIN_THROTTLE_PRUNE_LOCK = threading.Lock()
+_login_throttle_next_prune_monotonic = 0.0
+
+
+def _maybe_prune_login_rate_limit_buckets(now) -> None:
+    global _login_throttle_next_prune_monotonic
+
+    current = time.monotonic()
+    with _LOGIN_THROTTLE_PRUNE_LOCK:
+        if current < _login_throttle_next_prune_monotonic:
+            return
+        _login_throttle_next_prune_monotonic = (
+            current + _LOGIN_THROTTLE_PRUNE_INTERVAL_SECONDS
+        )
+    try:
+        LoginRateLimitBucket.objects.filter(
+            updated_at__lt=now
+            - timedelta(days=settings.LOGIN_THROTTLE_RETENTION_DAYS)
+        ).delete()
+    except Exception:
+        with _LOGIN_THROTTLE_PRUNE_LOCK:
+            _login_throttle_next_prune_monotonic = 0.0
+        raise
+
+
 class LoginRateThrottle(SimpleRateThrottle):
     scope = "login"
 
@@ -29,19 +57,18 @@ class LoginRateThrottle(SimpleRateThrottle):
             return True
         ident = self.get_ident(request)
         key = hashlib.sha256(f"{self.scope}:{ident}".encode()).hexdigest()
-        now = timezone.now()
-        LoginRateLimitBucket.objects.filter(
-            updated_at__lt=now
-            - timedelta(days=settings.LOGIN_THROTTLE_RETENTION_DAYS)
-        ).delete()
+        initial_now = timezone.now()
         with transaction.atomic():
             bucket, _created = LoginRateLimitBucket.objects.select_for_update().get_or_create(
                 key=key,
                 defaults={
-                    "window_started_at": now,
+                    "window_started_at": initial_now,
                     "request_count": 0,
                 },
             )
+            # Sample after acquiring the row lock. A waiter can otherwise observe
+            # a negative elapsed interval and erase a concurrent request's count.
+            now = timezone.now()
             elapsed = (now - bucket.window_started_at).total_seconds()
             if elapsed < 0 or elapsed >= self.duration:
                 bucket.window_started_at = now
@@ -49,16 +76,19 @@ class LoginRateThrottle(SimpleRateThrottle):
                 elapsed = 0
             self._wait_seconds = max(0.0, self.duration - elapsed)
             if bucket.request_count >= self.num_requests:
-                return False
-            bucket.request_count += 1
-            bucket.save(
-                update_fields=[
-                    "window_started_at",
-                    "request_count",
-                    "updated_at",
-                ]
-            )
-        return True
+                allowed = False
+            else:
+                bucket.request_count += 1
+                bucket.save(
+                    update_fields=[
+                        "window_started_at",
+                        "request_count",
+                        "updated_at",
+                    ]
+                )
+                allowed = True
+        _maybe_prune_login_rate_limit_buckets(now)
+        return allowed
 
     def wait(self) -> float:
         return getattr(self, "_wait_seconds", self.duration)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import timedelta
 from importlib import import_module
 import re
@@ -153,9 +154,13 @@ def test_login_attempts_are_rate_limited(settings, monkeypatch):
 
 
 @pytest.mark.django_db
-def test_login_throttle_prunes_expired_shared_buckets(settings):
+def test_login_throttle_prunes_expired_shared_buckets(settings, monkeypatch):
     settings.AUTH_REQUIRED = True
     settings.LOGIN_THROTTLE_RETENTION_DAYS = 7
+    monkeypatch.setattr(
+        "workflows.auth_views._login_throttle_next_prune_monotonic",
+        0.0,
+    )
     stale = LoginRateLimitBucket.objects.create(
         key="f" * 64,
         window_started_at=timezone.now() - timedelta(days=8),
@@ -174,6 +179,46 @@ def test_login_throttle_prunes_expired_shared_buckets(settings):
 
     assert response.status_code == 401
     assert not LoginRateLimitBucket.objects.filter(pk=stale.pk).exists()
+
+
+@pytest.mark.django_db
+def test_login_throttle_samples_time_after_acquiring_bucket_lock(
+    settings, monkeypatch
+):
+    settings.AUTH_REQUIRED = True
+    monkeypatch.setattr(
+        LoginRateThrottle,
+        "THROTTLE_RATES",
+        {"login": "2/min"},
+    )
+    remote_address = "198.51.100.42"
+    key = hashlib.sha256(f"login:{remote_address}".encode()).hexdigest()
+    window_started_at = timezone.now()
+    LoginRateLimitBucket.objects.create(
+        key=key,
+        window_started_at=window_started_at,
+        request_count=2,
+    )
+    calls = 0
+
+    def lock_wait_clock():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return window_started_at - timedelta(seconds=1)
+        return window_started_at + timedelta(seconds=1)
+
+    monkeypatch.setattr("workflows.auth_views.timezone.now", lock_wait_clock)
+
+    response = APIClient().post(
+        "/api/v1/auth/login",
+        {"username": "missing", "password": "wrong"},
+        format="json",
+        REMOTE_ADDR=remote_address,
+    )
+
+    assert response.status_code == 429
+    assert LoginRateLimitBucket.objects.get(pk=key).request_count == 2
 
 
 @pytest.mark.django_db

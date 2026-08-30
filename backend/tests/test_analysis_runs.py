@@ -2320,8 +2320,8 @@ def test_output_snapshot_copy_is_bounded_when_source_grows(
         def seek(self, *args):
             return self.handle.seek(*args)
 
-    def open_with_growth(path):
-        handle = original_open(path)
+    def open_with_growth(path, **kwargs):
+        handle = original_open(path, **kwargs)
         return GrowingHandle(handle) if Path(path) == output else handle
 
     monkeypatch.setattr(
@@ -2383,8 +2383,8 @@ def test_output_snapshot_rejects_atomic_source_replacement(
                 replaced = True
             return data
 
-    def open_with_replacement(path):
-        handle = original_open(path)
+    def open_with_replacement(path, **kwargs):
+        handle = original_open(path, **kwargs)
         return ReplacingHandle(handle) if Path(path) == output else handle
 
     monkeypatch.setattr(
@@ -2401,6 +2401,60 @@ def test_output_snapshot_rejects_atomic_source_replacement(
     snapshot_root = run_directory / ".verified-outputs"
     assert not list(snapshot_root.glob(".snapshot-*"))
     assert not [item for item in snapshot_root.iterdir() if not item.name.startswith(".")]
+
+
+def test_output_snapshot_rejects_ancestor_symlink_replacement(
+    analysis_workspace, tmp_path, monkeypatch
+):
+    asset, revision = _asset("snapshot-ancestor", "SnapshotAncestor")
+    _, _, runs, _ = analysis_workspace
+    run_directory = runs / "snapshot-ancestor"
+    output_directory = run_directory / "lane"
+    output_directory.mkdir(parents=True)
+    output = output_directory / "result.txt"
+    output.write_text("trusted\n", encoding="utf-8")
+    outside_directory = tmp_path / "outside-output"
+    outside_directory.mkdir()
+    (outside_directory / output.name).write_text("secret\n", encoding="utf-8")
+    moved_directory = run_directory / "lane-original"
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="SnapshotAncestor",
+        sample_id="ANCESTOR",
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(run_directory),
+        outputs={"outputs": {"SnapshotAncestor.file": str(output)}},
+    )
+    original_open = analysis_runs_module._open_regular_readonly
+    replaced = False
+
+    def open_after_ancestor_replacement(path, **kwargs):
+        nonlocal replaced
+        if Path(path) == output and not replaced:
+            output_directory.rename(moved_directory)
+            output_directory.symlink_to(outside_directory, target_is_directory=True)
+            replaced = True
+        return original_open(path, **kwargs)
+
+    monkeypatch.setattr(
+        "workflows.integration_outputs._open_regular_readonly",
+        open_after_ancestor_replacement,
+    )
+
+    manifest, output_status, error = build_output_manifest(run, run.outputs)
+
+    assert replaced is True
+    assert output_status == AnalysisRun.OutputStatus.INCOMPLETE
+    assert error["code"] == "OUTPUT_INTEGRITY_UNVERIFIABLE"
+    assert manifest["unverifiable_outputs"] == [
+        {
+            "key": "SnapshotAncestor.file",
+            "reason": "file_digest_failed",
+        }
+    ]
+    snapshot_root = run_directory / ".verified-outputs"
+    assert list(snapshot_root.iterdir()) == []
 
 
 def test_output_traversal_budget_counts_null_array_items(
@@ -2733,13 +2787,24 @@ def test_output_snapshot_accepts_hardlink_ctime_change(
     original_link = os.link
     ctime_changed = False
 
-    def link_with_distinct_ctime(source, target):
+    def link_with_distinct_ctime(source, target, **kwargs):
         nonlocal ctime_changed
-        before_ctime = os.stat(source, follow_symlinks=False).st_ctime_ns
-        original_link(source, target)
+        before_ctime = os.stat(
+            source,
+            dir_fd=kwargs.get("src_dir_fd"),
+            follow_symlinks=False,
+        ).st_ctime_ns
+        original_link(source, target, **kwargs)
         for _ in range(100):
-            os.chmod(target, 0o444)
-            if os.stat(target, follow_symlinks=False).st_ctime_ns != before_ctime:
+            os.chmod(target, 0o444, dir_fd=kwargs.get("dst_dir_fd"))
+            if (
+                os.stat(
+                    target,
+                    dir_fd=kwargs.get("dst_dir_fd"),
+                    follow_symlinks=False,
+                ).st_ctime_ns
+                != before_ctime
+            ):
                 ctime_changed = True
                 return
             time.sleep(0.001)
