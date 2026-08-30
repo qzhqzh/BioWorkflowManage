@@ -638,6 +638,87 @@ def test_execute_run_retries_infrastructure_failure_once(
     assert (tmp_path / "runs" / str(run.id) / "attempt-2" / "result.json").is_file()
 
 
+def test_execute_run_rechecks_managed_inputs_after_object_staging(
+    settings, tmp_path, monkeypatch
+):
+    asset, revision = _asset("staging-recheck", "StagingRecheck")
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="StagingRecheck",
+        sample_id="SAMPLE01",
+    )
+    settings.ANALYSIS_RUN_ROOT = tmp_path / "runs"
+    calls = []
+
+    def verify(*_args, **_kwargs):
+        calls.append("verify")
+        if calls == ["verify", "stage", "verify"]:
+            raise RuntimeError("managed input changed during object staging")
+
+    def stage(*_args, **_kwargs):
+        calls.append("stage")
+        return 1
+
+    monkeypatch.setattr(
+        "workflows.analysis_runtime.shutil.which", lambda _: "/bin/miniwdl"
+    )
+    monkeypatch.setattr(
+        "workflows.analysis_runtime._verify_run_resource_manifests", verify
+    )
+    monkeypatch.setattr("workflows.analysis_runtime.stage_run_object_inputs", stage)
+    monkeypatch.setattr(
+        "workflows.analysis_runtime.subprocess.Popen",
+        lambda *_args, **_kwargs: pytest.fail("miniwdl must not start"),
+    )
+
+    with pytest.raises(RuntimeError, match="managed input changed"):
+        execute_analysis_run(run)
+
+    assert calls == ["verify", "stage", "verify"]
+
+
+def test_execute_run_keeps_preparing_during_object_launch_recheck(
+    settings, tmp_path, monkeypatch
+):
+    asset, revision = _asset("object-launch-recheck", "ObjectLaunchRecheck")
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="ObjectLaunchRecheck",
+        sample_id="SAMPLE01",
+        status=AnalysisRun.Status.PREPARING,
+    )
+    settings.ANALYSIS_RUN_ROOT = tmp_path / "runs"
+
+    def verify_objects(item, **_kwargs):
+        item.refresh_from_db()
+        assert item.status == AnalysisRun.Status.PREPARING
+        raise RuntimeError("object launch recheck stopped execution")
+
+    monkeypatch.setattr(
+        "workflows.analysis_runtime.shutil.which", lambda _: "/bin/miniwdl"
+    )
+    monkeypatch.setattr(
+        "workflows.analysis_runtime._verify_run_resource_manifests",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "workflows.analysis_runtime.stage_run_object_inputs",
+        lambda *_args, **_kwargs: 1,
+    )
+    monkeypatch.setattr(
+        "workflows.analysis_runtime.verify_run_object_inputs", verify_objects
+    )
+    monkeypatch.setattr(
+        "workflows.analysis_runtime.subprocess.Popen",
+        lambda *_args, **_kwargs: pytest.fail("miniwdl must not start"),
+    )
+
+    with pytest.raises(RuntimeError, match="object launch recheck"):
+        execute_analysis_run(run)
+
+
 def test_execute_run_terminates_process_when_event_recording_fails(
     settings, tmp_path, monkeypatch
 ):

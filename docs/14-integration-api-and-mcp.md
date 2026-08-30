@@ -138,6 +138,69 @@ Directory `sha256` 仅兼容接收并忽略，不会被误当成目录身份摘�
 可终止且每个服务进程单并发的子进程中；HTTP 预检使用 `ANALYSIS_RESOURCE_MANIFEST_TIMEOUT_SECONDS`，worker
 复核使用 `ANALYSIS_WORKER_RESOURCE_MANIFEST_TIMEOUT_SECONDS`。
 
+File 输入也可以使用 S3/MinIO 兼容对象引用；Directory 仍只接受受管路径：
+
+```json
+{
+  "type": "s3_object",
+  "profile": "production-minio",
+  "bucket": "validated-inputs",
+  "key": "project/S001_R1.fastq.gz",
+  "version_id": "3Lg...",
+  "etag": "d41d8cd98f00b204e9800998ecf8427e",
+  "size": 123456789,
+  "sha256": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+}
+```
+
+`version_id` 与 `etag` 至少提供一个，`size` 和 `sha256` 必填。API 只接受部署侧已注册的
+`profile` 和该 profile 的 bucket 白名单；调用方不能提交 endpoint、Access Key、Secret Key
+或预签名 URL。预检通过 `HeadObject + If-Match/VersionId` 核对身份，不下载大文件。Worker 在
+`PREPARING` 阶段使用条件 `GetObject` 下载到 SHA-256 内容寻址的只读 staging，完整校验大小和
+摘要后才把路径交给 miniwdl。若对象被覆盖、版本消失、ETag 改变、下载内容不符或 staging 被
+篡改，任务失败关闭，不回退到“最新对象”。
+
+每个 profile 是 `${ANALYSIS_OBJECT_STORAGE_SECRETS_HOST_PATH}/<profile>.json`，示例：
+
+```json
+{
+  "endpoint_url": "https://minio.example.internal",
+  "region": "us-east-1",
+  "allowed_buckets": ["validated-inputs"],
+  "client_grants": {
+    "mes-production": {"validated-inputs": ["tenant-a/"]}
+  },
+  "allowed_cidrs": ["10.20.0.0/16"],
+  "allow_private_network": true,
+  "access_key_id": "<read-only access key>",
+  "secret_access_key": "<read-only secret key>"
+}
+```
+
+profile 文件不得提交到 Git；默认目录 `./secrets/object-storage` 已忽略。每个 profile 必须通过
+`client_grants` 把 Service Account、bucket 与 key prefix 绑定为同一条授权，不能把多租户账号与
+前缀分别配置成两个全局白名单。HTTP endpoint
+默认拒绝，私网地址必须显式 `allow_private_network=true`，loopback/link-local/site-local/multicast/
+unspecified/reserved 地址始终拒绝；`allowed_cidrs` 可进一步收窄出口。应用会把每次请求固定到本次已审核的
+解析地址，拒绝跳转到其他 origin；同一请求的 HEAD 复用一个关闭继承 FD 的独立 Worker 进程，Worker 同时配置
+自身硬期限和 Linux parent-death signal，父进程超时后先回收 Worker 再释放并发槽。生产环境仍应在主机防火墙或
+容器网络策略中做第二层出口白名单。profile 只挂载给 backend 与 analysis-worker，不挂载给 miniwdl task 容器，凭据不会
+进入 `AnalysisRun.request_payload`、日志、API 响应或 Webhook。
+
+对象 HEAD 使用独立于受管 NAS 快照的请求预算：单对象上限由
+`ANALYSIS_OBJECT_HEAD_TIMEOUT_SECONDS` 控制，同一请求累计上限由
+`ANALYSIS_OBJECT_HEAD_REQUEST_TIMEOUT_SECONDS` 控制且最多 20 秒，为 Gunicorn 30 秒请求超时保留回收余量。
+
+对象输入使用稳定错误码：引用/profile 无效为 `OBJECT_INPUT_REFERENCE_INVALID` /
+`OBJECT_INPUT_PROFILE_INVALID`，bucket 或 endpoint 越权为 `OBJECT_INPUT_BUCKET_FORBIDDEN` /
+`OBJECT_INPUT_ENDPOINT_FORBIDDEN`，身份变化为 `OBJECT_INPUT_CHANGED`，摘要不符为
+`OBJECT_INPUT_DIGEST_MISMATCH`，暂存篡改为 `OBJECT_INPUT_STAGING_CHANGED`，并发/容量等待超时为
+`OBJECT_INPUT_STAGE_BUSY` / `OBJECT_INPUT_STAGE_CAPACITY`，网络或硬超时为可重试的
+`OBJECT_INPUT_UNAVAILABLE` / `OBJECT_INPUT_STAGE_TIMEOUT`。profile/前缀授权失败分别为
+`OBJECT_INPUT_PROFILE_FORBIDDEN` / `OBJECT_INPUT_KEY_FORBIDDEN`，预检并发槽耗尽为
+`OBJECT_INPUT_HEAD_BUSY`，预检硬超时为 `OBJECT_INPUT_HEAD_TIMEOUT`。外部系统只按 `code`、`category` 和
+`retryable` 分支，不解析中文 message。
+
 ### 3.2 运行列表摘要
 
 `GET /api/v1/integration/analysis-runs` 最多返回 200 条，响应带 `view=summary`。列表项中的
@@ -485,7 +548,7 @@ uv run python backend/manage_mcp.py
 ## 8. 升级与验证
 
 迁移到包含 `0021_serviceaccount_servicetoken_and_more` 至
-`0029_integrationoutboxevent_webhookdelivery_and_more` 的版本前先停止分析 Worker 与
+`0030_inputstagingcoordinator_inputstaginglease` 的版本前先停止分析 Worker 与
 Webhook dispatcher，避免代码与数据库 Schema 短暂不一致：
 
 ```bash
@@ -515,3 +578,20 @@ SHA-256 字节上限由
 持续遍历，但无法中断单次卡住的 NAS syscall。当前数据库目录没有后台预计算索引，提供
 `identity_digest` 也仍会在请求中扫描核对；高延迟存储必须在部署层设置 NAS 超时并隔离/监控
 异常挂载，后台索引属于后续演进项。
+
+对象输入容量与调度由 `ANALYSIS_OBJECT_STAGE_*` 配置：单对象、单任务、并发预留总字节、
+最小剩余空间、跨 Worker 并发槽、等待时间、每对象硬超时和单任务总暂存时间都独立受限。并发槽由 PostgreSQL
+singleton row 串行分配，Worker 崩溃后 lease 到期自动回收。`ANALYSIS_INPUT_STAGING_HOST_PATH`
+必须由 Worker UID 可写，并同时以只读方式挂载给 backend 和 miniwdl Docker daemon；主机运行
+profile 还应把 `ANALYSIS_INPUT_STAGING_EXECUTION_ROOT` 设置为同一个宿主绝对路径。
+单任务字节上限按不同远端对象身份的实际下载量计算；磁盘预留则按尚未命中的不同内容寻址路径计算，
+相同声明摘要不能把多次远端传输折叠出配额。
+内容寻址文件是持久缓存，当前版本不会自动回收；安全 retention/GC 由 #32 跟踪。在该能力合并前，
+部署方必须监控 staging 使用量。需要人工回收时，先确认没有 `queued/preparing/running/cancel_requested`
+任务并停止所有 analysis worker，只清点和处理 `sha256/` 内容树，保留 `.leases/` 交给 lease
+回收逻辑；不得删除 staging 根目录或 Docker volume。下次执行会从远端重新验证并重建缺失内容。
+每个暂存 lease 使用独立的 `.leases/<lease-id>` 临时目录；过期 lease 的孤儿普通文件会在下一次
+分配槽位时按数据库活动 lease 白名单清理。内容寻址文件每次执行仍会对对应对象身份做条件 GET
+并完整计算 SHA-256，缓存命中不能绕过对象删除、撤权或“对象身份→摘要”的真实性校验；FASTQ/
+FASTA 语义和 R1/R2 首条 read ID 会在暂存后、启动 miniwdl 前再次校验。
+配对审计证据只持久化规范化 read ID 的 SHA-256，不保存原始 FASTQ header/read ID。

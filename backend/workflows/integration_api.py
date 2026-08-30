@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -70,6 +71,12 @@ from .models import (
     ToolVersion,
     WorkflowDocument,
     WorkflowVersion,
+)
+from .object_inputs import (
+    ObjectHeadBudget,
+    ObjectInputError,
+    inspect_object_reference,
+    object_manifest_items,
 )
 from .request_ids import request_id, with_request_id
 from .tool_runs import _safe_identifier, _tool_test_bundle, _validate_constraints
@@ -590,6 +597,23 @@ def _managed_resource(
             f"输入 {input_name} 必须使用 root_alias + relative_path。",
             category="input",
         )
+    prohibited_fields = {
+        "profile",
+        "bucket",
+        "version_id",
+        "etag",
+        "access_key_id",
+        "secret_access_key",
+        "session_token",
+        "endpoint_url",
+        "presigned_url",
+    }
+    if prohibited_fields & set(value):
+        raise IntegrationAPIError(
+            "MANAGED_RESOURCE_INVALID",
+            f"输入 {input_name} 不能包含对象存储凭据或 endpoint。",
+            category="input",
+        )
     if kind == "file" and value.get("identity_digest"):
         raise IntegrationAPIError(
             "MANAGED_RESOURCE_DIGEST_INVALID",
@@ -761,6 +785,9 @@ def _managed_resource(
             category="input",
         )
     manifest: dict[str, Any] = {
+        "reference_type": "managed_path",
+        "semantic_type": semantic_type,
+        "input_sequence": sum(len(items) for items in manifests.values()),
         "root_alias": alias,
         "relative_path": normalized.as_posix(),
         "kind": kind,
@@ -806,6 +833,7 @@ def _managed_resource(
             "path": local_path,
             "containment_root": local_root,
             "identity": observed_identity,
+            "manifest": manifest,
         }
     )
     return str(execution_root / normalized)
@@ -819,13 +847,72 @@ def _coerce_input(
     semantic_type: str,
     manifests: dict[str, list[dict[str, Any]]],
     observed: list[dict[str, Any]],
+    object_checks: list[dict[str, Any]],
     snapshot_budget: ResourceSnapshotBudget,
+    object_head_budget: ObjectHeadBudget,
+    client_id: str | None,
 ) -> Any:
     optional = wdl_type.endswith("?")
     normalized_type = wdl_type.removesuffix("?").strip()
     if value is None and optional:
         return None
     if normalized_type == "File":
+        value_fields = set(value) if isinstance(value, dict) else set()
+        managed_fields = {"root_alias", "relative_path"}
+        managed_shape = managed_fields <= value_fields
+        object_identity_fields = {"profile", "bucket", "version_id", "etag"}
+        if (
+            isinstance(value, dict)
+            and value.get("type") == "s3_object"
+            and (
+                (not managed_shape and bool(managed_fields & value_fields))
+                or (managed_shape and bool(object_identity_fields & value_fields))
+            )
+        ):
+            raise IntegrationAPIError(
+                "INPUT_REFERENCE_AMBIGUOUS",
+                f"输入 {input_name} 不能混用受管路径和对象引用字段。",
+                category="input",
+            )
+        if (
+            isinstance(value, dict)
+            and value.get("type") == "s3_object"
+            and not managed_shape
+        ):
+            if len(manifests["objects"]) >= int(
+                settings.ANALYSIS_OBJECT_STAGE_MAX_ITEMS
+            ):
+                raise IntegrationAPIError(
+                    "OBJECT_INPUT_LIMIT_EXCEEDED",
+                    "对象输入数量超过部署上限。",
+                    category="input",
+            )
+            try:
+                _snapshot_checkpoint(snapshot_budget)
+                with snapshot_budget.suspend_deadline():
+                    execution_path, manifest, check = inspect_object_reference(
+                        value,
+                        input_name=input_name,
+                        semantic_type=semantic_type,
+                        client_id=client_id,
+                        head_budget=object_head_budget,
+                    )
+                _snapshot_checkpoint(snapshot_budget)
+            except ObjectInputError as error:
+                raise IntegrationAPIError(
+                    error.code,
+                    str(error),
+                    category=error.category,
+                    retryable=error.retryable,
+                    details=error.details,
+                    http_status=error.http_status,
+                ) from error
+            manifest["input_sequence"] = sum(
+                len(items) for items in manifests.values()
+            )
+            manifests["objects"].append(manifest)
+            object_checks.append(check)
+            return execution_path
         return _managed_resource(
             value,
             kind="file",
@@ -861,7 +948,10 @@ def _coerce_input(
                 semantic_type=semantic_type,
                 manifests=manifests,
                 observed=observed,
+                object_checks=object_checks,
                 snapshot_budget=snapshot_budget,
+                object_head_budget=object_head_budget,
+                client_id=client_id,
             )
             for item in value
         ]
@@ -881,7 +971,10 @@ def _coerce_input(
                 semantic_type=semantic_type,
                 manifests=manifests,
                 observed=observed,
+                object_checks=object_checks,
                 snapshot_budget=snapshot_budget,
+                object_head_budget=object_head_budget,
+                client_id=client_id,
             )
             for index, side in enumerate(("left", "right"))
         }
@@ -1122,6 +1215,7 @@ def _content_checks(
     observed: list[dict[str, Any]],
     *,
     snapshot_budget: ResourceSnapshotBudget,
+    skip_fastq_pair: bool = False,
 ) -> list[dict[str, Any]]:
     reads: dict[int, list[str]] = {1: [], 2: []}
     checked = []
@@ -1130,26 +1224,38 @@ def _content_checks(
         semantic = item["semantic_type"]
         path = item["path"]
         if semantic == "bio.fastq.gz.r1":
-            reads[1].append(
-                _validate_fastq(
-                    path,
-                    expected_mate=1,
-                    expected_identity=item["identity"],
-                    containment_root=item["containment_root"],
-                    snapshot_budget=snapshot_budget,
-                )
+            read_id = _validate_fastq(
+                path,
+                expected_mate=1,
+                expected_identity=item["identity"],
+                containment_root=item["containment_root"],
+                snapshot_budget=snapshot_budget,
             )
+            read_id_digest = f"sha256:{hashlib.sha256(read_id.encode('utf-8')).hexdigest()}"
+            reads[1].append(read_id_digest)
+            if skip_fastq_pair:
+                item["manifest"]["semantic_evidence"] = {
+                    "kind": "fastq",
+                    "mate": 1,
+                    "first_read_id_sha256": read_id_digest,
+                }
             checked.append({"input": item["input"], "check": "fastq_r1", "ready": True})
         elif semantic == "bio.fastq.gz.r2":
-            reads[2].append(
-                _validate_fastq(
-                    path,
-                    expected_mate=2,
-                    expected_identity=item["identity"],
-                    containment_root=item["containment_root"],
-                    snapshot_budget=snapshot_budget,
-                )
+            read_id = _validate_fastq(
+                path,
+                expected_mate=2,
+                expected_identity=item["identity"],
+                containment_root=item["containment_root"],
+                snapshot_budget=snapshot_budget,
             )
+            read_id_digest = f"sha256:{hashlib.sha256(read_id.encode('utf-8')).hexdigest()}"
+            reads[2].append(read_id_digest)
+            if skip_fastq_pair:
+                item["manifest"]["semantic_evidence"] = {
+                    "kind": "fastq",
+                    "mate": 2,
+                    "first_read_id_sha256": read_id_digest,
+                }
             checked.append({"input": item["input"], "check": "fastq_r2", "ready": True})
         elif item["kind"] == "file" and "fasta" in semantic.casefold():
             _validate_fasta(
@@ -1159,7 +1265,7 @@ def _content_checks(
                 snapshot_budget=snapshot_budget,
             )
             checked.append({"input": item["input"], "check": "fasta", "ready": True})
-    if reads[1] or reads[2]:
+    if (reads[1] or reads[2]) and not skip_fastq_pair:
         if len(reads[1]) != len(reads[2]) or reads[1] != reads[2]:
             raise IntegrationAPIError(
                 "FASTQ_PAIR_MISMATCH",
@@ -1178,6 +1284,7 @@ def _prepare_contract_inputs(
     workflow_name: str,
     input_keys: dict[str, str] | None = None,
     snapshot_budget: ResourceSnapshotBudget | None = None,
+    client_id: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
     if not isinstance(raw_inputs, dict):
         raise IntegrationAPIError("INPUTS_INVALID", "inputs 必须是 JSON object。", category="input")
@@ -1190,51 +1297,77 @@ def _prepare_contract_inputs(
             category="input",
             details={"inputs": unknown},
         )
-    manifests: dict[str, list[dict[str, Any]]] = {"rawdata": [], "database": []}
+    manifests: dict[str, list[dict[str, Any]]] = {
+        "rawdata": [],
+        "database": [],
+        "objects": [],
+    }
     snapshot_budget = snapshot_budget or ResourceSnapshotBudget()
     observed: list[dict[str, Any]] = []
+    object_checks: list[dict[str, Any]] = []
+    object_head_budget = ObjectHeadBudget()
     values: dict[str, Any] = {}
-    for name, port in by_name.items():
-        if name in raw_inputs:
-            raw_value = raw_inputs[name]
-        elif "default" in port:
-            raw_value = port["default"]
-        elif not port.get("required", True) or str(port.get("wdl_type", "")).endswith("?"):
-            continue
-        else:
-            raise IntegrationAPIError(
-                "INPUT_REQUIRED",
-                f"缺少必填输入 {name}。",
-                category="input",
-                details={"input": name},
+    try:
+        for name, port in by_name.items():
+            if name in raw_inputs:
+                raw_value = raw_inputs[name]
+            elif "default" in port:
+                raw_value = port["default"]
+            elif not port.get("required", True) or str(
+                port.get("wdl_type", "")
+            ).endswith("?"):
+                continue
+            else:
+                raise IntegrationAPIError(
+                    "INPUT_REQUIRED",
+                    f"缺少必填输入 {name}。",
+                    category="input",
+                    details={"input": name},
+                )
+            value = _coerce_input(
+                raw_value,
+                wdl_type=str(port.get("wdl_type") or ""),
+                input_name=name,
+                semantic_type=str(port.get("semantic_type") or "core.value.unknown"),
+                manifests=manifests,
+                observed=observed,
+                object_checks=object_checks,
+                snapshot_budget=snapshot_budget,
+                object_head_budget=object_head_budget,
+                client_id=client_id,
             )
-        value = _coerce_input(
-            raw_value,
-            wdl_type=str(port.get("wdl_type") or ""),
-            input_name=name,
-            semantic_type=str(port.get("semantic_type") or "core.value.unknown"),
-            manifests=manifests,
-            observed=observed,
+            try:
+                _validate_constraints(port, value)
+            except ValueError as error:
+                raise IntegrationAPIError(
+                    "INPUT_CONSTRAINT_INVALID",
+                    str(error),
+                    category="input",
+                ) from error
+            key = input_keys[name] if input_keys else name
+            values[f"{workflow_name}.{key}"] = value
+    finally:
+        with snapshot_budget.suspend_deadline():
+            object_head_budget.close()
+    content_checks = [
+        *object_checks,
+        *_content_checks(
+            observed,
             snapshot_budget=snapshot_budget,
-        )
-        try:
-            _validate_constraints(port, value)
-        except ValueError as error:
-            raise IntegrationAPIError(
-                "INPUT_CONSTRAINT_INVALID",
-                str(error),
-                category="input",
-            ) from error
-        key = input_keys[name] if input_keys else name
-        values[f"{workflow_name}.{key}"] = value
-    content_checks = _content_checks(
-        observed,
-        snapshot_budget=snapshot_budget,
-    )
+            skip_fastq_pair=any(
+                item.get("semantic_type") in {"bio.fastq.gz.r1", "bio.fastq.gz.r2"}
+                for item in manifests["objects"]
+            ),
+        ),
+    ]
     resource_manifests = {
         "input_resource_manifest": (
-            {"schema_version": 1, "files": manifests["rawdata"]}
-            if manifests["rawdata"]
+            {
+                "schema_version": 2 if manifests["objects"] else 1,
+                "files": manifests["rawdata"],
+                "objects": manifests["objects"],
+            }
+            if manifests["rawdata"] or manifests["objects"]
             else None
         ),
         "database_resource_manifest": (
@@ -1243,6 +1376,17 @@ def _prepare_contract_inputs(
             else None
         ),
     }
+    try:
+        object_manifest_items(resource_manifests["input_resource_manifest"])
+    except ObjectInputError as error:
+        raise IntegrationAPIError(
+            error.code,
+            str(error),
+            category=error.category,
+            retryable=error.retryable,
+            details=error.details,
+            http_status=error.http_status,
+        ) from error
     return values, resource_manifests, content_checks
 
 
@@ -1254,7 +1398,7 @@ def _declared_resources(
     resources = version.interface_contract.get("resources") or []
     if not resources:
         return {"database_resource_manifest": None, "checks": []}
-    manifests = {"rawdata": [], "database": []}
+    manifests = {"rawdata": [], "database": [], "objects": []}
     snapshot_budget = snapshot_budget or ResourceSnapshotBudget()
     observed: list[dict[str, Any]] = []
     for index, resource in enumerate(resources, 1):
@@ -1492,7 +1636,11 @@ def _workflow_output_contract(
     ]
 
 
-def _preflight_workflow(body: dict[str, Any]) -> dict[str, Any]:
+def _preflight_workflow(
+    body: dict[str, Any],
+    *,
+    client_id: str | None,
+) -> dict[str, Any]:
     version, product_version = _analysis_source(body)
     workflow_name = str(version.workflow_graph.get("id") or version.workflow.slug)
     interface_contract = (
@@ -1511,6 +1659,7 @@ def _preflight_workflow(body: dict[str, Any]) -> dict[str, Any]:
         body.get("inputs") or {},
         workflow_name=workflow_name,
         snapshot_budget=snapshot_budget,
+        client_id=client_id,
     )
     declared = _declared_resources(version, snapshot_budget=snapshot_budget)
     catalog = _catalog_resources(
@@ -1577,7 +1726,11 @@ def _tool_output_contract(item: ToolVersion) -> list[dict[str, Any]]:
     ]
 
 
-def _preflight_tool(body: dict[str, Any]) -> dict[str, Any]:
+def _preflight_tool(
+    body: dict[str, Any],
+    *,
+    client_id: str | None,
+) -> dict[str, Any]:
     tool = body.get("tool")
     if not isinstance(tool, dict):
         raise IntegrationAPIError("TOOL_VERSION_REQUIRED", "必须指定固定 ToolVersion。")
@@ -1615,6 +1768,7 @@ def _preflight_tool(body: dict[str, Any]) -> dict[str, Any]:
         workflow_name="tool_test",
         input_keys=input_nodes,
         snapshot_budget=snapshot_budget,
+        client_id=client_id,
     )
     return {
         "tool_version": item,
@@ -1654,6 +1808,9 @@ def _public_text(value: Any) -> str:
             "ANALYSIS_DATABASE_EXECUTION_ROOT",
             "ANALYSIS_RUN_ROOT",
             "ANALYSIS_RUN_EXECUTION_ROOT",
+            "ANALYSIS_INPUT_STAGING_ROOT",
+            "ANALYSIS_INPUT_STAGING_EXECUTION_ROOT",
+            "ANALYSIS_OBJECT_STORAGE_PROFILE_DIR",
         )
     }
     for root in sorted((item for item in roots if item), key=len, reverse=True):
@@ -1866,7 +2023,11 @@ def integration_workflow_version_detail(request, version_id: int):
 def integration_preflight(request):
     try:
         metadata = _validate_metadata(request.data.get("metadata"))
-        result = _preflight_workflow(dict(request.data))
+        account = _service_account(request)
+        result = _preflight_workflow(
+            dict(request.data),
+            client_id=account.client_id if account is not None else None,
+        )
     except IntegrationAPIError as error:
         return _error_response(request, error)
     return Response(
@@ -1962,7 +2123,7 @@ def integration_analysis_runs(request):
         )
         if existing is not None:
             return _idempotent_response(request, existing, digest)
-        preflight = _preflight_workflow(body)
+        preflight = _preflight_workflow(body, client_id=account.client_id)
         version = preflight["workflow_version"]
         product_version = preflight["analysis_product_version"]
         source_bundle, source_digest = _compile_published_workflow(version)
@@ -2180,6 +2341,15 @@ def integration_analysis_run_retry(request, run_id):
                 original,
                 snapshot_budget=ResourceSnapshotBudget(),
             )
+        except ObjectInputError as error:
+            raise IntegrationAPIError(
+                error.code,
+                str(error),
+                category=error.category,
+                retryable=error.retryable,
+                details={"retry_of": str(original.id), **error.details},
+                http_status=status.HTTP_409_CONFLICT,
+            ) from error
         except ResourceSnapshotBudgetError as error:
             raise IntegrationAPIError(
                 "MANAGED_RESOURCE_LIMIT_EXCEEDED",
@@ -2452,7 +2622,11 @@ def integration_analysis_runs_batch_status(request):
 @permission_classes([IntegrationScopePermission])
 def integration_tool_test_preflight(request):
     try:
-        result = _preflight_tool(dict(request.data))
+        account = _service_account(request)
+        result = _preflight_tool(
+            dict(request.data),
+            client_id=account.client_id if account is not None else None,
+        )
     except IntegrationAPIError as error:
         return _error_response(request, error)
     item = result["tool_version"]
@@ -2491,7 +2665,7 @@ def integration_tool_test_runs(request):
         )
         if existing is not None:
             return _idempotent_response(request, existing, digest)
-        preflight = _preflight_tool(body)
+        preflight = _preflight_tool(body, client_id=account.client_id)
         item = preflight["tool_version"]
         sample_id = f"tool-test-{item.tool_id}"[:128]
         with transaction.atomic():

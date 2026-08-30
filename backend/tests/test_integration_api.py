@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
 import os
 import time
 import uuid
 from datetime import timedelta
-from io import StringIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from botocore.exceptions import ClientError
 from django.core.exceptions import ValidationError
 from django.core.management import call_command
 from django.core.management.base import CommandError
@@ -43,6 +45,7 @@ from workflows.models import (
     AnalysisProduct,
     AnalysisProductVersion,
     AnalysisRun,
+    InputStagingCoordinator,
     ServiceAccount,
     ServiceToken,
     SoftwareAsset,
@@ -50,6 +53,7 @@ from workflows.models import (
     WorkflowDocument,
     WorkflowVersion,
 )
+from workflows.object_inputs import ObjectInputError, stage_run_object_inputs
 
 
 pytestmark = pytest.mark.usefixtures("auth_disabled")
@@ -84,14 +88,123 @@ def _write_fastq(path: Path, mate: int, *, read_id="read-001"):
         handle.write(f"@{read_id}/{mate}\nACGT\n+\n!!!!\n")
 
 
+def _fastq_bytes(mate: int, *, read_id="read-001") -> bytes:
+    buffer = BytesIO()
+    with gzip.GzipFile(fileobj=buffer, mode="wb", mtime=0) as handle:
+        handle.write(f"@{read_id}/{mate}\nACGT\n+\n!!!!\n".encode())
+    return buffer.getvalue()
+
+
+def _write_object_profile(
+    profile_dir: Path,
+    *,
+    name="lab-minio",
+    client_grants=None,
+) -> tuple[str, str]:
+    access_key = "test-access-key-not-for-storage"
+    secret_key = "test-secret-key-not-for-storage"
+    (profile_dir / f"{name}.json").write_text(
+        json.dumps(
+            {
+                "endpoint_url": "https://objects.example.test",
+                "region": "us-east-1",
+                "allowed_buckets": ["validated-inputs"],
+                "client_grants": client_grants
+                or {"okb": {"validated-inputs": ["incoming/"]}},
+                "access_key_id": access_key,
+                "secret_access_key": secret_key,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return access_key, secret_key
+
+
+def _object_reference(content: bytes, *, key: str, version_id="version-1"):
+    return {
+        "type": "s3_object",
+        "profile": "lab-minio",
+        "bucket": "validated-inputs",
+        "key": key,
+        "version_id": version_id,
+        "etag": "etag-" + hashlib.sha256(content).hexdigest()[:32],
+        "size": len(content),
+        "sha256": "sha256:" + hashlib.sha256(content).hexdigest(),
+    }
+
+
+class _FakeObjectBody(BytesIO):
+    pass
+
+
+class _FakeS3Client:
+    def __init__(self, objects: dict[str, bytes], *, get_error=None):
+        self.objects = objects
+        self.get_error = get_error
+        self.head_calls = []
+        self.get_calls = []
+        self.bodies = []
+
+    def _response(self, key: str):
+        content = self.objects[key]
+        return {
+            "ContentLength": len(content),
+            "ETag": f'"etag-{hashlib.sha256(content).hexdigest()[:32]}"',
+            "VersionId": "version-1",
+        }
+
+    def head_object(self, **kwargs):
+        self.head_calls.append(kwargs)
+        return self._response(kwargs["Key"])
+
+    def get_object(self, **kwargs):
+        self.get_calls.append(kwargs)
+        if self.get_error is not None:
+            raise self.get_error
+        body = _FakeObjectBody(self.objects[kwargs["Key"]])
+        self.bodies.append(body)
+        return {
+            **self._response(kwargs["Key"]),
+            "Body": body,
+        }
+
+    def close(self):
+        return None
+
+
+def _mock_object_head(client: _FakeS3Client):
+    def inspect(reference, **_kwargs):
+        parameters = {
+            "Bucket": reference["bucket"],
+            "Key": reference["key"],
+        }
+        if reference["version_id"]:
+            parameters["VersionId"] = reference["version_id"]
+        if reference["etag"]:
+            parameters["IfMatch"] = f'"{reference["etag"]}"'
+        response = client.head_object(**parameters)
+        return {
+            "ContentLength": response.get("ContentLength"),
+            "DeleteMarker": response.get("DeleteMarker") is True,
+            "ETag": response.get("ETag"),
+            "VersionId": response.get("VersionId"),
+        }
+
+    return patch("workflows.object_inputs.ObjectHeadBudget.inspect", side_effect=inspect)
+
+
 @pytest.fixture
 def integration_workspace(settings, tmp_path: Path):
     rawdata = tmp_path / "rawdata"
     database = tmp_path / "database"
     runs = tmp_path / "runs"
+    staging = tmp_path / "input-staging"
+    profiles = tmp_path / "object-storage-profiles"
     rawdata.mkdir()
     database.mkdir()
     runs.mkdir()
+    staging.mkdir()
+    profiles.mkdir()
     _write_fastq(rawdata / "S001_R1.fastq.gz", 1)
     _write_fastq(rawdata / "S001_R2.fastq.gz", 2)
     settings.ANALYSIS_RAWDATA_ROOT = rawdata
@@ -100,7 +213,15 @@ def integration_workspace(settings, tmp_path: Path):
     settings.ANALYSIS_DATABASE_EXECUTION_ROOT = database
     settings.ANALYSIS_RUN_ROOT = runs
     settings.ANALYSIS_RUN_EXECUTION_ROOT = runs
+    settings.ANALYSIS_INPUT_STAGING_ROOT = staging
+    settings.ANALYSIS_INPUT_STAGING_EXECUTION_ROOT = staging
+    settings.ANALYSIS_OBJECT_STORAGE_PROFILE_DIR = profiles
+    settings.ANALYSIS_OBJECT_STAGE_MIN_FREE_BYTES = 0
+    settings.ANALYSIS_OBJECT_STAGE_SLOT_WAIT_SECONDS = 0
+    settings.ANALYSIS_OBJECT_STAGE_TIMEOUT_SECONDS = 5
+    settings.ANALYSIS_OBJECT_STAGE_LEASE_SECONDS = 60
     settings.ANALYSIS_MIN_AVAILABLE_MEMORY_GB = 0
+    InputStagingCoordinator.objects.get_or_create(pk=1)
     return rawdata, database, runs
 
 
@@ -607,8 +728,8 @@ def test_analysis_product_deactivation_during_submission_blocks_run(
     }
     real_preflight = integration_api_module._preflight_workflow
 
-    def deactivate_after_preflight(request_body):
-        result = real_preflight(request_body)
+    def deactivate_after_preflight(request_body, *, client_id):
+        result = real_preflight(request_body, client_id=client_id)
         AnalysisProduct.objects.filter(pk=product_version.product_id).update(
             is_active=False
         )
@@ -826,6 +947,591 @@ def test_integration_not_found_and_validation_errors_use_stable_envelope(setting
     )
     assert invalid_batch.status_code == 400
     assert invalid_batch.data["error"]["code"] == "BATCH_STATUS_RUN_ID_INVALID"
+
+
+@pytest.mark.django_db
+def test_s3_inputs_share_auditable_manifest_and_stage_without_credentials(
+    integration_workspace,
+    settings,
+):
+    _, _, _, client = _token_client()
+    version = _workflow_version()
+    read1 = _fastq_bytes(1)
+    read2 = _fastq_bytes(2)
+    objects = {
+        "incoming/S001.verylonglibraryname_R1.fastq.gz": read1,
+        "incoming/S001.verylonglibraryname_R2.fastq.gz": read2,
+    }
+    access_key, secret_key = _write_object_profile(
+        Path(settings.ANALYSIS_OBJECT_STORAGE_PROFILE_DIR)
+    )
+    body = _submission(version, external_run_id="portable-input-run")
+    body["inputs"] = {
+        "read1": _object_reference(
+            read1,
+            key="incoming/S001.verylonglibraryname_R1.fastq.gz",
+        ),
+        "read2": _object_reference(
+            read2,
+            key="incoming/S001.verylonglibraryname_R2.fastq.gz",
+        ),
+    }
+    fake_client = _FakeS3Client(objects)
+
+    with _mock_object_head(fake_client):
+        preflight = client.post(
+            "/api/v1/integration/analysis-runs/preflight",
+            body,
+            format="json",
+        )
+        created = client.post(
+            "/api/v1/integration/analysis-runs",
+            body,
+            format="json",
+            HTTP_IDEMPOTENCY_KEY="portable-input-run",
+        )
+
+    assert preflight.status_code == 200, preflight.data
+    assert preflight.data["ready"] is True
+    assert [
+        item["check"] for item in preflight.data["checks"]
+    ].count("object_input_head") == 2
+    manifest = preflight.data["resource_manifest"]["input_resource_manifest"]
+    assert manifest["schema_version"] == 2
+    assert manifest["files"] == []
+    assert len(manifest["objects"]) == 2
+    assert all(item["reference_type"] == "s3_object" for item in manifest["objects"])
+    assert created.status_code == 201, created.data
+
+    run = AnalysisRun.objects.get(pk=created.data["id"])
+    stored = json.dumps(
+        {"request": run.request_payload, "inputs": run.input_values},
+        ensure_ascii=False,
+    )
+    public = json.dumps(
+        {"preflight": preflight.data, "created": created.data},
+        ensure_ascii=False,
+        default=str,
+    )
+    for secret in (access_key, secret_key):
+        assert secret not in stored
+        assert secret not in public
+    assert all(path.endswith(".fastq.gz") for path in run.input_values.values())
+
+    run.status = AnalysisRun.Status.PREPARING
+    run.lease_token = uuid.uuid4()
+    run.save(update_fields=["status", "lease_token", "updated_at"])
+    with (
+        patch("workflows.object_inputs._validate_endpoint"),
+        patch("workflows.object_inputs._s3_client", return_value=fake_client),
+    ):
+        staged_count = stage_run_object_inputs(run)
+
+    assert staged_count == 2
+    for item in run.request_payload["input_resource_manifest"]["objects"]:
+        staged = Path(settings.ANALYSIS_INPUT_STAGING_ROOT) / item["staging_relative_path"]
+        assert staged.read_bytes() == objects[item["key"]]
+        assert staged.stat().st_mode & 0o222 == 0
+    assert len(fake_client.get_calls) == 2
+    assert all(call["VersionId"] == "version-1" for call in fake_client.get_calls)
+    assert all(call["IfMatch"].startswith('"etag-') for call in fake_client.get_calls)
+    assert all(call["IfMatch"].endswith('"') for call in fake_client.get_calls)
+
+    first = run.request_payload["input_resource_manifest"]["objects"][0]
+    staged = Path(settings.ANALYSIS_INPUT_STAGING_ROOT) / first["staging_relative_path"]
+    staged.chmod(0o644)
+    staged.write_bytes(b"x" * first["size"])
+    staged.chmod(0o444)
+    with pytest.raises(ObjectInputError) as caught:
+        stage_run_object_inputs(run)
+    assert caught.value.code == "OBJECT_INPUT_STAGING_CHANGED"
+
+
+@pytest.mark.django_db
+def test_four_object_preflights_use_independent_real_worker_budget(
+    integration_workspace,
+    settings,
+    monkeypatch,
+    tmp_path,
+):
+    from workflows import object_inputs as object_inputs_module
+
+    _, _, _, client = _token_client()
+    profile_dir = Path(settings.ANALYSIS_OBJECT_STORAGE_PROFILE_DIR)
+    _write_object_profile(profile_dir)
+    site_directory = tmp_path / "object-head-site"
+    site_directory.mkdir()
+    startup_marker = tmp_path / "object-head-worker-starts"
+    (site_directory / "sitecustomize.py").write_text(
+        (
+            f"""
+import socket
+import time
+from botocore.client import BaseClient
+
+with open({str(startup_marker)!r}, "a", encoding="utf-8") as marker:
+    marker.write("started\\n")
+"""
+            + """
+time.sleep(0.55)
+original_getaddrinfo = socket.getaddrinfo
+original_make_api_call = BaseClient._make_api_call
+
+def fake_getaddrinfo(host, port, *args, **kwargs):
+    if host == "objects.example.test":
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("8.8.8.8", port))]
+    return original_getaddrinfo(host, port, *args, **kwargs)
+
+def fake_make_api_call(self, operation_name, api_params):
+    if operation_name == "HeadObject":
+        return {
+            "ContentLength": 1,
+            "ETag": api_params.get("IfMatch"),
+            "VersionId": api_params.get("VersionId"),
+        }
+    return original_make_api_call(self, operation_name, api_params)
+
+socket.getaddrinfo = fake_getaddrinfo
+BaseClient._make_api_call = fake_make_api_call
+"""
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    original_environment = object_inputs_module._head_worker_environment
+
+    def worker_environment(timeout):
+        environment = original_environment(timeout)
+        environment["PYTHONPATH"] = str(site_directory)
+        return environment
+
+    monkeypatch.setattr(
+        object_inputs_module,
+        "_head_worker_environment",
+        worker_environment,
+    )
+    tool_inputs = [
+        {
+            "name": f"file{index}",
+            "label": f"File {index}",
+            "wdl_type": "File",
+            "semantic_type": "core.file.unknown",
+            "required": True,
+        }
+        for index in range(1, 5)
+    ]
+    spec = {
+        "schema_version": "1.0.0",
+        "id": "four_object_task",
+        "name": "four_object_task",
+        "display_name": "Four object task",
+        "tool_version": "1.0.0",
+        "description": "Object HEAD budget fixture",
+        "container": {"engine": "docker", "image": "ubuntu:24.04"},
+        "inputs": tool_inputs,
+        "outputs": [
+            {
+                "name": "result",
+                "wdl_type": "File",
+                "semantic_type": "core.file.any",
+                "capture": {"mode": "path", "value": "result.txt"},
+            }
+        ],
+        "command": {
+            "shell": "bash",
+            "strict_mode": True,
+            "template": 'cp "~{file1}" result.txt',
+        },
+        "runtime": {"cpu": 1, "memory_gb": 1, "disk_gb": 1},
+    }
+    tool = ToolVersion.objects.create(
+        tool_id=spec["id"],
+        version=spec["tool_version"],
+        name=spec["display_name"],
+        digest=canonical_digest(spec),
+        tool_spec=spec,
+    )
+    body = {
+        "external_ref": {
+            "client_id": "okb",
+            "external_run_id": "four-object-preflight",
+        },
+        "tool": {
+            "tool_id": tool.tool_id,
+            "version": tool.version,
+            "expected_digest": tool.digest,
+        },
+        "inputs": {
+            item["name"]: _object_reference(
+                b"x",
+                key=f'incoming/{item["name"]}.txt',
+            )
+            for item in tool_inputs
+        },
+    }
+
+    assert settings.ANALYSIS_RESOURCE_MANIFEST_TIMEOUT_SECONDS == 2
+    assert settings.ANALYSIS_OBJECT_HEAD_REQUEST_TIMEOUT_SECONDS == 20
+    started = time.monotonic()
+    response = client.post(
+        "/api/v1/integration/tool-test-runs/preflight",
+        body,
+        format="json",
+    )
+
+    assert response.status_code == 200, response.data
+    assert response.data["ready"] is True
+    assert [item["check"] for item in response.data["checks"]].count(
+        "object_input_head"
+    ) == 4
+    assert startup_marker.read_text(encoding="utf-8") == "started\n"
+    assert time.monotonic() - started < 20
+
+
+@pytest.mark.django_db
+def test_s3_input_changes_and_conditional_get_fail_closed(
+    integration_workspace,
+    settings,
+):
+    _, _, _, client = _token_client()
+    version = _workflow_version()
+    read1 = _fastq_bytes(1)
+    _write_object_profile(Path(settings.ANALYSIS_OBJECT_STORAGE_PROFILE_DIR))
+    body = _submission(version, external_run_id="changed-object-run")
+    body["inputs"]["read1"] = _object_reference(
+        read1,
+        key="incoming/S001_R1.fastq.gz",
+    )
+    changed_client = _FakeS3Client(
+        {"incoming/S001_R1.fastq.gz": b"x" * len(read1)}
+    )
+    with _mock_object_head(changed_client):
+        changed = client.post(
+            "/api/v1/integration/analysis-runs/preflight",
+            body,
+            format="json",
+        )
+    assert changed.status_code == 409
+    assert changed.data["error"]["code"] == "OBJECT_INPUT_CHANGED"
+
+    forbidden = json.loads(json.dumps(body))
+    forbidden["inputs"]["read1"]["bucket"] = "unapproved-inputs"
+    bucket_response = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        forbidden,
+        format="json",
+    )
+    assert bucket_response.status_code == 403
+    assert bucket_response.data["error"]["code"] == "OBJECT_INPUT_BUCKET_FORBIDDEN"
+
+    credential_injection = json.loads(json.dumps(body))
+    credential_injection["inputs"]["read1"]["secret_access_key"] = "must-not-echo"
+    rejected_credential = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        credential_injection,
+        format="json",
+    )
+    assert rejected_credential.status_code == 400
+    assert rejected_credential.data["error"]["code"] == "OBJECT_INPUT_REFERENCE_INVALID"
+    assert "must-not-echo" not in json.dumps(rejected_credential.data)
+
+    good_client = _FakeS3Client({"incoming/S001_R1.fastq.gz": read1})
+    with _mock_object_head(good_client):
+        created = client.post(
+            "/api/v1/integration/analysis-runs",
+            body,
+            format="json",
+            HTTP_IDEMPOTENCY_KEY="changed-object-run",
+        )
+    assert created.status_code == 201, created.data
+    run = AnalysisRun.objects.get(pk=created.data["id"])
+    managed_evidence = run.request_payload["input_resource_manifest"]["files"][0][
+        "semantic_evidence"
+    ]
+    assert managed_evidence["first_read_id_sha256"].startswith("sha256:")
+    assert "read-001" not in json.dumps(run.request_payload)
+    run.status = AnalysisRun.Status.PREPARING
+    run.lease_token = uuid.uuid4()
+    run.save(update_fields=["status", "lease_token", "updated_at"])
+    precondition_failed = ClientError(
+        {
+            "Error": {"Code": "PreconditionFailed", "Message": "changed"},
+            "ResponseMetadata": {"HTTPStatusCode": 412},
+        },
+        "GetObject",
+    )
+    failed_client = _FakeS3Client(
+        {"incoming/S001_R1.fastq.gz": read1},
+        get_error=precondition_failed,
+    )
+    with (
+        patch("workflows.object_inputs._validate_endpoint"),
+        patch("workflows.object_inputs._s3_client", return_value=failed_client),
+        pytest.raises(ObjectInputError) as caught,
+    ):
+        stage_run_object_inputs(run)
+    assert caught.value.code == "OBJECT_INPUT_CHANGED"
+
+    identity_client = _FakeS3Client({"incoming/S001_R1.fastq.gz": read1})
+
+    def changed_identity_get(**kwargs):
+        identity_client.get_calls.append(kwargs)
+        body = _FakeObjectBody(read1)
+        identity_client.bodies.append(body)
+        return {
+            **identity_client._response(kwargs["Key"]),
+            "ETag": '"different-etag"',
+            "Body": body,
+        }
+
+    identity_client.get_object = changed_identity_get
+    with (
+        patch("workflows.object_inputs._validate_endpoint"),
+        patch("workflows.object_inputs._s3_client", return_value=identity_client),
+        pytest.raises(ObjectInputError) as identity_error,
+    ):
+        stage_run_object_inputs(run)
+    assert identity_error.value.code == "OBJECT_INPUT_CHANGED"
+    assert identity_client.bodies[0].closed
+
+    manifest_item = run.request_payload["input_resource_manifest"]["objects"][0]
+    cached = Path(settings.ANALYSIS_INPUT_STAGING_ROOT) / manifest_item[
+        "staging_relative_path"
+    ]
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    cached.write_bytes(read1)
+    cached.chmod(0o444)
+    corrupt_client = _FakeS3Client({"incoming/S001_R1.fastq.gz": read1})
+
+    def corrupt_get(**kwargs):
+        corrupt_client.get_calls.append(kwargs)
+        return {
+            **corrupt_client._response(kwargs["Key"]),
+            "Body": _FakeObjectBody(b"x" * len(read1)),
+        }
+
+    corrupt_client.get_object = corrupt_get
+    with (
+        patch("workflows.object_inputs._validate_endpoint"),
+        patch("workflows.object_inputs._s3_client", return_value=corrupt_client),
+        patch(
+            "workflows.object_inputs._remove_lease_directory",
+            side_effect=ObjectInputError(
+                "OBJECT_INPUT_STAGE_IO_ERROR",
+                "cleanup failed",
+                retryable=True,
+            ),
+        ),
+        pytest.raises(ObjectInputError) as digest_error,
+    ):
+        stage_run_object_inputs(run)
+    assert digest_error.value.code == "OBJECT_INPUT_DIGEST_MISMATCH"
+    assert len(corrupt_client.get_calls) == 1
+
+
+@pytest.mark.django_db
+def test_s3_profile_enforces_service_account_and_key_prefix(
+    integration_workspace,
+    settings,
+):
+    version = _workflow_version()
+    content = _fastq_bytes(1)
+    _write_object_profile(Path(settings.ANALYSIS_OBJECT_STORAGE_PROFILE_DIR))
+
+    _, _, _, other_client = _token_client(client_id="other")
+    other_body = _submission(version, external_run_id="other-client-object")
+    other_body["external_ref"]["client_id"] = "other"
+    other_body["inputs"]["read1"] = _object_reference(
+        content,
+        key="incoming/S001_R1.fastq.gz",
+    )
+    forbidden_profile = other_client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        other_body,
+        format="json",
+    )
+    assert forbidden_profile.status_code == 403
+    assert forbidden_profile.data["error"]["code"] == "OBJECT_INPUT_PROFILE_FORBIDDEN"
+
+    _, _, _, client = _token_client()
+    key_body = _submission(version, external_run_id="outside-prefix-object")
+    key_body["inputs"]["read1"] = _object_reference(
+        content,
+        key="private/S001_R1.fastq.gz",
+    )
+    forbidden_key = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        key_body,
+        format="json",
+    )
+    assert forbidden_key.status_code == 403
+    assert forbidden_key.data["error"]["code"] == "OBJECT_INPUT_KEY_FORBIDDEN"
+
+    _write_object_profile(
+        Path(settings.ANALYSIS_OBJECT_STORAGE_PROFILE_DIR),
+        client_grants={
+            "okb": {"validated-inputs": ["tenant-a/"]},
+            "other": {"validated-inputs": ["tenant-b/"]},
+        },
+    )
+    cross_tenant = _submission(version, external_run_id="cross-tenant-prefix")
+    cross_tenant["inputs"]["read1"] = _object_reference(
+        content,
+        key="tenant-b/S001_R1.fastq.gz",
+    )
+    cross_tenant_response = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        cross_tenant,
+        format="json",
+    )
+    assert cross_tenant_response.status_code == 403
+    assert cross_tenant_response.data["error"]["code"] == "OBJECT_INPUT_KEY_FORBIDDEN"
+
+
+@pytest.mark.django_db
+def test_s3_reference_with_surrogate_key_returns_stable_validation_error(
+    integration_workspace,
+    settings,
+):
+    _, _, _, client = _token_client()
+    version = _workflow_version()
+    content = _fastq_bytes(1)
+    _write_object_profile(Path(settings.ANALYSIS_OBJECT_STORAGE_PROFILE_DIR))
+    body = _submission(version, external_run_id="surrogate-object-key")
+    body["inputs"]["read1"] = _object_reference(
+        content,
+        key="incoming/" + chr(0xD800) + ".fastq.gz",
+    )
+
+    response = client.generic(
+        "POST",
+        "/api/v1/integration/analysis-runs/preflight",
+        json.dumps(body).encode("ascii"),
+        content_type="application/json",
+    )
+
+    assert response.status_code == 400
+    assert response.data["error"]["code"] == "OBJECT_INPUT_REFERENCE_INVALID"
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("case", "expected_code"),
+    [
+        ("invalid-gzip", "FASTQ_GZIP_INVALID"),
+        ("mismatched-pair", "FASTQ_PAIR_MISMATCH"),
+        ("reused-identity", "FASTQ_MATE_INVALID"),
+    ],
+)
+def test_s3_stage_validates_remote_fastq_content(
+    integration_workspace,
+    settings,
+    case,
+    expected_code,
+):
+    _, _, _, client = _token_client()
+    version = _workflow_version()
+    read1 = b"not-a-gzip-stream" if case == "invalid-gzip" else _fastq_bytes(1)
+    read2 = (
+        read1
+        if case == "reused-identity"
+        else _fastq_bytes(
+            2,
+            read_id="different-read" if case == "mismatched-pair" else "read-001",
+        )
+    )
+    read2_key = (
+        "incoming/S001_R1.fastq.gz"
+        if case == "reused-identity"
+        else "incoming/S001_R2.fastq.gz"
+    )
+    objects = {
+        "incoming/S001_R1.fastq.gz": read1,
+        read2_key: read2,
+    }
+    _write_object_profile(Path(settings.ANALYSIS_OBJECT_STORAGE_PROFILE_DIR))
+    body = _submission(version, external_run_id=f"remote-fastq-{case}")
+    body["inputs"] = {
+        "read1": _object_reference(read1, key="incoming/S001_R1.fastq.gz"),
+        "read2": _object_reference(read2, key=read2_key),
+    }
+    fake_client = _FakeS3Client(objects)
+    with _mock_object_head(fake_client):
+        created = client.post(
+            "/api/v1/integration/analysis-runs",
+            body,
+            format="json",
+            HTTP_IDEMPOTENCY_KEY=f"remote-fastq-{case}",
+        )
+    assert created.status_code == 201, created.data
+    run = AnalysisRun.objects.get(pk=created.data["id"])
+    run.status = AnalysisRun.Status.PREPARING
+    run.lease_token = uuid.uuid4()
+    run.save(update_fields=["status", "lease_token", "updated_at"])
+
+    with (
+        patch("workflows.object_inputs._validate_endpoint"),
+        patch("workflows.object_inputs._s3_client", return_value=fake_client),
+        pytest.raises(ObjectInputError) as caught,
+    ):
+        stage_run_object_inputs(run)
+
+    assert caught.value.code == expected_code
+    if case == "reused-identity":
+        assert len(fake_client.get_calls) == 1
+
+
+@pytest.mark.django_db
+def test_managed_input_keeps_legacy_custom_type_compatible(integration_workspace):
+    _, _, _, client = _token_client()
+    version = _workflow_version()
+    body = _submission(version, external_run_id="legacy-managed-type")
+    body["inputs"]["read1"]["type"] = "s3_object"
+
+    response = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        body,
+        format="json",
+    )
+
+    assert response.status_code == 200, response.data
+    assert response.data["ready"] is True
+
+    ambiguous = _submission(version, external_run_id="ambiguous-input-reference")
+    ambiguous["inputs"]["read1"].pop("relative_path")
+    ambiguous["inputs"]["read1"].update({"type": "s3_object", "profile": "lab-minio"})
+    rejected = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        ambiguous,
+        format="json",
+    )
+    assert rejected.status_code == 400
+    assert rejected.data["error"]["code"] == "INPUT_REFERENCE_AMBIGUOUS"
+
+    complete_ambiguous = _submission(
+        version,
+        external_run_id="complete-ambiguous-input-reference",
+    )
+    complete_ambiguous["inputs"]["read1"].update(
+        {"type": "s3_object", "profile": "lab-minio", "bucket": "inputs"}
+    )
+    rejected_complete = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        complete_ambiguous,
+        format="json",
+    )
+    assert rejected_complete.status_code == 400
+    assert rejected_complete.data["error"]["code"] == "INPUT_REFERENCE_AMBIGUOUS"
+
+    credential = _submission(version, external_run_id="managed-credential-field")
+    credential["inputs"]["read1"]["secret_access_key"] = "must-not-persist"
+    rejected_credential = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        credential,
+        format="json",
+    )
+    assert rejected_credential.status_code == 400
+    assert rejected_credential.data["error"]["code"] == "MANAGED_RESOURCE_INVALID"
+    assert "must-not-persist" not in json.dumps(rejected_credential.data)
 
 
 @pytest.mark.django_db
@@ -2039,6 +2745,30 @@ def test_openapi_contract_covers_every_integration_route():
     } <= set(paths)
     workflow_ref = payload["components"]["schemas"]["WorkflowVersionRef"]
     assert workflow_ref.get("additionalProperties", True) is not False
+    input_reference = payload["components"]["schemas"]["InputReference"]
+    assert {item["$ref"] for item in input_reference["oneOf"]} == {
+        "#/components/schemas/ManagedResource",
+        "#/components/schemas/S3ObjectReference",
+    }
+    s3_reference = payload["components"]["schemas"]["S3ObjectReference"]
+    assert s3_reference["additionalProperties"] is False
+    assert {"profile", "bucket", "key", "size", "sha256"} <= set(
+        s3_reference["required"]
+    )
+    input_value = payload["components"]["schemas"]["InputValue"]
+    assert input_value["anyOf"][0]["$ref"] == "#/components/schemas/InputReference"
+    assert input_value["anyOf"][1]["items"]["$ref"] == (
+        "#/components/schemas/InputValue"
+    )
+    for schema_name in (
+        "AnalysisSubmission",
+        "AnalysisPreflight",
+        "ToolTestPreflight",
+        "ToolTestSubmission",
+    ):
+        assert payload["components"]["schemas"][schema_name]["properties"]["inputs"][
+            "additionalProperties"
+        ]["$ref"] == "#/components/schemas/InputValue"
     assert "404" in paths["/analysis-runs/preflight"]["post"]["responses"]
     assert "404" in paths["/analysis-runs"]["post"]["responses"]
     assert "analysisRunTerminal" in payload["webhooks"]

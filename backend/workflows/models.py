@@ -1389,6 +1389,36 @@ class AnalysisRunEvent(models.Model):
         ordering = ["created_at", "id"]
 
 
+class InputStagingCoordinator(models.Model):
+    """Singleton row used to serialize cross-worker staging reservations."""
+
+    id = models.PositiveSmallIntegerField(primary_key=True, default=1, editable=False)
+    updated_at = models.DateTimeField(auto_now=True)
+
+
+class InputStagingLease(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    run = models.OneToOneField(
+        AnalysisRun,
+        on_delete=models.CASCADE,
+        related_name="input_staging_lease",
+    )
+    worker_lease_token = models.UUIDField(editable=False)
+    reserved_bytes = models.PositiveBigIntegerField()
+    expires_at = models.DateTimeField(db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(reserved_bytes__gt=0),
+                name="input_staging_lease_positive_bytes",
+            )
+        ]
+
+
 class WebhookEndpoint(models.Model):
     """Outbound terminal-event subscription owned by one Service Account."""
 

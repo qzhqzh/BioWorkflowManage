@@ -138,6 +138,7 @@ jobs:
         run: >-
           uv run pytest
           backend/tests/test_webhooks.py::test_postgresql_delivery_claim_and_lease_fencing
+          backend/tests/test_object_inputs.py::test_postgresql_input_staging_slot_is_serialized
 
   frontend:
     name: Frontend quality gates

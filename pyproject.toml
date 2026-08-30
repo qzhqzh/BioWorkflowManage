@@ -4,6 +4,7 @@ version = "1.0.0"
 description = "Contract-driven visual bioinformatics workflow compiler"
 requires-python = ">=3.11"
 dependencies = [
+  "boto3>=1.40,<2",
   "Django>=5.2,<5.3",
   "djangorestframework>=3.16,<3.17",
   "gunicorn>=23,<24",
