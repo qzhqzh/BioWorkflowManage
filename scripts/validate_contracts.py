@@ -234,7 +234,11 @@ def main() -> None:
     }
     for schema in schemas.values():
         Draft202012Validator.check_schema(schema)
-    for name in ("config.schema.json", "images-lock.schema.json"):
+    for name in (
+        "config.schema.json",
+        "images-lock.schema.json",
+        "workflow-package-manifest.schema.json",
+    ):
         Draft202012Validator.check_schema(load_json(ANALYSIS_NODE_PACKAGE / name))
 
     tool = load_json(FIXTURE / "tool-fastp.json")

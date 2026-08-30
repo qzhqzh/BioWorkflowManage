@@ -7,13 +7,16 @@ import argparse
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import platform
 import re
 import shutil
 import socket
+import stat as stat_module
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -43,17 +46,28 @@ IMAGE_ENV_KEYS = {
 }
 REQUIRED_CONFIG_KEYS = (
     "ANALYSIS_NODE_VERSION",
+    "ANALYSIS_NODE_PROJECT_NAME",
     "ANALYSIS_NODE_MODE",
     "ANALYSIS_NODE_RUNTIME",
     "ANALYSIS_NODE_BIND_ADDRESS",
     "ANALYSIS_NODE_API_PORT",
     "ANALYSIS_NODE_CONSOLE_PORT",
     "ANALYSIS_NODE_PUBLIC_BASE_URL",
+    "ANALYSIS_NODE_MIN_FREE_GB",
     "POSTGRES_DB",
     "POSTGRES_USER",
     "POSTGRES_PASSWORD",
     "DJANGO_SECRET_KEY",
     "WEBHOOK_SIGNING_KEY",
+    "DJANGO_ALLOWED_HOSTS",
+    "DJANGO_CSRF_TRUSTED_ORIGINS",
+    "CORS_ALLOWED_ORIGINS",
+    "DJANGO_AUTH_REQUIRED",
+    "DJANGO_SESSION_COOKIE_SECURE",
+    "DJANGO_CSRF_COOKIE_SECURE",
+    "DJANGO_TRUSTED_PROXY_COUNT",
+    "INTEGRATION_REQUIRE_ANALYSIS_PRODUCT",
+    "INTEGRATION_REQUIRE_SIGNED_WORKFLOW_PACKAGE",
     "ANALYSIS_NODE_DATA_ROOT",
     "ANALYSIS_NODE_BACKUP_ROOT",
     "ANALYSIS_NODE_POSTGRES_PATH",
@@ -77,6 +91,7 @@ REQUIRED_CONFIG_KEYS = (
     "MINIWDL_DOCKER_GID",
     "MINIWDL_CONTROL_SUBNET",
     "MINIWDL_EGRESS_SUBNET",
+    "ANALYSIS_MIN_AVAILABLE_MEMORY_GB",
 )
 PATH_KEYS = tuple(key for key in REQUIRED_CONFIG_KEYS if key.endswith(("_ROOT", "_PATH")))
 DIRECTORY_MODES = {
@@ -114,6 +129,52 @@ EXECUTION_ROOTS = {
     ),
 }
 SECRET_KEYS = ("POSTGRES_PASSWORD", "DJANGO_SECRET_KEY", "WEBHOOK_SIGNING_KEY")
+RESTORE_STOP_SERVICES = (
+    "gateway-headless",
+    "gateway-console",
+    "frontend",
+    "analysis-worker-isolated",
+    "analysis-worker-host",
+    "rawdata-indexer",
+    "webhook-dispatcher",
+    "artifact-exporter",
+    "artifact-cleaner",
+    "object-input-cache-gc",
+    "backend",
+    "miniwdl-docker",
+    "db",
+)
+WORKER_DIRECTORY_ACCESS = {
+    "ANALYSIS_WORKSPACE_HOST_PATH": stat_module.S_IRUSR | stat_module.S_IXUSR,
+    "ANALYSIS_RAWDATA_HOST_PATH": stat_module.S_IRUSR | stat_module.S_IXUSR,
+    "ANALYSIS_DATABASE_HOST_PATH": stat_module.S_IRUSR | stat_module.S_IXUSR,
+    "ANALYSIS_RUN_HOST_PATH": (
+        stat_module.S_IRUSR | stat_module.S_IWUSR | stat_module.S_IXUSR
+    ),
+    "ANALYSIS_INPUT_STAGING_HOST_PATH": (
+        stat_module.S_IRUSR | stat_module.S_IWUSR | stat_module.S_IXUSR
+    ),
+    "ANALYSIS_CACHE_HOST_PATH": (
+        stat_module.S_IRUSR | stat_module.S_IWUSR | stat_module.S_IXUSR
+    ),
+    "ANALYSIS_ARTIFACT_EXPORT_HOST_PATH": (
+        stat_module.S_IRUSR | stat_module.S_IWUSR | stat_module.S_IXUSR
+    ),
+    "ANALYSIS_OBJECT_STORAGE_SECRETS_HOST_PATH": (
+        stat_module.S_IRUSR | stat_module.S_IXUSR
+    ),
+    "ANALYSIS_ARTIFACT_EXPORT_SECRETS_HOST_PATH": (
+        stat_module.S_IRUSR | stat_module.S_IXUSR
+    ),
+}
+PRIVATE_DIRECTORY_KEYS = {
+    "ANALYSIS_NODE_BACKUP_ROOT",
+    "ANALYSIS_NODE_POSTGRES_PATH",
+    "ANALYSIS_NODE_DIND_PATH",
+    "ANALYSIS_NODE_DIND_CERT_PATH",
+    "ANALYSIS_OBJECT_STORAGE_SECRETS_HOST_PATH",
+    "ANALYSIS_ARTIFACT_EXPORT_SECRETS_HOST_PATH",
+}
 VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?$")
 DIGEST_REF_PATTERN = re.compile(r"@sha256:[0-9a-f]{64}$")
 IMAGE_ID_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -141,10 +202,16 @@ def _check(name: str, ok: bool, success: str, failure: str) -> Check:
 
 
 def parse_env_file(path: Path) -> dict[str, str]:
-    if not path.is_file():
-        raise AnalysisNodeError(f"配置文件不存在：{path}")
+    try:
+        content = _read_regular_bytes(
+            path,
+            label="配置文件",
+            maximum_bytes=1024 * 1024,
+        ).decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise AnalysisNodeError(f"配置文件不是有效 UTF-8：{path}") from error
     values: dict[str, str] = {}
-    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    for line_number, raw_line in enumerate(content.splitlines(), 1):
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
@@ -204,6 +271,15 @@ def validate_environment(values: dict[str, str]) -> list[Check]:
             "ANALYSIS_NODE_VERSION 必须是语义化版本。",
         )
     )
+    project_name = values["ANALYSIS_NODE_PROJECT_NAME"]
+    checks.append(
+        _check(
+            "project-name",
+            bool(re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,62}", project_name)),
+            f"Compose project name：{project_name}。",
+            "ANALYSIS_NODE_PROJECT_NAME 必须是 1-63 位小写字母、数字、下划线或连字符。",
+        )
+    )
     mode = values["ANALYSIS_NODE_MODE"]
     runtime = values["ANALYSIS_NODE_RUNTIME"]
     checks.append(_check("mode", mode in {"headless", "console"}, f"界面模式：{mode}", "界面模式只能是 headless 或 console。"))
@@ -214,6 +290,14 @@ def validate_environment(values: dict[str, str]) -> list[Check]:
             values.get("INTEGRATION_REQUIRE_ANALYSIS_PRODUCT") == "1",
             "只允许已发布 Analysis Product。",
             "交付部署必须设置 INTEGRATION_REQUIRE_ANALYSIS_PRODUCT=1。",
+        )
+    )
+    checks.append(
+        _check(
+            "signed-workflow-packages",
+            values.get("INTEGRATION_REQUIRE_SIGNED_WORKFLOW_PACKAGE") == "1",
+            "只允许已有可信签名证明的 Workflow 包。",
+            "交付部署必须设置 INTEGRATION_REQUIRE_SIGNED_WORKFLOW_PACKAGE=1。",
         )
     )
 
@@ -241,8 +325,73 @@ def validate_environment(values: dict[str, str]) -> list[Check]:
         checks.append(_check(key.casefold(), valid, f"{key} 有效。", f"{key} 必须在 1-65535。"))
 
     public_url = urlparse(values.get("ANALYSIS_NODE_PUBLIC_BASE_URL", ""))
-    url_valid = public_url.scheme == "https" and bool(public_url.netloc) and not public_url.username
+    url_valid = (
+        public_url.scheme == "https"
+        and bool(public_url.netloc)
+        and not public_url.username
+        and public_url.path in {"", "/"}
+        and not public_url.params
+        and not public_url.query
+        and not public_url.fragment
+    )
     checks.append(_check("public-url", url_valid, "公开 URL 使用 HTTPS。", "ANALYSIS_NODE_PUBLIC_BASE_URL 必须是无内嵌凭据的 HTTPS URL。"))
+    public_origin = f"{public_url.scheme}://{public_url.netloc}"
+    allowed_hosts = {
+        item.strip() for item in values["DJANGO_ALLOWED_HOSTS"].split(",") if item.strip()
+    }
+    csrf_origins = {
+        item.strip()
+        for item in values["DJANGO_CSRF_TRUSTED_ORIGINS"].split(",")
+        if item.strip()
+    }
+    cors_origins = {
+        item.strip()
+        for item in values["CORS_ALLOWED_ORIGINS"].split(",")
+        if item.strip()
+    }
+    checks.append(
+        _check(
+            "public-host-policy",
+            bool(public_url.hostname and public_url.hostname in allowed_hosts),
+            "公开域名已进入 Allowed Hosts。",
+            "ANALYSIS_NODE_PUBLIC_BASE_URL 的 hostname 必须加入 DJANGO_ALLOWED_HOSTS。",
+        )
+    )
+    checks.append(
+        _check(
+            "browser-origin-policy",
+            public_origin in csrf_origins and public_origin in cors_origins,
+            "公开 HTTPS origin 已进入 CSRF 与 CORS allowlist。",
+            "公开 HTTPS origin 必须同时加入 DJANGO_CSRF_TRUSTED_ORIGINS 与 CORS_ALLOWED_ORIGINS。",
+        )
+    )
+    cookie_security = (
+        values["DJANGO_AUTH_REQUIRED"] == "1"
+        and values["DJANGO_SESSION_COOKIE_SECURE"] == "1"
+        and values["DJANGO_CSRF_COOKIE_SECURE"] == "1"
+    )
+    checks.append(
+        _check(
+            "authentication-cookie-policy",
+            cookie_security,
+            "认证与 Secure Cookie 基线已开启。",
+            "必须开启 DJANGO_AUTH_REQUIRED、DJANGO_SESSION_COOKIE_SECURE 和 DJANGO_CSRF_COOKIE_SECURE。",
+        )
+    )
+    try:
+        trusted_proxy_count = _integer(values, "DJANGO_TRUSTED_PROXY_COUNT", -1)
+        proxy_valid = trusted_proxy_count >= 1
+    except AnalysisNodeError:
+        trusted_proxy_count = -1
+        proxy_valid = False
+    checks.append(
+        _check(
+            "trusted-proxy-count",
+            proxy_valid,
+            f"可信代理层数：{trusted_proxy_count}。",
+            "DJANGO_TRUSTED_PROXY_COUNT 必须至少包含产品 gateway 这一层可信代理。",
+        )
+    )
 
     resolved_paths: dict[str, Path] = {}
     for key in PATH_KEYS:
@@ -268,6 +417,8 @@ def validate_environment(values: dict[str, str]) -> list[Check]:
         )
         checks.append(_check("secret-separation", all(not _is_relative_to(item, data_root) for item in secret_roots), "密钥目录不在数据根目录内。", "密钥目录不能放入可备份或导出的数据根目录。"))
         expected_workspace_children = (
+            "ANALYSIS_RAWDATA_HOST_PATH",
+            "ANALYSIS_DATABASE_HOST_PATH",
             "ANALYSIS_RUN_HOST_PATH",
             "ANALYSIS_INPUT_STAGING_HOST_PATH",
             "ANALYSIS_CACHE_HOST_PATH",
@@ -285,12 +436,54 @@ def validate_environment(values: dict[str, str]) -> list[Check]:
         checks.append(_check("execution-paths", roots_valid, message, failure))
 
     try:
+        uid = _integer(values, "MINIWDL_UID", -1)
+        gid = _integer(values, "MINIWDL_GID", -1)
+        docker_gid = _integer(values, "MINIWDL_DOCKER_GID", -1)
+        identities_valid = uid > 0 and gid > 0 and docker_gid >= 0
+    except AnalysisNodeError:
+        identities_valid = False
+    checks.append(
+        _check(
+            "runtime-identities",
+            identities_valid,
+            "运行 UID、GID 与 Docker Socket GID 有效。",
+            "MINIWDL_UID/MINIWDL_GID 必须为正整数，MINIWDL_DOCKER_GID 必须为非负整数。",
+        )
+    )
+
+    try:
         control = ipaddress.ip_network(values.get("MINIWDL_CONTROL_SUBNET", ""))
         egress = ipaddress.ip_network(values.get("MINIWDL_EGRESS_SUBNET", ""))
         subnet_ok = control.version == 4 and egress.version == 4 and not control.overlaps(egress)
     except ValueError:
         subnet_ok = False
     checks.append(_check("runtime-subnets", subnet_ok, "隔离运行时子网有效且不重叠。", "MINIWDL_CONTROL_SUBNET 与 MINIWDL_EGRESS_SUBNET 必须是不同的 IPv4 CIDR。"))
+    try:
+        minimum_memory = float(values["ANALYSIS_MIN_AVAILABLE_MEMORY_GB"])
+        memory_valid = math.isfinite(minimum_memory) and minimum_memory >= 0
+    except (KeyError, ValueError):
+        memory_valid = False
+    checks.append(
+        _check(
+            "minimum-memory",
+            memory_valid,
+            "最低可用内存阈值有效。",
+            "ANALYSIS_MIN_AVAILABLE_MEMORY_GB 必须是非负数。",
+        )
+    )
+    try:
+        minimum_disk = float(values["ANALYSIS_NODE_MIN_FREE_GB"])
+        disk_valid = math.isfinite(minimum_disk) and minimum_disk >= 0
+    except (KeyError, ValueError):
+        disk_valid = False
+    checks.append(
+        _check(
+            "minimum-disk",
+            disk_valid,
+            "最低磁盘可用空间阈值有效。",
+            "ANALYSIS_NODE_MIN_FREE_GB 必须是非负数。",
+        )
+    )
     return checks
 
 
@@ -304,6 +497,179 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _read_regular_bytes(path: Path, *, label: str, maximum_bytes: int) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise AnalysisNodeError(f"无法安全读取{label}：{error}") from error
+    try:
+        item = os.fstat(descriptor)
+        if not stat_module.S_ISREG(item.st_mode):
+            raise AnalysisNodeError(f"{label}必须是普通文件。")
+        if item.st_size > maximum_bytes:
+            raise AnalysisNodeError(f"{label}超过 {maximum_bytes} 字节上限。")
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            content = handle.read(maximum_bytes + 1)
+            if len(content) > maximum_bytes:
+                raise AnalysisNodeError(f"{label}超过 {maximum_bytes} 字节上限。")
+            return content
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _env_file_security_check(path: Path) -> Check:
+    try:
+        item = path.lstat()
+    except OSError as error:
+        return Check("env-file-permissions", "fail", f"无法检查配置文件：{error}")
+    secure = stat_module.S_ISREG(item.st_mode) and item.st_mode & 0o077 == 0
+    return _check(
+        "env-file-permissions",
+        secure,
+        "配置文件是仅 owner 可访问的普通文件。",
+        "实际配置文件必须是非符号链接普通文件，且权限不得向 group/other 开放；请执行 chmod 0600。",
+    )
+
+
+def _available_memory_gb(path: Path = Path("/proc/meminfo")) -> float | None:
+    try:
+        for line in path.read_text(encoding="ascii").splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024 / 1024**3
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _worker_has_directory_access(
+    item: os.stat_result,
+    *,
+    uid: int,
+    gid: int,
+    required_owner_bits: int,
+) -> bool:
+    required = (required_owner_bits >> 6) & 0o7
+    if item.st_uid == uid:
+        available = (item.st_mode >> 6) & 0o7
+    elif item.st_gid == gid:
+        available = (item.st_mode >> 3) & 0o7
+    else:
+        available = item.st_mode & 0o7
+    return available & required == required
+
+
+def _directory_permission_checks(values: dict[str, str]) -> list[Check]:
+    uid = _integer(values, "MINIWDL_UID", 1000)
+    gid = _integer(values, "MINIWDL_GID", 1000)
+    missing: list[str] = []
+    overly_open: list[str] = []
+    inaccessible: list[str] = []
+    for key in DIRECTORY_MODES:
+        path = Path(values[key])
+        if path.is_symlink() or not path.is_dir():
+            missing.append(key)
+            continue
+        try:
+            item = path.stat()
+        except OSError:
+            missing.append(key)
+            continue
+        if key in PRIVATE_DIRECTORY_KEYS and item.st_mode & 0o077:
+            overly_open.append(key)
+        required = WORKER_DIRECTORY_ACCESS.get(key)
+        if required is not None and not _worker_has_directory_access(
+            item,
+            uid=uid,
+            gid=gid,
+            required_owner_bits=required,
+        ):
+            inaccessible.append(key)
+    return [
+        _check(
+            "managed-directories",
+            not missing,
+            "所有受管目录均存在且不是符号链接。",
+            "以下目录缺失、类型错误或为符号链接：" + ", ".join(missing),
+        ),
+        _check(
+            "private-directory-modes",
+            not overly_open,
+            "数据库、备份、运行时状态和密钥目录未向组或其他用户开放。",
+            "以下私有目录向组或其他用户开放：" + ", ".join(overly_open),
+        ),
+        _check(
+            "worker-directory-access",
+            not inaccessible,
+            f"运行用户 {uid}:{gid} 对受管输入、运行、缓存和密钥目录权限完整。",
+            f"运行用户 {uid}:{gid} 无法按需访问：" + ", ".join(inaccessible),
+        ),
+    ]
+
+
+def _docker_network_conflict_checks(values: dict[str, str]) -> list[Check]:
+    if values["ANALYSIS_NODE_RUNTIME"] != "isolated":
+        return [Check("docker-network-conflicts", "pass", "host runtime 不创建隔离执行子网。")]
+    try:
+        configured = [
+            ipaddress.ip_network(values["MINIWDL_CONTROL_SUBNET"]),
+            ipaddress.ip_network(values["MINIWDL_EGRESS_SUBNET"]),
+        ]
+    except ValueError as error:
+        return [Check("docker-network-conflicts", "fail", f"隔离执行子网无效：{error}")]
+    try:
+        listed = _run(["docker", "network", "ls", "--quiet"], capture=True)
+        network_ids = listed.stdout.split()
+        if not network_ids:
+            return [Check("docker-network-conflicts", "pass", "主机尚无 Docker 网络冲突。")]
+        inspected = _run(
+            ["docker", "network", "inspect", *network_ids],
+            capture=True,
+        )
+        documents = json.loads(inspected.stdout)
+    except (AnalysisNodeError, json.JSONDecodeError, TypeError) as error:
+        return [Check("docker-network-conflicts", "fail", f"无法检查 Docker 网段：{error}")]
+    if not isinstance(documents, list):
+        return [Check("docker-network-conflicts", "fail", "Docker network inspect 返回格式无效。")]
+    project_name = values.get("ANALYSIS_NODE_PROJECT_NAME", "analysis-node")
+    project_subnets = {
+        "miniwdl-control": configured[0],
+        "miniwdl-egress": configured[1],
+    }
+    conflicts: list[str] = []
+    for document in documents:
+        if not isinstance(document, dict):
+            continue
+        labels = document.get("Labels") or {}
+        name = str(document.get("Name") or "unknown")
+        ipam = document.get("IPAM") or {}
+        for item in ipam.get("Config") or []:
+            if not isinstance(item, dict) or not item.get("Subnet"):
+                continue
+            try:
+                existing = ipaddress.ip_network(str(item["Subnet"]))
+            except ValueError:
+                continue
+            if labels.get("com.docker.compose.project") == project_name:
+                network_key = labels.get("com.docker.compose.network")
+                expected = project_subnets.get(str(network_key))
+                if expected is not None and existing != expected:
+                    conflicts.append(f"{name}={existing} (expected {expected})")
+                continue
+            if any(candidate.overlaps(existing) for candidate in configured):
+                conflicts.append(f"{name}={existing}")
+    return [
+        _check(
+            "docker-network-conflicts",
+            not conflicts,
+            "配置的隔离执行子网与现有 Docker 网络不重叠。",
+            "配置子网与现有 Docker 网络冲突：" + ", ".join(sorted(conflicts)),
+        )
+    ]
 
 
 def validate_image_lock(package_dir: Path, values: dict[str, str], image_values: dict[str, str]) -> list[Check]:
@@ -492,15 +858,32 @@ class Context:
 
 def build_context(args: argparse.Namespace) -> Context:
     package_dir = Path(args.package_dir).resolve()
-    env_file = Path(args.env_file).resolve() if args.env_file else package_dir / ".env"
-    images_env = Path(args.images_env).resolve() if args.images_env else package_dir / "images.env"
-    return Context(
+    env_file = (
+        Path(os.path.abspath(args.env_file))
+        if args.env_file
+        else package_dir / ".env"
+    )
+    images_env = (
+        Path(os.path.abspath(args.images_env))
+        if args.images_env
+        else package_dir / "images.env"
+    )
+    context = Context(
         package_dir=package_dir,
         env_file=env_file,
         images_env=images_env,
         values=parse_env_file(env_file),
         image_values=parse_env_file(images_env),
     )
+    template_verification = (
+        getattr(args, "command", "") == "verify-bundle"
+        and env_file == package_dir / ".env.example"
+    )
+    if not template_verification:
+        env_check = _env_file_security_check(env_file)
+        if env_check.status == "fail":
+            raise AnalysisNodeError(env_check.message)
+    return context
 
 
 def initialize_directories(context: Context) -> list[Check]:
@@ -529,6 +912,8 @@ def initialize_directories(context: Context) -> list[Check]:
     }
     for key, mode in DIRECTORY_MODES.items():
         path = Path(context.values[key])
+        if path.is_symlink():
+            raise AnalysisNodeError(f"配置路径不能是符号链接：{key}={path}")
         existed = path.exists()
         if existed and not path.is_dir():
             raise AnalysisNodeError(f"配置路径不是目录：{key}={path}")
@@ -564,10 +949,46 @@ def _version_tuple(value: str) -> tuple[int, int, int]:
 
 def preflight(context: Context, *, require_bundle: bool) -> list[Check]:
     checks = validate_environment(context.values)
+    checks.append(_env_file_security_check(context.env_file))
     checks.extend(verify_bundle(context, required=require_bundle))
     checks.append(_check("platform-os", sys.platform.startswith("linux"), "操作系统为 Linux。", "Analysis Node 1.x 仅支持 Linux。"))
     machine = platform.machine().casefold()
     checks.append(_check("platform-arch", machine in {"x86_64", "amd64"}, f"CPU 架构：{machine}", "Analysis Node 1.x 离线包仅支持 amd64。"))
+    try:
+        checks.extend(_directory_permission_checks(context.values))
+    except AnalysisNodeError as error:
+        checks.append(Check("managed-directories", "fail", str(error)))
+    try:
+        minimum_memory = float(
+            context.values.get("ANALYSIS_MIN_AVAILABLE_MEMORY_GB", "-1")
+        )
+    except ValueError:
+        minimum_memory = -1
+    available_memory = _available_memory_gb()
+    memory_ok = minimum_memory == 0 or (
+        minimum_memory > 0
+        and available_memory is not None
+        and available_memory >= minimum_memory
+    )
+    if minimum_memory == 0:
+        memory_description = "可用内存门槛已显式设为 0 GiB。"
+    elif available_memory is not None:
+        memory_description = (
+            f"可用内存 {available_memory:.1f} GiB，不低于 {minimum_memory:g} GiB。"
+        )
+    else:
+        memory_description = "无法读取 /proc/meminfo 的 MemAvailable。"
+    checks.append(
+        _check(
+            "available-memory",
+            memory_ok,
+            memory_description,
+            (
+                f"{memory_description.rstrip('。')}；"
+                f"要求至少 {minimum_memory:g} GiB。"
+            ),
+        )
+    )
     if shutil.which("docker") is None:
         checks.append(Check("docker", "fail", "未安装 Docker CLI。"))
         return checks
@@ -587,6 +1008,21 @@ def preflight(context: Context, *, require_bundle: bool) -> list[Check]:
     if context.values["ANALYSIS_NODE_RUNTIME"] == "host":
         socket_path = Path("/var/run/docker.sock")
         checks.append(_check("host-docker-socket", socket_path.is_socket(), "主机 Docker Socket 可见。", "host runtime 需要 /var/run/docker.sock。"))
+        if socket_path.is_socket():
+            actual_gid = socket_path.stat().st_gid
+            expected_gid = _integer(context.values, "MINIWDL_DOCKER_GID", -1)
+            checks.append(
+                _check(
+                    "host-docker-gid",
+                    actual_gid == expected_gid,
+                    f"Docker Socket GID 与容器补充组一致：{actual_gid}。",
+                    f"/var/run/docker.sock GID 为 {actual_gid}，配置为 {expected_gid}。",
+                )
+            )
+    try:
+        checks.extend(_docker_network_conflict_checks(context.values))
+    except ValueError as error:
+        checks.append(Check("docker-network-conflicts", "fail", f"隔离执行子网无效：{error}"))
     selected_port_key = "ANALYSIS_NODE_API_PORT" if context.values["ANALYSIS_NODE_MODE"] == "headless" else "ANALYSIS_NODE_CONSOLE_PORT"
     bind_address = context.values["ANALYSIS_NODE_BIND_ADDRESS"]
     port = _integer(context.values, selected_port_key, 8082)
@@ -620,6 +1056,13 @@ def preflight(context: Context, *, require_bundle: bool) -> list[Check]:
 
 
 def verify_loaded_images(context: Context) -> list[Check]:
+    lock_checks = validate_image_lock(
+        context.package_dir,
+        context.values,
+        context.image_values,
+    )
+    if _failed(lock_checks):
+        raise AnalysisNodeError("images.lock.json 无效，无法核对本地镜像。")
     try:
         lock = json.loads(
             (context.package_dir / "images.lock.json").read_text(encoding="utf-8")
@@ -638,6 +1081,20 @@ def verify_loaded_images(context: Context) -> list[Check]:
             checks.append(_check(f"image:{role}", actual == item["image_id"], f"镜像已加载且 ID 匹配：{role}", f"镜像 ID 不匹配：{role}"))
         except AnalysisNodeError as error:
             checks.append(Check(f"image:{role}", "fail", str(error)))
+    return checks
+
+
+def require_trusted_runtime(context: Context) -> list[Check]:
+    checks = validate_environment(context.values)
+    checks.extend(verify_bundle(context, required=True))
+    if not _failed(checks):
+        checks.extend(verify_loaded_images(context))
+    if _failed(checks):
+        failures = ", ".join(item.name for item in checks if item.status == "fail")
+        raise AnalysisNodeError(
+            "签名交付包、镜像锁或本地镜像校验未通过，拒绝修改运行状态："
+            + failures
+        )
     return checks
 
 
@@ -672,9 +1129,106 @@ def load_images(context: Context) -> list[Check]:
     return image_checks
 
 
+def attest_workflow_package(
+    context: Context,
+    *,
+    manifest_path: Path,
+    signature_bundle_path: Path,
+    certificate_identity: str,
+    certificate_oidc_issuer: str,
+) -> list[Check]:
+    require_trusted_runtime(context)
+    manifest_bytes = _read_regular_bytes(
+        manifest_path,
+        label="工作流包声明",
+        maximum_bytes=64 * 1024,
+    )
+    signature_bundle_bytes = _read_regular_bytes(
+        signature_bundle_path,
+        label="Sigstore bundle",
+        maximum_bytes=10 * 1024 * 1024,
+    )
+    try:
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+        workflow_version_id = int(manifest["workflow_version_id"])
+        source_digest = str(manifest["source_digest"])
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+        raise AnalysisNodeError("工作流包声明 JSON 无效。") from error
+    if (
+        not isinstance(manifest, dict)
+        or set(manifest)
+        != {"schema_version", "workflow_version_id", "source_digest"}
+        or manifest.get("schema_version") != 1
+        or workflow_version_id < 1
+        or not IMAGE_ID_PATTERN.fullmatch(source_digest)
+    ):
+        raise AnalysisNodeError(
+            "工作流包声明必须包含 schema_version=1、正整数 workflow_version_id "
+            "和 sha256 source_digest。"
+        )
+    normalized_identity = certificate_identity.strip()
+    normalized_issuer = certificate_oidc_issuer.strip()
+    if not normalized_identity or not normalized_issuer:
+        raise AnalysisNodeError("证书 identity 与 OIDC issuer 不能为空。")
+    if shutil.which("cosign") is None:
+        raise AnalysisNodeError("缺少 cosign，无法离线验证工作流包签名。")
+    with tempfile.TemporaryDirectory(prefix="analysis-node-attestation-") as temporary:
+        verified_manifest = Path(temporary) / "workflow-package.json"
+        verified_bundle = Path(temporary) / "workflow-package.sigstore.json"
+        verified_manifest.write_bytes(manifest_bytes)
+        verified_bundle.write_bytes(signature_bundle_bytes)
+        _run(
+            [
+                "cosign",
+                "verify-blob",
+                "--offline",
+                "--bundle",
+                str(verified_bundle),
+                "--certificate-identity",
+                normalized_identity,
+                "--certificate-oidc-issuer",
+                normalized_issuer,
+                str(verified_manifest),
+            ],
+            capture=True,
+        )
+    _run(
+        _compose_command(
+            context,
+            "exec",
+            "-T",
+            "backend",
+            "python",
+            "backend/manage.py",
+            "attest_workflow_package",
+            "--workflow-version-id",
+            str(workflow_version_id),
+            "--source-digest",
+            source_digest,
+            "--statement-digest",
+            "sha256:" + hashlib.sha256(manifest_bytes).hexdigest(),
+            "--signature-bundle-digest",
+            "sha256:" + hashlib.sha256(signature_bundle_bytes).hexdigest(),
+            "--signer-identity",
+            normalized_identity,
+            "--actor",
+            "analysis-node-installer",
+        ),
+        environment=context.environment,
+        capture=True,
+    )
+    return [
+        Check(
+            "workflow-package-attestation",
+            "pass",
+            f"WorkflowVersion {workflow_version_id} 已绑定离线验证的 Sigstore 包证明。",
+        )
+    ]
+
+
 def compose_action(context: Context, action: str) -> list[Check]:
-    if action != "down" and _failed(validate_environment(context.values)):
-        raise AnalysisNodeError("配置校验未通过，拒绝修改服务状态。")
+    if action in {"up", "migrate"}:
+        require_trusted_runtime(context)
     if action == "up":
         _run(_compose_command(context, "up", "-d", "--wait"), environment=context.environment)
         return [Check("services", "pass", "Analysis Node 服务已启动并通过容器健康检查。")]
@@ -688,8 +1242,7 @@ def compose_action(context: Context, action: str) -> list[Check]:
 
 
 def create_backup(context: Context) -> Path:
-    if _failed(validate_environment(context.values)):
-        raise AnalysisNodeError("配置校验未通过，拒绝创建备份。")
+    require_trusted_runtime(context)
     backup_root = Path(context.values["ANALYSIS_NODE_BACKUP_ROOT"])
     backup_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -750,11 +1303,22 @@ def restore_backup(context: Context, backup_path: Path, *, confirmed: bool) -> l
     if not manifest_path.is_file():
         raise AnalysisNodeError("备份清单不存在，拒绝恢复。")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("file") != backup_path.name or manifest.get("sha256") != _sha256(backup_path):
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("schema_version") != 1
+        or manifest.get("product_version") != context.values["ANALYSIS_NODE_VERSION"]
+        or manifest.get("database") != context.values["POSTGRES_DB"]
+        or manifest.get("file") != backup_path.name
+        or manifest.get("sha256") != _sha256(backup_path)
+    ):
         raise AnalysisNodeError("备份摘要校验失败，拒绝恢复。")
-    safety_backup = create_backup(context)
-    _run(_compose_command(context, "stop"), environment=context.environment)
+    require_trusted_runtime(context)
+    _run(
+        _compose_command(context, "stop", *RESTORE_STOP_SERVICES),
+        environment=context.environment,
+    )
     _run(_compose_command(context, "up", "-d", "--wait", "db"), environment=context.environment)
+    safety_backup = create_backup(context)
     common = _compose_command(context, "exec", "-T", "db")
     user = context.values["POSTGRES_USER"]
     database = context.values["POSTGRES_DB"]
@@ -802,6 +1366,125 @@ def _gateway_headers(values: dict[str, str]) -> dict[str, str]:
     return {"Host": public_url.netloc}
 
 
+@dataclass
+class SmokeProbe:
+    directory: Path
+    filename: str
+    relative_path: str
+    directory_fd: int
+    device: int
+    inode: int
+
+
+def _prepare_smoke_probe(context: Context, external_id: str) -> SmokeProbe:
+    rawdata_root = Path(context.values["ANALYSIS_RAWDATA_HOST_PATH"])
+    try:
+        root_stat = rawdata_root.lstat()
+    except OSError as error:
+        raise AnalysisNodeError(f"无法检查冒烟输入根目录：{rawdata_root}") from error
+    if not stat_module.S_ISDIR(root_stat.st_mode):
+        raise AnalysisNodeError("冒烟输入根目录必须是真实目录，不能是符号链接。")
+
+    directory = rawdata_root / f".analysis-node-smoke-{external_id}"
+    directory_fd = -1
+    file_fd = -1
+    directory_stat: os.stat_result | None = None
+    directory_created = False
+    prepared = False
+    filename = "probe.txt"
+    try:
+        os.mkdir(directory, mode=0o700)
+        directory_created = True
+        directory_fd = os.open(
+            directory,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        directory_stat = os.fstat(directory_fd)
+        file_fd = os.open(
+            filename,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        os.write(file_fd, b"analysis-node-input\n")
+        worker_gid = _integer(context.values, "MINIWDL_GID", 1000)
+        if os.geteuid() == 0:
+            os.fchown(directory_fd, 0, worker_gid)
+            os.fchown(file_fd, 0, worker_gid)
+        os.fchmod(file_fd, 0o440)
+        os.fchmod(directory_fd, 0o550)
+        os.close(file_fd)
+        file_fd = -1
+        prepared = True
+        return SmokeProbe(
+            directory=directory,
+            filename=filename,
+            relative_path=f"{directory.name}/{filename}",
+            directory_fd=directory_fd,
+            device=directory_stat.st_dev,
+            inode=directory_stat.st_ino,
+        )
+    except FileExistsError as error:
+        raise AnalysisNodeError(
+            f"拒绝复用已有冒烟输入路径：{directory}"
+        ) from error
+    except OSError as error:
+        raise AnalysisNodeError(f"无法安全创建冒烟输入：{directory}") from error
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        if not prepared and directory_fd >= 0:
+            try:
+                os.fchmod(directory_fd, 0o700)
+                os.unlink(filename, dir_fd=directory_fd)
+            except OSError:
+                pass
+            os.close(directory_fd)
+        if not prepared and directory_created:
+            try:
+                current = directory.lstat()
+                if directory_stat is None or (
+                    stat_module.S_ISDIR(current.st_mode)
+                    and current.st_dev == directory_stat.st_dev
+                    and current.st_ino == directory_stat.st_ino
+                ):
+                    directory.rmdir()
+            except OSError:
+                pass
+
+
+def _cleanup_smoke_probe(probe: SmokeProbe) -> None:
+    cleanup_error: OSError | None = None
+    try:
+        os.fchmod(probe.directory_fd, 0o700)
+        os.unlink(probe.filename, dir_fd=probe.directory_fd)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        cleanup_error = error
+    finally:
+        os.close(probe.directory_fd)
+
+    try:
+        current = probe.directory.lstat()
+        if (
+            stat_module.S_ISDIR(current.st_mode)
+            and current.st_dev == probe.device
+            and current.st_ino == probe.inode
+        ):
+            probe.directory.rmdir()
+        else:
+            cleanup_error = cleanup_error or OSError(
+                "temporary smoke input path was replaced"
+            )
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        cleanup_error = cleanup_error or error
+    if cleanup_error is not None:
+        raise AnalysisNodeError("无法安全清理临时冒烟输入。") from cleanup_error
+
+
 def smoke(context: Context, *, timeout_seconds: int) -> list[Check]:
     if _failed(validate_environment(context.values)):
         raise AnalysisNodeError("配置校验未通过，拒绝执行冒烟任务。")
@@ -809,56 +1492,63 @@ def smoke(context: Context, *, timeout_seconds: int) -> list[Check]:
     def compose(*arguments: str) -> list[str]:
         return _compose_command(context, *arguments)
 
-    _run(compose("exec", "-T", "backend", "python", "backend/manage.py", "prepare_analysis_node_smoke"), environment=context.environment, capture=True)
-    issued = _run(
-        compose(
-            "exec",
-            "-T",
-            "backend",
-            "python",
-            "backend/manage.py",
-            "manage_service_account",
-            "--client-id",
-            "analysis-node-installer",
-            "--name",
-            "Analysis Node installer",
-            "--scope",
-            "analysis:submit",
-            "--scope",
-            "analysis:read",
-            "--issue-token",
-            "--token-name",
-            "installation-smoke",
-            "--expires-days",
-            "1",
-        ),
-        environment=context.environment,
-        capture=True,
-    )
-    token_match = re.search(r"^TOKEN=(.+)$", issued.stdout, re.MULTILINE)
-    prefix_match = re.search(r"^TOKEN_PREFIX=(.+)$", issued.stdout, re.MULTILINE)
-    if token_match is None or prefix_match is None:
-        raise AnalysisNodeError("无法签发临时冒烟 Service Token。")
-    token = token_match.group(1).strip()
-    prefix = prefix_match.group(1).strip()
     external_id = f"smoke-{uuid4().hex}"
-    base = _local_api_base(context.values)
-    gateway_headers = _gateway_headers(context.values)
-    payload = {
-        "external_ref": {
-            "client_id": "analysis-node-installer",
-            "external_run_id": external_id,
-            "external_analysis_id": external_id,
-        },
-        "analysis_product": {
-            "analysis_code": "analysis-node-smoke",
-            "contract_version": "1.0.0",
-        },
-        "subject": {"sample_id": "analysis-node-smoke"},
-        "inputs": {},
-        "metadata": {"purpose": "installation-smoke"},
-    }
+    probe = _prepare_smoke_probe(context, external_id)
+    prefix = ""
     try:
+        _run(compose("exec", "-T", "backend", "python", "backend/manage.py", "prepare_analysis_node_smoke"), environment=context.environment, capture=True)
+        issued = _run(
+            compose(
+                "exec",
+                "-T",
+                "backend",
+                "python",
+                "backend/manage.py",
+                "manage_service_account",
+                "--client-id",
+                "analysis-node-installer",
+                "--name",
+                "Analysis Node installer",
+                "--scope",
+                "analysis:submit",
+                "--scope",
+                "analysis:read",
+                "--issue-token",
+                "--token-name",
+                "installation-smoke",
+                "--expires-days",
+                "1",
+            ),
+            environment=context.environment,
+            capture=True,
+        )
+        token_match = re.search(r"^TOKEN=(.+)$", issued.stdout, re.MULTILINE)
+        prefix_match = re.search(r"^TOKEN_PREFIX=(.+)$", issued.stdout, re.MULTILINE)
+        prefix = prefix_match.group(1).strip() if prefix_match is not None else ""
+        if token_match is None or not prefix:
+            raise AnalysisNodeError("无法签发临时冒烟 Service Token。")
+        token = token_match.group(1).strip()
+        base = _local_api_base(context.values)
+        gateway_headers = _gateway_headers(context.values)
+        payload = {
+            "external_ref": {
+                "client_id": "analysis-node-installer",
+                "external_run_id": external_id,
+                "external_analysis_id": external_id,
+            },
+            "analysis_product": {
+                "analysis_code": "analysis-node-smoke",
+                "contract_version": "1.0.0",
+            },
+            "subject": {"sample_id": "analysis-node-smoke"},
+            "inputs": {
+                "probe": {
+                    "root_alias": "rawdata",
+                    "relative_path": probe.relative_path,
+                }
+            },
+            "metadata": {"purpose": "installation-smoke"},
+        }
         preflight_result = _http_json(
             f"{base}/integration/analysis-runs/preflight",
             token=token,
@@ -889,24 +1579,34 @@ def smoke(context: Context, *, timeout_seconds: int) -> list[Check]:
             )
         if current.get("status") != "succeeded" or current.get("output_status") != "complete":
             raise AnalysisNodeError(f"API 冒烟未成功：status={current.get('status')} output_status={current.get('output_status')} error={current.get('error')}")
-        return [Check("headless-api-smoke", "pass", f"Analysis Product 经 API 提交并完成：{run_id}")]
+        return [
+            Check(
+                "headless-api-smoke",
+                "pass",
+                f"Analysis Product 读取受管输入并经 API 完成：{run_id}",
+            )
+        ]
     finally:
-        _run(
-            compose(
-                "exec",
-                "-T",
-                "backend",
-                "python",
-                "backend/manage.py",
-                "manage_service_account",
-                "--client-id",
-                "analysis-node-installer",
-                "--revoke-prefix",
-                prefix,
-            ),
-            environment=context.environment,
-            capture=True,
-        )
+        try:
+            if prefix:
+                _run(
+                    compose(
+                        "exec",
+                        "-T",
+                        "backend",
+                        "python",
+                        "backend/manage.py",
+                        "manage_service_account",
+                        "--client-id",
+                        "analysis-node-installer",
+                        "--revoke-prefix",
+                        prefix,
+                    ),
+                    environment=context.environment,
+                    capture=True,
+                )
+        finally:
+            _cleanup_smoke_probe(probe)
 
 
 def doctor(context: Context, *, run_smoke: bool, timeout_seconds: int) -> list[Check]:
@@ -979,6 +1679,14 @@ def build_parser() -> argparse.ArgumentParser:
     preflight_parser = commands.add_parser("preflight")
     preflight_parser.add_argument("--allow-source-tree", action="store_true")
     commands.add_parser("load-images")
+    attestation = commands.add_parser("attest-workflow-package")
+    attestation.add_argument("--manifest", required=True)
+    attestation.add_argument("--signature-bundle", required=True)
+    attestation.add_argument("--certificate-identity", required=True)
+    attestation.add_argument(
+        "--certificate-oidc-issuer",
+        default="https://token.actions.githubusercontent.com",
+    )
     commands.add_parser("migrate")
     commands.add_parser("up")
     commands.add_parser("down")
@@ -1008,6 +1716,14 @@ def main(argv: list[str] | None = None) -> int:
             checks = preflight(context, require_bundle=not args.allow_source_tree)
         elif args.command == "load-images":
             checks = load_images(context)
+        elif args.command == "attest-workflow-package":
+            checks = attest_workflow_package(
+                context,
+                manifest_path=Path(args.manifest),
+                signature_bundle_path=Path(args.signature_bundle),
+                certificate_identity=args.certificate_identity,
+                certificate_oidc_issuer=args.certificate_oidc_issuer,
+            )
         elif args.command in {"migrate", "up", "down"}:
             checks = compose_action(context, args.command)
         elif args.command == "backup":

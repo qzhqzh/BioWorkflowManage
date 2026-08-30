@@ -71,6 +71,12 @@ Token 会立即按新 scope 生效。
 MES、运营平台等业务调用方优先使用稳定的 `analysis_code + contract_version`，不直接依赖
 内部 WorkflowVersion 数字 ID。管理员把一个外部契约固定发布到不可变 WorkflowVersion：
 
+Analysis Node 独立交付默认同时开启 `INTEGRATION_REQUIRE_ANALYSIS_PRODUCT=1` 和
+`INTEGRATION_REQUIRE_SIGNED_WORKFLOW_PACKAGE=1`。在这种部署中，管理员必须先按
+[Analysis Node 第三方 Workflow 包信任流程](19-analysis-node-deployment.md#第三方-workflow-包信任)
+离线验证 Sigstore 签名并绑定不可变证明，才能执行下面的产品发布命令；未证明的产品在发布、
+新建任务和 retry 三处都会被拒绝。
+
 ```bash
 docker compose exec backend python backend/manage.py manage_analysis_product \
   --code dna-panel \

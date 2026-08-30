@@ -59,6 +59,7 @@ services:
       ANALYSIS_OBJECT_STORAGE_PROFILE_DIR: /run/secrets/bioworkflow/object-storage
       ANALYSIS_ARTIFACT_EXPORT_PROFILE_DIR: /run/secrets/bioworkflow/artifact-export
       INTEGRATION_REQUIRE_ANALYSIS_PRODUCT: "1"
+      INTEGRATION_REQUIRE_SIGNED_WORKFLOW_PACKAGE: "1"
       ANALYSIS_NODE_SMOKE_TASK_IMAGE: ${ANALYSIS_NODE_SMOKE_TASK_IMAGE}
     volumes:
       - ${ANALYSIS_RAWDATA_HOST_PATH}:/analysis/rawdata:ro
@@ -240,7 +241,7 @@ services:
       DOCKER_HOST: tcp://miniwdl-docker:2376
       DOCKER_CERT_PATH: /certs/client
       DOCKER_TLS_VERIFY: "1"
-      MINIWDL_RUN_ROOT: /analysis/runs
+      MINIWDL_RUN_ROOT: /analysis
       ANALYSIS_RAWDATA_ROOT: /analysis/rawdata
       ANALYSIS_DATABASE_ROOT: /analysis/databases
       ANALYSIS_RUN_ROOT: /analysis/runs

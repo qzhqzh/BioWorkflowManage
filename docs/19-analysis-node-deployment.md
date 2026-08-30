@@ -19,7 +19,8 @@ Analysis Node 是 BioWorkflowManage 面向 MES、运营平台和第三方服务�
 镜像使用本地固定 tag、`pull_policy: never` 和完整 `images.lock.json`；离线启动不会隐式拉取镜像。
 
 本版本不提供 Kubernetes Operator，不自动删除客户数据、Docker volume 或备份，不把任意第三方
-WDL 当作可信交付内容。Analysis Node 只执行部署者显式发布且契约快照未漂移的 Analysis Product。
+WDL 当作可信交付内容。Analysis Node 只执行部署者显式发布、契约快照未漂移且已有可信包证明的
+Analysis Product；历史上未绑定 Analysis Product 的任务也不能借 retry 绕过该边界。
 
 ## 交付物与信任链
 
@@ -34,6 +35,9 @@ WDL 当作可信交付内容。Analysis Node 只执行部署者显式发布且�
 
 发布工作流只从 `analysis-node-v*` tag 创建公开 GitHub Release。Workflow Dispatch 可生成候选制品，
 但不会发布 Release。实际创建 tag/Release 属于独立发布动作，不是普通 PR 合并的一部分。
+发布工作流在上传制品前会从最终 tar 包解压到干净目录，删除构建阶段的本地交付 tag，再依次执行
+`verify-bundle → init → preflight → load-images → migrate → up → doctor --smoke`，随后做一次真实
+backup/restore 和第二次 smoke；任何一步失败都不会产出可发布 Release。
 
 下载后先在未解包状态验证制品。`VERSION` 替换为实际版本：
 
@@ -91,13 +95,21 @@ bin/analysis-node preflight
 - `ANALYSIS_NODE_PUBLIC_BASE_URL`、可信域名、CORS/CSRF 来源和可信代理层数；
 - 所有数据、备份、工作区、NAS 和 secret 绝对路径；
 - 两个 miniwdl 子网与现有 Docker/VPN/机房网段不重叠；
-- `INTEGRATION_REQUIRE_ANALYSIS_PRODUCT=1` 保持开启。
+- `INTEGRATION_REQUIRE_ANALYSIS_PRODUCT=1` 与
+  `INTEGRATION_REQUIRE_SIGNED_WORKFLOW_PACKAGE=1` 保持开启。
 
 `DJANGO_ALLOWED_HOSTS` 中应保留 `localhost,127.0.0.1` 供容器内 readiness 探针使用，并加入真实
 外部域名；这两个 loopback 名称不会使服务对外监听，外部暴露仍由 Bind Address 和防火墙决定。
+`DJANGO_TRUSTED_PROXY_COUNT` 必须包含产品 gateway；直接访问 gateway 时为 1，前面另有一层 TLS
+反向代理时通常为 2，必须按真实可信链路填写。
 
 `init` 只创建目录、收紧权限并写入初始化标记，重复执行不会删除或清空已有文件。备份目录必须与
 数据目录隔离；对象存储和 Artifact Export 凭据目录不能位于数据根目录中。
+
+`preflight` 会阻断以下问题：可用内存或磁盘不足、受管目录缺失/为符号链接、私有目录权限过宽、
+`MINIWDL_UID:MINIWDL_GID` 无法读取输入或写入运行目录、host runtime 的 Docker Socket GID
+不匹配，以及隔离子网和已有 Docker 网络重叠。原始数据和数据库放在 NAS 时，应先挂载到最终
+绝对路径再执行 `init/preflight`，不能只检查一个尚未挂载的空目录。
 
 `host-runtime` 必须把四个 `*_EXECUTION_ROOT` 设置成对应的绝对 `*_HOST_PATH`，确保 worker 和任务
 容器看到完全相同的路径。`isolated-runtime` 则固定使用 `/analysis/*` 容器路径。
@@ -114,7 +126,10 @@ bin/analysis-node doctor --smoke --timeout 600
 `load-images` 先校验签名和摘要，再加载 `images.tar`，逐一比对 Image ID。隔离模式还会把可信
 smoke task 镜像加载到 DIND 内部 Engine。`doctor --smoke` 会检查服务、镜像、readiness、Headless
 不含 frontend、隔离 Engine，并通过临时 Service Token 经 API 提交 `analysis-node-smoke@1.0.0`，
-轮询到结果完整后立即吊销 Token。
+读取一份临时受管 rawdata 输入，轮询到结果完整后立即吊销 Token 并删除临时输入。
+
+`migrate`、`up`、`backup` 和 `restore` 每次执行前都会重新验证发布者签名、内部 SHA-256、镜像锁
+和本机 Image ID。这样即使本地 tag 后来被替换，也不能借运维命令执行或迁移数据库。
 
 停止服务使用：
 
@@ -128,7 +143,8 @@ bin/analysis-node down
 
 默认只监听 `127.0.0.1`，由客户已有的 Nginx、Ingress 或负载均衡器终止 TLS。只在确有防火墙和
 访问控制时改为 `0.0.0.0`。外层代理必须保留 `Host`、`X-Forwarded-For` 和
-`X-Forwarded-Proto=https`，`DJANGO_TRUSTED_PROXY_COUNT` 必须等于真实可信代理层数。
+`X-Forwarded-Proto=https`。产品 gateway 只接受精确的 `https` 值并传给 backend，其他值回退到
+gateway 自身 scheme；`DJANGO_TRUSTED_PROXY_COUNT` 必须等于 backend 前的真实可信代理层数。
 
 Analysis Node 不直接管理客户 TLS 私钥。生产环境保持 Secure Cookie，精确配置 Allowed Hosts、
 CSRF 和 CORS，且不要使用 `*`。Headless 模式同样需要认证；健康与 readiness 端点除外。
@@ -190,8 +206,43 @@ bin/analysis-node restore /absolute/backup/analysis-node-....dump \
   --confirm-database-restore
 ```
 
-恢复命令只接受配置的备份根目录内、清单与 SHA-256 一致的 dump，并在覆盖前自动再生成一份安全
-备份；它不会恢复或删除文件存储。恢复后仍须恢复匹配的文件系统快照，再启动旧版本并跑冒烟。
+恢复命令只接受配置的备份根目录内、清单与 SHA-256 一致的 dump。它先停止 gateway、worker、
+dispatcher 等所有写入方，仅启动数据库，再生成覆盖前安全备份，避免安全备份完成后仍有新写入
+被后续 `dropdb` 丢失；它不会恢复或删除文件存储。恢复后仍须恢复匹配的文件系统快照，再启动旧
+版本并跑冒烟。
+
+## 第三方 Workflow 包信任
+
+内置 `analysis-node-smoke@1.0.0` 来自已签名且镜像锁定的后端交付物，安装器会自动写入不可变证明。
+客户或集成商提供的 WorkflowVersion 必须先对下面的最小声明做 Sigstore 签名：
+
+```json
+{
+  "schema_version": 1,
+  "workflow_version_id": 123,
+  "source_digest": "sha256:<WorkflowVersion compiled digest>"
+}
+```
+
+签名并在 Analysis Node 主机离线验证、登记：
+
+```bash
+cosign sign-blob --yes \
+  --bundle workflow-package.sigstore.json \
+  workflow-package.json
+
+bin/analysis-node attest-workflow-package \
+  --manifest workflow-package.json \
+  --signature-bundle workflow-package.sigstore.json \
+  --certificate-identity \
+  'https://github.com/customer/repository/.github/workflows/release.yml@refs/tags/workflow-v1.0.0'
+```
+
+安装器使用 `cosign verify-blob --offline` 验证精确证书 identity 和 OIDC issuer，再把声明摘要、
+Sigstore bundle 摘要、签名身份和 WorkflowVersion 源码摘要写成不可变证明。不要绕过安装器直接
+调用后端登记命令。证明完成后才能用 `manage_analysis_product` 发布该 WorkflowVersion；执行、
+重试时还会再次确认源码摘要和证明一致。更换源码、签名声明或签名身份必须发布新的
+WorkflowVersion，不能覆盖既有证明。
 
 ## 第三方系统接入
 

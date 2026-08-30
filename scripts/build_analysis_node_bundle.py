@@ -21,6 +21,19 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_SOURCE = PROJECT_ROOT / "deploy" / "analysis-node"
 RELEASE_IMAGES = PACKAGE_SOURCE / "release-images.json"
+PACKAGE_FILES = (
+    ".env.example",
+    "bin/analysis-node",
+    "compose.yml",
+    "config.schema.json",
+    "images-lock.schema.json",
+    "images.env.example",
+    "lib/analysis_node.py",
+    "nginx-console.conf",
+    "nginx-headless.conf",
+    "release-images.json",
+    "workflow-package-manifest.schema.json",
+)
 REQUIRED_ROLES = (
     "backend",
     "frontend",
@@ -32,6 +45,7 @@ REQUIRED_ROLES = (
 LOCAL_REPOSITORIES = {
     role: f"bioworkflowmanage/{role}" for role in REQUIRED_ROLES
 }
+SMOKE_TASK_CONTRACT_VERSION = "1.0.0"
 DIGEST_REFERENCE = re.compile(r"^\S+@sha256:[0-9a-f]{64}$")
 IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
 VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?$")
@@ -100,6 +114,11 @@ def validate_sources(
     return sources
 
 
+def local_reference(role: str, version: str) -> str:
+    tag = SMOKE_TASK_CONTRACT_VERSION if role == "smoke-task" else version
+    return f"{LOCAL_REPOSITORIES[role]}:{tag}"
+
+
 def render_images_env(version: str) -> str:
     keys = {
         "backend": "ANALYSIS_NODE_BACKEND_IMAGE",
@@ -110,7 +129,7 @@ def render_images_env(version: str) -> str:
         "smoke-task": "ANALYSIS_NODE_SMOKE_TASK_IMAGE",
     }
     return "".join(
-        f"{keys[role]}={LOCAL_REPOSITORIES[role]}:{version}\n"
+        f"{keys[role]}={local_reference(role, version)}\n"
         for role in REQUIRED_ROLES
     )
 
@@ -144,15 +163,14 @@ def checksum_manifest(package_dir: Path) -> str:
 
 
 def _copy_package(target: Path) -> None:
-    def ignore(_directory: str, names: list[str]) -> set[str]:
-        return {
-            name
-            for name in names
-            if name in {"__pycache__", "SHA256SUMS", "SHA256SUMS.sigstore.json"}
-            or name.endswith(".pyc")
-        }
-
-    shutil.copytree(PACKAGE_SOURCE, target, ignore=ignore)
+    target.mkdir()
+    for relative_name in PACKAGE_FILES:
+        source = PACKAGE_SOURCE / relative_name
+        if source.is_symlink() or not source.is_file():
+            raise BundleError(f"交付包白名单文件不存在或不是普通文件：{relative_name}")
+        destination = target / relative_name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
     shutil.copy2(PROJECT_ROOT / "docs" / "19-analysis-node-deployment.md", target / "README.md")
     shutil.copy2(
         PROJECT_ROOT / "docs" / "14-integration-api-and-mcp.md",
@@ -204,7 +222,7 @@ def _prepare_images(
     sbom_dir.mkdir(mode=0o755)
     for role in REQUIRED_ROLES:
         source_ref = sources[role]
-        local_ref = f"{LOCAL_REPOSITORIES[role]}:{version}"
+        local_ref = local_reference(role, version)
         last_error: BundleError | None = None
         for attempt in range(1, 4):
             try:

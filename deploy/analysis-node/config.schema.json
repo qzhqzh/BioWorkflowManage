@@ -5,17 +5,26 @@
   "type": "object",
   "required": [
     "ANALYSIS_NODE_VERSION",
+    "ANALYSIS_NODE_PROJECT_NAME",
     "ANALYSIS_NODE_MODE",
     "ANALYSIS_NODE_RUNTIME",
     "ANALYSIS_NODE_BIND_ADDRESS",
     "ANALYSIS_NODE_API_PORT",
     "ANALYSIS_NODE_CONSOLE_PORT",
     "ANALYSIS_NODE_PUBLIC_BASE_URL",
+    "ANALYSIS_NODE_MIN_FREE_GB",
     "POSTGRES_DB",
     "POSTGRES_USER",
     "POSTGRES_PASSWORD",
     "DJANGO_SECRET_KEY",
     "WEBHOOK_SIGNING_KEY",
+    "DJANGO_ALLOWED_HOSTS",
+    "DJANGO_CSRF_TRUSTED_ORIGINS",
+    "CORS_ALLOWED_ORIGINS",
+    "DJANGO_AUTH_REQUIRED",
+    "DJANGO_SESSION_COOKIE_SECURE",
+    "DJANGO_CSRF_COOKIE_SECURE",
+    "DJANGO_TRUSTED_PROXY_COUNT",
     "ANALYSIS_NODE_DATA_ROOT",
     "ANALYSIS_NODE_BACKUP_ROOT",
     "ANALYSIS_NODE_POSTGRES_PATH",
@@ -35,16 +44,22 @@
     "ANALYSIS_RUN_EXECUTION_ROOT",
     "ANALYSIS_INPUT_STAGING_EXECUTION_ROOT",
     "INTEGRATION_REQUIRE_ANALYSIS_PRODUCT",
+    "INTEGRATION_REQUIRE_SIGNED_WORKFLOW_PACKAGE",
     "MINIWDL_UID",
     "MINIWDL_GID",
     "MINIWDL_DOCKER_GID",
     "MINIWDL_CONTROL_SUBNET",
-    "MINIWDL_EGRESS_SUBNET"
+    "MINIWDL_EGRESS_SUBNET",
+    "ANALYSIS_MIN_AVAILABLE_MEMORY_GB"
   ],
   "properties": {
     "ANALYSIS_NODE_VERSION": {
       "type": "string",
       "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[A-Za-z0-9.-]+)?$"
+    },
+    "ANALYSIS_NODE_PROJECT_NAME": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,62}$"
     },
     "ANALYSIS_NODE_MODE": {"enum": ["headless", "console"]},
     "ANALYSIS_NODE_RUNTIME": {"enum": ["isolated", "host"]},
@@ -52,7 +67,20 @@
     "ANALYSIS_NODE_API_PORT": {"type": "string", "pattern": "^[0-9]{1,5}$"},
     "ANALYSIS_NODE_CONSOLE_PORT": {"type": "string", "pattern": "^[0-9]{1,5}$"},
     "ANALYSIS_NODE_PUBLIC_BASE_URL": {"type": "string", "format": "uri"},
-    "INTEGRATION_REQUIRE_ANALYSIS_PRODUCT": {"const": "1"}
+    "ANALYSIS_NODE_MIN_FREE_GB": {
+      "type": "string",
+      "pattern": "^(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?$"
+    },
+    "DJANGO_AUTH_REQUIRED": {"const": "1"},
+    "DJANGO_SESSION_COOKIE_SECURE": {"const": "1"},
+    "DJANGO_CSRF_COOKIE_SECURE": {"const": "1"},
+    "DJANGO_TRUSTED_PROXY_COUNT": {"type": "string", "pattern": "^[1-9][0-9]*$"},
+    "INTEGRATION_REQUIRE_ANALYSIS_PRODUCT": {"const": "1"},
+    "INTEGRATION_REQUIRE_SIGNED_WORKFLOW_PACKAGE": {"const": "1"},
+    "ANALYSIS_MIN_AVAILABLE_MEMORY_GB": {
+      "type": "string",
+      "pattern": "^(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?$"
+    }
   },
   "additionalProperties": {"type": "string"}
 }

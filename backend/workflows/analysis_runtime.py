@@ -65,6 +65,51 @@ class AnalysisRunLeaseLost(RuntimeError):
     pass
 
 
+class WorkflowPackageTrustError(RuntimeError):
+    code = "ANALYSIS_WORKFLOW_PACKAGE_UNTRUSTED"
+    category = "security"
+    retryable = False
+
+
+class AnalysisProductTrustError(RuntimeError):
+    code = "ANALYSIS_PRODUCT_REQUIRED"
+    category = "security"
+    retryable = False
+
+
+def _require_trusted_analysis_source(run: AnalysisRun) -> None:
+    if run.run_kind != AnalysisRun.Kind.WORKFLOW:
+        return
+    if settings.INTEGRATION_REQUIRE_ANALYSIS_PRODUCT:
+        from .analysis_products import analysis_product_version_is_current
+
+        product_version = run.analysis_product_version
+        if (
+            product_version is None
+            or product_version.workflow_version_id != run.workflow_version_id
+            or product_version.source_digest != run.source_digest
+            or not analysis_product_version_is_current(product_version)
+        ):
+            raise AnalysisProductTrustError(
+                "当前部署只允许执行仍有效且与运行快照一致的 Analysis Product。"
+            )
+    if not settings.INTEGRATION_REQUIRE_SIGNED_WORKFLOW_PACKAGE:
+        return
+    if not run.workflow_version_id:
+        raise WorkflowPackageTrustError(
+            "历史 WDL 资产没有工作流包签名证明，当前部署禁止执行。"
+        )
+    from .analysis_products import workflow_package_attestation_is_current
+
+    if (
+        run.source_digest != run.workflow_version.compiled_digest
+        or not workflow_package_attestation_is_current(run.workflow_version)
+    ):
+        raise WorkflowPackageTrustError(
+            "运行快照与 WorkflowVersion 固定编译产物或工作流包签名证明不一致。"
+        )
+
+
 def _terminate_process_group(process: subprocess.Popen) -> None:
     if process.poll() is not None:
         return
@@ -987,6 +1032,7 @@ def execute_analysis_run(
     run: AnalysisRun,
     heartbeat: _LeaseHeartbeat | None = None,
 ) -> None:
+    _require_trusted_analysis_source(run)
     executable = shutil.which("miniwdl")
     if executable is None:
         raise RuntimeError("analysis-worker 中没有 miniwdl 可执行文件。")
@@ -1318,6 +1364,16 @@ def process_analysis_run(run: AnalysisRun) -> None:
     except Exception as error:
         try:
             failure = (
+                {
+                    "code": error.code,
+                    "category": error.category,
+                    "retryable": error.retryable,
+                }
+                if isinstance(
+                    error,
+                    (AnalysisProductTrustError, WorkflowPackageTrustError),
+                )
+                else
                 {
                     "code": error.code,
                     "category": error.category,

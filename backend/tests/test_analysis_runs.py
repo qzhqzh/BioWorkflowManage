@@ -22,6 +22,7 @@ from django.utils import timezone
 
 from compiler_core import canonical_digest, compile_workflow
 import workflows.analysis_runs as analysis_runs_module
+from workflows.analysis_products import publish_analysis_product_version
 from workflows.analysis_runtime import (
     GIB,
     _available_memory_bytes,
@@ -30,10 +31,12 @@ from workflows.analysis_runtime import (
     _is_infrastructure_error,
     _LeaseHeartbeat,
     _read_result_json,
+    _require_trusted_analysis_source,
     _result_error,
     _verify_run_resource_manifests,
     claim_next_run,
     execute_analysis_run,
+    process_analysis_run,
 )
 from workflows.analysis_runs import (
     AnalysisInputError,
@@ -53,11 +56,13 @@ from workflows.integration_outputs import (
 )
 from workflows.rawdata_index import queue_rawdata_scan, run_rawdata_scan_batch
 from workflows.models import (
+    AnalysisProduct,
     AnalysisRun,
     WDLAsset,
     WDLSourceFile,
     WDLSourceRevision,
     WorkflowDocument,
+    WorkflowPackageAttestation,
     WorkflowVersion,
 )
 
@@ -1378,6 +1383,265 @@ def test_catalog_and_submit_support_latest_published_workflow(
     assert run.request_payload["input_digest"].startswith("sha256:")
     assert run.input_values["published_fastq.read1"].endswith("_R1.fq.gz")
     assert response.data["workflow"]["graph_summary"]["tool_count"] == 1
+
+
+def test_browser_rejects_unsigned_published_workflow_when_required(
+    client,
+    analysis_workspace,
+    settings,
+):
+    version = _published_fastq_workflow()
+    settings.INTEGRATION_REQUIRE_SIGNED_WORKFLOW_PACKAGE = True
+
+    catalog = client.get("/api/v1/analysis/catalog").data
+    workflow = next(
+        item
+        for item in catalog["workflows"]
+        if item["source_slug"] == version.workflow.slug
+    )
+    response = client.post(
+        "/api/v1/analysis-runs",
+        {
+            "workflow": workflow["slug"],
+            "dataset": catalog["datasets"][0]["id"],
+        },
+        format="json",
+    )
+
+    assert workflow["ready"] is False
+    assert any("签名证明" in item for item in workflow["blockers"])
+    assert response.status_code == 400
+    assert response.data["error"]["code"] == "ANALYSIS_WORKFLOW_UNSUPPORTED"
+    assert not AnalysisRun.objects.exists()
+
+
+def test_browser_rejects_legacy_wdl_when_signed_packages_are_required(
+    client,
+    analysis_workspace,
+    settings,
+):
+    asset, _ = _asset("solidtumorsingle", "SolidTumorSingle")
+    settings.INTEGRATION_REQUIRE_SIGNED_WORKFLOW_PACKAGE = True
+
+    catalog = client.get("/api/v1/analysis/catalog").data
+    workflow = next(
+        item
+        for item in catalog["workflows"]
+        if item.get("source_slug") == asset.slug
+    )
+    response = client.post(
+        "/api/v1/analysis-runs",
+        {
+            "workflow": workflow["slug"],
+            "dataset": catalog["datasets"][0]["id"],
+        },
+        format="json",
+    )
+
+    assert workflow["ready"] is False
+    assert any("签名证明" in item for item in workflow["blockers"])
+    assert response.status_code == 400
+    assert response.data["error"]["code"] == "ANALYSIS_WORKFLOW_PACKAGE_REQUIRED"
+    assert not AnalysisRun.objects.exists()
+
+
+def test_worker_rejects_legacy_queued_unsigned_workflow_version(
+    settings,
+    tmp_path,
+    monkeypatch,
+):
+    version = _published_fastq_workflow()
+    run = AnalysisRun.objects.create(
+        workflow_version=version,
+        workflow_name="published_fastq",
+        sample_id="UNSIGNED01",
+        source_bundle=version.compiled_bundle,
+        source_digest=version.compiled_digest,
+    )
+    settings.INTEGRATION_REQUIRE_SIGNED_WORKFLOW_PACKAGE = True
+    settings.ANALYSIS_MIN_AVAILABLE_MEMORY_GB = 0
+    miniwdl_checked = False
+
+    def unexpected_miniwdl_check(_command):
+        nonlocal miniwdl_checked
+        miniwdl_checked = True
+        return "/usr/bin/miniwdl"
+
+    monkeypatch.setattr(
+        "workflows.analysis_runtime.shutil.which",
+        unexpected_miniwdl_check,
+    )
+
+    claimed = claim_next_run()
+    assert claimed is not None and claimed.pk == run.pk
+    process_analysis_run(claimed)
+
+    run.refresh_from_db()
+    assert miniwdl_checked is False
+    assert run.status == AnalysisRun.Status.FAILED
+    assert run.error_code == "ANALYSIS_WORKFLOW_PACKAGE_UNTRUSTED"
+    assert run.error_category == "security"
+    assert run.error_retryable is False
+
+
+def test_worker_rejects_legacy_queued_wdl_asset_when_signed_packages_are_required(
+    settings,
+    monkeypatch,
+):
+    asset, revision = _asset("solidtumorsingle", "SolidTumorSingle")
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="SolidTumorSingle",
+        sample_id="LEGACY01",
+    )
+    settings.INTEGRATION_REQUIRE_SIGNED_WORKFLOW_PACKAGE = True
+    settings.ANALYSIS_MIN_AVAILABLE_MEMORY_GB = 0
+    miniwdl_checked = False
+
+    def unexpected_miniwdl_check(_command):
+        nonlocal miniwdl_checked
+        miniwdl_checked = True
+        return "/usr/bin/miniwdl"
+
+    monkeypatch.setattr(
+        "workflows.analysis_runtime.shutil.which",
+        unexpected_miniwdl_check,
+    )
+
+    claimed = claim_next_run()
+    assert claimed is not None and claimed.pk == run.pk
+    process_analysis_run(claimed)
+
+    run.refresh_from_db()
+    assert miniwdl_checked is False
+    assert run.status == AnalysisRun.Status.FAILED
+    assert run.error_code == "ANALYSIS_WORKFLOW_PACKAGE_UNTRUSTED"
+    assert run.error_category == "security"
+
+
+def test_worker_rejects_run_snapshot_not_bound_to_signed_workflow_version(
+    settings,
+    monkeypatch,
+):
+    version = _published_fastq_workflow()
+    WorkflowPackageAttestation.objects.create(
+        workflow_version=version,
+        verification_method=WorkflowPackageAttestation.VerificationMethod.BUNDLED,
+        source_digest=version.compiled_digest,
+        statement_digest=f"sha256:{'a' * 64}",
+        signer_identity="signed-backend-image",
+        verified_by="pytest",
+    )
+    run = AnalysisRun.objects.create(
+        workflow_version=version,
+        workflow_name="published_fastq",
+        sample_id="MISMATCH01",
+        source_bundle=version.compiled_bundle,
+        source_digest=f"sha256:{'b' * 64}",
+    )
+    settings.INTEGRATION_REQUIRE_SIGNED_WORKFLOW_PACKAGE = True
+    settings.ANALYSIS_MIN_AVAILABLE_MEMORY_GB = 0
+    miniwdl_checked = False
+
+    def unexpected_miniwdl_check(_command):
+        nonlocal miniwdl_checked
+        miniwdl_checked = True
+        return "/usr/bin/miniwdl"
+
+    monkeypatch.setattr(
+        "workflows.analysis_runtime.shutil.which",
+        unexpected_miniwdl_check,
+    )
+
+    claimed = claim_next_run()
+    assert claimed is not None and claimed.pk == run.pk
+    process_analysis_run(claimed)
+
+    run.refresh_from_db()
+    assert miniwdl_checked is False
+    assert run.status == AnalysisRun.Status.FAILED
+    assert run.error_code == "ANALYSIS_WORKFLOW_PACKAGE_UNTRUSTED"
+
+
+def test_worker_rejects_non_product_workflow_when_product_is_required(
+    settings,
+    monkeypatch,
+):
+    version = _published_fastq_workflow()
+    run = AnalysisRun.objects.create(
+        workflow_version=version,
+        workflow_name="published_fastq",
+        sample_id="NO_PRODUCT01",
+        source_bundle=version.compiled_bundle,
+        source_digest=version.compiled_digest,
+    )
+    settings.INTEGRATION_REQUIRE_ANALYSIS_PRODUCT = True
+    settings.ANALYSIS_MIN_AVAILABLE_MEMORY_GB = 0
+    miniwdl_checked = False
+
+    def unexpected_miniwdl_check(_command):
+        nonlocal miniwdl_checked
+        miniwdl_checked = True
+        return "/usr/bin/miniwdl"
+
+    monkeypatch.setattr(
+        "workflows.analysis_runtime.shutil.which",
+        unexpected_miniwdl_check,
+    )
+
+    claimed = claim_next_run()
+    assert claimed is not None and claimed.pk == run.pk
+    process_analysis_run(claimed)
+
+    run.refresh_from_db()
+    assert miniwdl_checked is False
+    assert run.status == AnalysisRun.Status.FAILED
+    assert run.error_code == "ANALYSIS_PRODUCT_REQUIRED"
+    assert run.error_category == "security"
+
+
+def test_worker_keeps_accepted_product_run_executable_after_deactivation(settings):
+    version = _published_fastq_workflow()
+    interface_contract = {
+        **version.interface_contract,
+        "outputs": [
+            {
+                "name": "copied",
+                "label": "Copied read",
+                "wdl_type": "File",
+                "semantic_type": "bio.fastq.gz.r1",
+                "required": True,
+            }
+        ],
+    }
+    WorkflowVersion.objects.filter(pk=version.pk).update(
+        interface_contract=interface_contract
+    )
+    version.interface_contract = interface_contract
+    product = AnalysisProduct.objects.create(
+        code="accepted-product",
+        name="Accepted product",
+    )
+    product_version, _ = publish_analysis_product_version(
+        product,
+        contract_version="1.0.0",
+        workflow_version=version,
+        actor="pytest",
+    )
+    run = AnalysisRun.objects.create(
+        workflow_version=version,
+        analysis_product_version=product_version,
+        workflow_name="published_fastq",
+        sample_id="ACCEPTED01",
+        source_bundle=version.compiled_bundle,
+        source_digest=version.compiled_digest,
+    )
+    product.is_active = False
+    product.save(update_fields=["is_active", "updated_at"])
+    settings.INTEGRATION_REQUIRE_ANALYSIS_PRODUCT = True
+
+    _require_trusted_analysis_source(run)
 
 
 def test_submit_refreshes_cached_fastq_identity(client, analysis_workspace):

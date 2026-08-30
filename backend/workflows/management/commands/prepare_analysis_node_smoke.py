@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
@@ -8,14 +9,31 @@ from django.db import transaction
 from compiler_core import canonical_digest
 from workflows.analysis_products import (
     AnalysisProductError,
+    attest_workflow_package,
     publish_analysis_product_version,
 )
-from workflows.models import AnalysisProduct, WorkflowDocument, WorkflowVersion
+from workflows.models import (
+    AnalysisProduct,
+    WorkflowDocument,
+    WorkflowPackageAttestation,
+    WorkflowVersion,
+)
 
 
 SMOKE_PRODUCT_CODE = "analysis-node-smoke"
 SMOKE_CONTRACT_VERSION = "1.0.0"
 DEFAULT_SMOKE_IMAGE = "bioworkflowmanage/smoke-task:1.0.0"
+SMOKE_SIGNER_IDENTITY = "analysis-node:signed-backend-image"
+
+
+def _is_pinned_image_reference(value: str) -> bool:
+    if re.search(r"@sha256:[0-9a-f]{64}$", value):
+        return True
+    final_segment = value.rsplit("/", 1)[-1]
+    if ":" not in final_segment:
+        return False
+    _, tag = final_segment.rsplit(":", 1)
+    return bool(tag and tag.casefold() != "latest")
 
 
 def smoke_workflow_snapshot(image: str) -> dict:
@@ -23,7 +41,11 @@ def smoke_workflow_snapshot(image: str) -> dict:
     wdl = f'''version 1.0
 
 task analysis_node_smoke_task {{
+  input {{
+    File probe
+  }}
   command <<<
+    grep -qx 'analysis-node-input' ~{{probe}}
     python -c "from pathlib import Path; Path('result.txt').write_text('analysis-node-ok\\n')"
   >>>
   output {{
@@ -35,7 +57,13 @@ task analysis_node_smoke_task {{
 }}
 
 workflow {workflow_name} {{
-  call analysis_node_smoke_task
+  input {{
+    File probe
+  }}
+  call analysis_node_smoke_task {{
+    input:
+      probe = probe
+  }}
   output {{
     File result = analysis_node_smoke_task.result
   }}
@@ -47,6 +75,17 @@ workflow {workflow_name} {{
         "name": "Analysis Node smoke",
         "nodes": [
             {
+                "id": "probe",
+                "type": "workflow_input",
+                "label": "Managed input probe",
+                "port": {
+                    "name": "value",
+                    "wdl_type": "File",
+                    "semantic_type": "core.file.any",
+                    "required": True,
+                },
+            },
+            {
                 "id": "smoke",
                 "type": "tool",
                 "label": "Analysis Node smoke task",
@@ -54,7 +93,7 @@ workflow {workflow_name} {{
                     "id": "analysis_node_smoke_task",
                     "tool_version": SMOKE_CONTRACT_VERSION,
                     "spec_version": "1.0.0",
-                    "digest": f"sha256:{canonical_digest({'image': image})}",
+                    "digest": canonical_digest({"image": image}),
                 },
                 "parameter_values": {},
             },
@@ -72,6 +111,11 @@ workflow {workflow_name} {{
         ],
         "edges": [
             {
+                "id": "probe-smoke",
+                "source": {"node_id": "probe", "port": "value"},
+                "target": {"node_id": "smoke", "port": "probe"},
+            },
+            {
                 "id": "smoke-result",
                 "source": {"node_id": "smoke", "port": "result"},
                 "target": {"node_id": "result", "port": "value"},
@@ -85,7 +129,15 @@ workflow {workflow_name} {{
     }
     interface = {
         "contract_version": SMOKE_CONTRACT_VERSION,
-        "inputs": [],
+        "inputs": [
+            {
+                "name": "probe",
+                "label": "Managed input probe",
+                "wdl_type": "File",
+                "semantic_type": "core.file.any",
+                "required": True,
+            }
+        ],
         "outputs": [
             {
                 "name": "result",
@@ -110,8 +162,10 @@ class Command(BaseCommand):
         image = str(
             os.environ.get("ANALYSIS_NODE_SMOKE_TASK_IMAGE", DEFAULT_SMOKE_IMAGE)
         ).strip()
-        if not image or (":" not in image and "@sha256:" not in image):
-            raise CommandError("ANALYSIS_NODE_SMOKE_TASK_IMAGE 必须固定 tag 或 digest。")
+        if not _is_pinned_image_reference(image):
+            raise CommandError(
+                "ANALYSIS_NODE_SMOKE_TASK_IMAGE 必须固定为非 latest tag 或 sha256 digest。"
+            )
         actor = str(options["actor"] or "analysis-node-installer")[:256]
         snapshot = smoke_workflow_snapshot(image)
         graph = snapshot["graph"]
@@ -167,6 +221,26 @@ class Command(BaseCommand):
             raise CommandError(
                 "现有 analysis-node-smoke WorkflowVersion 与可信快照不一致；不会覆盖。"
             )
+
+        try:
+            attest_workflow_package(
+                version,
+                verification_method=(
+                    WorkflowPackageAttestation.VerificationMethod.BUNDLED
+                ),
+                source_digest=version.compiled_digest,
+                statement_digest=canonical_digest(
+                    {
+                        "kind": "analysis-node-bundled-workflow",
+                        "snapshot": snapshot,
+                    }
+                ),
+                signature_bundle_digest="",
+                signer_identity=SMOKE_SIGNER_IDENTITY,
+                actor=actor,
+            )
+        except AnalysisProductError as error:
+            raise CommandError(f"{error.code}: {error}") from error
 
         product, _ = AnalysisProduct.objects.get_or_create(
             code=SMOKE_PRODUCT_CODE,
