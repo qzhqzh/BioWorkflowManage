@@ -541,7 +541,7 @@ def create_artifact_export(
                     )
                 return existing, False
             locked_run = (
-                AnalysisRun.objects.select_for_update()
+                AnalysisRun.objects.select_for_update(of=("self",))
                 .select_related("service_account")
                 .get(pk=run.pk)
             )
