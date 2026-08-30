@@ -1,16 +1,17 @@
 from __future__ import annotations
 
-import gzip
-import hashlib
 import json
+import os
 import re
+import stat as stat_module
 import uuid
 from pathlib import Path
 from typing import Any
 
 from django.conf import settings
 from django.db import IntegrityError, transaction
-from django.db.models import Q
+from django.db.models import IntegerField, Q
+from django.db.models.functions import Cast
 from django.http import FileResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -23,20 +24,37 @@ from .analysis_runs import (
     _catalog_resource_manifest,
     _canonical_digest,
     _compile_published_workflow,
+    _output_payload,
     _requirements,
     _run_timing_payload,
     _workflow_graph_summary,
     _workflow_interface,
     load_database_catalog,
 )
-from .analysis_runtime import _available_memory_bytes, _verify_run_resource_manifests
+from .analysis_runtime import (
+    _available_memory_bytes,
+    _failure_metadata,
+    _verify_run_resource_manifests,
+)
 from .auth_permissions import (
     IntegrationScopePermission,
     ServicePrincipal,
     require_service_scopes,
     require_service_scopes_by_method,
 )
-from .integration_outputs import _local_run_path, public_output_manifest
+from .integration_outputs import (
+    _file_identity,
+    _open_regular_readonly,
+    _read_gzip_text_lines,
+    GzipProbeLineLimitError,
+    ResourceSnapshotBudget,
+    ResourceSnapshotBudgetError,
+    ResourceSnapshotChangedError,
+    open_verified_output,
+    output_manifest_file_item_is_verified,
+    output_manifest_has_integrity_v2,
+    public_output_manifest,
+)
 from .models import (
     AnalysisRun,
     AnalysisRunEvent,
@@ -103,9 +121,9 @@ def _error_response(request, error: IntegrationAPIError) -> Response:
                 "error": {
                     "code": error.code,
                     "category": error.category,
-                    "message": str(error),
+                    "message": _public_text(error),
                     "retryable": error.retryable,
-                    "details": error.details,
+                    "details": _public_value(error.details),
                     "request_id": value,
                 }
             },
@@ -369,12 +387,31 @@ def _split_pair_type(value: str) -> tuple[str, str] | None:
     return None
 
 
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return "sha256:" + digest.hexdigest()
+def _bounded_request_sha256(
+    path: Path,
+    *,
+    expected_identity: dict[str, int],
+    snapshot_budget: ResourceSnapshotBudget,
+    containment_root: Path,
+) -> str:
+    try:
+        return snapshot_budget.file_digest(
+            path,
+            expected_identity=expected_identity,
+            containment_root=containment_root,
+        )
+    except ResourceSnapshotBudgetError as error:
+        raise IntegrationAPIError(
+            "MANAGED_RESOURCE_LIMIT_EXCEEDED",
+            str(error),
+            category="input",
+        ) from error
+    except ResourceSnapshotChangedError as error:
+        raise IntegrationAPIError(
+            "ANALYSIS_RESOURCE_CHANGED",
+            str(error),
+            category="input",
+        ) from error
 
 
 def _managed_resource(
@@ -385,11 +422,18 @@ def _managed_resource(
     semantic_type: str,
     manifests: dict[str, list[dict[str, Any]]],
     observed: list[dict[str, Any]],
+    snapshot_budget: ResourceSnapshotBudget,
 ) -> str:
     if not isinstance(value, dict):
         raise IntegrationAPIError(
             "MANAGED_RESOURCE_REQUIRED",
             f"输入 {input_name} 必须使用 root_alias + relative_path。",
+            category="input",
+        )
+    if kind == "file" and value.get("identity_digest"):
+        raise IntegrationAPIError(
+            "MANAGED_RESOURCE_DIGEST_INVALID",
+            f"输入 {input_name} 的 File 只能使用 sha256，不能使用 identity_digest。",
             category="input",
         )
     alias = str(value.get("root_alias") or "").strip()
@@ -407,38 +451,153 @@ def _managed_resource(
             f"输入 {input_name} 必须使用受管目录内的相对路径。",
             category="input",
         )
+    try:
+        snapshot_budget.claim_item()
+    except ResourceSnapshotBudgetError as error:
+        raise IntegrationAPIError(
+            "MANAGED_RESOURCE_LIMIT_EXCEEDED",
+            str(error),
+            category="input",
+        ) from error
     local_setting, execution_setting = ROOT_ALIASES[alias]
     local_root = Path(getattr(settings, local_setting)).resolve()
     execution_root = Path(getattr(settings, execution_setting)).resolve()
-    local_path = (local_root / relative).resolve()
+    local_path = local_root / relative
     try:
-        normalized = local_path.relative_to(local_root)
+        normalized = local_path.absolute().relative_to(local_root.absolute())
     except ValueError as error:
         raise IntegrationAPIError(
             "MANAGED_RESOURCE_ESCAPE",
             f"输入 {input_name} 越过受管目录。",
             category="input",
         ) from error
-    exists = local_path.is_dir() if kind == "directory" else local_path.is_file()
-    if not exists:
+    try:
+        stat = os.stat(local_path, follow_symlinks=False)
+    except OSError:
+        stat = None
+    if stat is not None and stat_module.S_ISLNK(stat.st_mode):
+        raise IntegrationAPIError(
+            "MANAGED_RESOURCE_ESCAPE",
+            f"输入 {input_name} 越过受管目录或包含符号链接。",
+            category="input",
+        )
+    expected_mode = stat_module.S_ISDIR if kind == "directory" else stat_module.S_ISREG
+    if stat is None or not expected_mode(stat.st_mode):
         raise IntegrationAPIError(
             "MANAGED_RESOURCE_MISSING",
             f"输入 {input_name} 的资源不存在：{normalized.as_posix()}",
             category="input",
             details={"root_alias": alias, "relative_path": normalized.as_posix()},
         )
-    stat = local_path.stat()
-    if kind == "file" and stat.st_size == 0:
+    observed_identity = (
+        {
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "ctime_ns": stat.st_ctime_ns,
+            "device": stat.st_dev,
+            "inode": stat.st_ino,
+        }
+        if kind == "file"
+        else {
+            "mtime_ns": stat.st_mtime_ns,
+            "ctime_ns": stat.st_ctime_ns,
+            "device": stat.st_dev,
+            "inode": stat.st_ino,
+        }
+    )
+    if kind == "file":
+        try:
+            observed_identity = snapshot_budget.file_identity(
+                local_path,
+                containment_root=local_root,
+            )
+        except (OSError, ValueError) as error:
+            raise IntegrationAPIError(
+                "MANAGED_RESOURCE_ESCAPE",
+                f"输入 {input_name} 越过受管目录或包含符号链接。",
+                category="input",
+            ) from error
+    if kind == "file" and observed_identity["size"] == 0:
         raise IntegrationAPIError(
             "MANAGED_RESOURCE_EMPTY",
             f"输入 {input_name} 的文件为空。",
             category="input",
         )
-    expected_sha256 = str(value.get("sha256") or "").strip()
-    if expected_sha256 and _file_sha256(local_path) != expected_sha256:
+    declared_digest = str(
+        (
+            value.get("identity_digest")
+            if kind == "directory"
+            else value.get("sha256")
+        )
+        or ""
+    ).strip()
+    normalized_declared_digest = declared_digest.removeprefix("sha256:")
+    if normalized_declared_digest and not re.fullmatch(
+        r"[0-9a-fA-F]{64}", normalized_declared_digest
+    ):
+        raise IntegrationAPIError(
+            "MANAGED_RESOURCE_DIGEST_INVALID",
+            f"输入 {input_name} 的摘要格式无效。",
+            category="input",
+        )
+    expected_digest = (
+        f"sha256:{normalized_declared_digest.lower()}"
+        if normalized_declared_digest
+        else ""
+    )
+    actual_digest = ""
+    if kind == "file" and expected_digest:
+        try:
+            actual_digest = _bounded_request_sha256(
+                local_path,
+                expected_identity=observed_identity,
+                snapshot_budget=snapshot_budget,
+                containment_root=local_root,
+            )
+        except IntegrationAPIError:
+            raise
+        except (OSError, ValueError) as error:
+            raise IntegrationAPIError(
+                "MANAGED_RESOURCE_UNREADABLE",
+                f"输入 {input_name} 无法读取。",
+                category="input",
+            ) from error
+        if expected_digest and actual_digest != expected_digest:
+            raise IntegrationAPIError(
+                "MANAGED_RESOURCE_DIGEST_MISMATCH",
+                f"输入 {input_name} 的 SHA-256 不一致。",
+                category="input",
+            )
+    observed_directory = None
+    if kind == "directory":
+        try:
+            observed_directory = snapshot_budget.directory_manifest(
+                local_path,
+                containment_root=local_root,
+            )
+        except ResourceSnapshotBudgetError as error:
+            raise IntegrationAPIError(
+                "MANAGED_RESOURCE_LIMIT_EXCEEDED",
+                str(error),
+                category="input",
+            ) from error
+        except ResourceSnapshotChangedError as error:
+            raise IntegrationAPIError(
+                "ANALYSIS_RESOURCE_CHANGED",
+                str(error),
+                category="input",
+            ) from error
+        except (OSError, ValueError) as error:
+            raise IntegrationAPIError(
+                "MANAGED_RESOURCE_UNSUPPORTED",
+                f"输入 {input_name} 的目录包含不受支持的节点。",
+                category="input",
+            ) from error
+        observed_identity = observed_directory["identity"]
+    if kind == "directory" and expected_digest and observed_directory["digest"] != expected_digest:
         raise IntegrationAPIError(
             "MANAGED_RESOURCE_DIGEST_MISMATCH",
-            f"输入 {input_name} 的 SHA-256 不一致。",
+            f"输入 {input_name} 的目录身份摘要不一致。",
             category="input",
         )
     manifest: dict[str, Any] = {
@@ -446,20 +605,38 @@ def _managed_resource(
         "relative_path": normalized.as_posix(),
         "kind": kind,
         "input": input_name,
-        "verification": "exists" if kind == "directory" else "identity",
+        "verification": (
+            "directory_identity_sha256"
+            if kind == "directory"
+            else "sha256"
+            if expected_digest
+            else "identity_v2"
+        ),
+        "identity": observed_identity,
     }
     if kind == "file":
         manifest.update(
             {
-                "size": stat.st_size,
-                "mtime_ns": stat.st_mtime_ns,
-                "device": stat.st_dev,
-                "inode": stat.st_ino,
+                "size": observed_identity["size"],
+                "mtime_ns": observed_identity["mtime_ns"],
+                "ctime_ns": observed_identity["ctime_ns"],
+                "device": observed_identity["device"],
+                "inode": observed_identity["inode"],
             }
         )
-        if expected_sha256:
-            manifest["sha256"] = expected_sha256
-            manifest["verification"] = "sha256"
+        if expected_digest:
+            manifest["sha256"] = actual_digest
+    else:
+        manifest.update(
+            {
+                "digest": observed_directory["digest"],
+                "entry_count": observed_directory["entry_count"],
+            }
+        )
+        if expected_digest:
+            manifest["declared_identity_digest"] = expected_digest
+        if value.get("sha256"):
+            manifest["warning"] = "legacy_directory_sha256_ignored"
     manifests[alias].append(manifest)
     observed.append(
         {
@@ -467,9 +644,11 @@ def _managed_resource(
             "semantic_type": semantic_type,
             "kind": kind,
             "path": local_path,
+            "containment_root": local_root,
+            "identity": observed_identity,
         }
     )
-    return str((execution_root / normalized).resolve())
+    return str(execution_root / normalized)
 
 
 def _coerce_input(
@@ -480,6 +659,7 @@ def _coerce_input(
     semantic_type: str,
     manifests: dict[str, list[dict[str, Any]]],
     observed: list[dict[str, Any]],
+    snapshot_budget: ResourceSnapshotBudget,
 ) -> Any:
     optional = wdl_type.endswith("?")
     normalized_type = wdl_type.removesuffix("?").strip()
@@ -493,6 +673,7 @@ def _coerce_input(
             semantic_type=semantic_type,
             manifests=manifests,
             observed=observed,
+            snapshot_budget=snapshot_budget,
         )
     if normalized_type == "Directory":
         return _managed_resource(
@@ -502,6 +683,7 @@ def _coerce_input(
             semantic_type=semantic_type,
             manifests=manifests,
             observed=observed,
+            snapshot_budget=snapshot_budget,
         )
     if normalized_type.startswith("Array[") and normalized_type.endswith("]"):
         if not isinstance(value, list):
@@ -519,6 +701,7 @@ def _coerce_input(
                 semantic_type=semantic_type,
                 manifests=manifests,
                 observed=observed,
+                snapshot_budget=snapshot_budget,
             )
             for item in value
         ]
@@ -538,6 +721,7 @@ def _coerce_input(
                 semantic_type=semantic_type,
                 manifests=manifests,
                 observed=observed,
+                snapshot_budget=snapshot_budget,
             )
             for index, side in enumerate(("left", "right"))
         }
@@ -563,7 +747,45 @@ def _coerce_input(
     return float(value) if normalized_type == "Float" else value
 
 
-def _validate_fastq(path: Path, *, expected_mate: int) -> str:
+def _snapshot_checkpoint(snapshot_budget: ResourceSnapshotBudget) -> None:
+    try:
+        snapshot_budget.checkpoint()
+    except ResourceSnapshotBudgetError as error:
+        raise IntegrationAPIError(
+            "MANAGED_RESOURCE_LIMIT_EXCEEDED",
+            str(error),
+            category="input",
+        ) from error
+
+
+def _bounded_text_line(
+    handle,
+    *,
+    path: Path,
+    snapshot_budget: ResourceSnapshotBudget,
+) -> str:
+    _snapshot_checkpoint(snapshot_budget)
+    limit = settings.ANALYSIS_INPUT_TEXT_LINE_MAX_CHARS
+    line = handle.readline(limit + 1)
+    _snapshot_checkpoint(snapshot_budget)
+    if len(line) > limit:
+        raise IntegrationAPIError(
+            "INPUT_RECORD_TOO_LARGE",
+            f"输入文件单行超过安全上限：{path.name}",
+            category="input",
+            details={"max_chars": limit},
+        )
+    return line.rstrip("\r\n")
+
+
+def _validate_fastq(
+    path: Path,
+    *,
+    expected_mate: int,
+    expected_identity: dict[str, int],
+    containment_root: Path,
+    snapshot_budget: ResourceSnapshotBudget,
+) -> str:
     if not path.name.lower().endswith((".fastq.gz", ".fq.gz")):
         raise IntegrationAPIError(
             "FASTQ_EXTENSION_INVALID",
@@ -571,18 +793,62 @@ def _validate_fastq(path: Path, *, expected_mate: int) -> str:
             category="input",
         )
     try:
-        with gzip.open(path, "rt", encoding="utf-8", errors="strict") as handle:
-            header = handle.readline().rstrip("\r\n")
-            sequence = handle.readline().rstrip("\r\n")
-            plus = handle.readline().rstrip("\r\n")
-            quality = handle.readline().rstrip("\r\n")
-    except (OSError, UnicodeError) as error:
+        _snapshot_checkpoint(snapshot_budget)
+        with _open_regular_readonly(
+            path,
+            containment_root=containment_root,
+        ) as raw_handle:
+            before = os.fstat(raw_handle.fileno())
+            if _file_identity(before) != expected_identity:
+                raise IntegrationAPIError(
+                    "ANALYSIS_RESOURCE_CHANGED",
+                    f"FASTQ 在内容校验前发生变化：{path.name}",
+                    category="input",
+                )
+            lines = _read_gzip_text_lines(
+                raw_handle,
+                line_count=4,
+                max_chars=settings.ANALYSIS_INPUT_TEXT_LINE_MAX_CHARS,
+                encoding="utf-8",
+                checkpoint=lambda: _snapshot_checkpoint(snapshot_budget),
+            )
+            header, sequence, plus, quality = lines
+            after = os.fstat(raw_handle.fileno())
+        with _open_regular_readonly(
+            path,
+            containment_root=containment_root,
+        ) as current_handle:
+            current = os.fstat(current_handle.fileno())
+        if (
+            _file_identity(after) != expected_identity
+            or _file_identity(current) != expected_identity
+        ):
+            raise IntegrationAPIError(
+                "ANALYSIS_RESOURCE_CHANGED",
+                f"FASTQ 在内容校验期间发生变化：{path.name}",
+                category="input",
+            )
+    except IntegrationAPIError:
+        raise
+    except GzipProbeLineLimitError as error:
+        raise IntegrationAPIError(
+            "INPUT_RECORD_TOO_LARGE",
+            f"输入文件单行超过安全上限：{path.name}",
+            category="input",
+            details={"max_chars": settings.ANALYSIS_INPUT_TEXT_LINE_MAX_CHARS},
+        ) from error
+    except (OSError, UnicodeError, ValueError) as error:
         raise IntegrationAPIError(
             "FASTQ_GZIP_INVALID",
             f"FASTQ gzip 内容无效：{path.name}",
             category="input",
         ) from error
-    if not header.startswith("@") or not sequence or not plus.startswith("+"):
+    if (
+        not header.startswith("@")
+        or not header[1:].split()
+        or not sequence
+        or not plus.startswith("+")
+    ):
         raise IntegrationAPIError(
             "FASTQ_RECORD_INVALID",
             f"FASTQ 首条记录结构无效：{path.name}",
@@ -614,18 +880,77 @@ def _validate_fastq(path: Path, *, expected_mate: int) -> str:
     return read_id
 
 
-def _validate_fasta(path: Path) -> None:
-    opener = gzip.open if path.name.lower().endswith(".gz") else open
+def _validate_fasta(
+    path: Path,
+    *,
+    expected_identity: dict[str, int],
+    containment_root: Path,
+    snapshot_budget: ResourceSnapshotBudget,
+) -> None:
     try:
-        with opener(path, "rt", encoding="utf-8", errors="strict") as handle:
-            first = handle.readline()
-    except (OSError, UnicodeError) as error:
+        _snapshot_checkpoint(snapshot_budget)
+        with _open_regular_readonly(
+            path,
+            containment_root=containment_root,
+        ) as raw_handle:
+            before = os.fstat(raw_handle.fileno())
+            if _file_identity(before) != expected_identity:
+                raise IntegrationAPIError(
+                    "ANALYSIS_RESOURCE_CHANGED",
+                    f"FASTA 在内容校验前发生变化：{path.name}",
+                    category="input",
+                )
+            if path.name.lower().endswith(".gz"):
+                first_line = _read_gzip_text_lines(
+                    raw_handle,
+                    line_count=1,
+                    max_chars=settings.ANALYSIS_INPUT_TEXT_LINE_MAX_CHARS,
+                    encoding="utf-8",
+                    checkpoint=lambda: _snapshot_checkpoint(snapshot_budget),
+                )[0]
+            else:
+                first = raw_handle.readline(
+                    settings.ANALYSIS_INPUT_TEXT_LINE_MAX_CHARS + 1
+                )
+                _snapshot_checkpoint(snapshot_budget)
+                if len(first) > settings.ANALYSIS_INPUT_TEXT_LINE_MAX_CHARS:
+                    raise IntegrationAPIError(
+                        "INPUT_RECORD_TOO_LARGE",
+                        f"输入文件单行超过安全上限：{path.name}",
+                        category="input",
+                    )
+                first_line = first.decode("utf-8", errors="strict").rstrip("\r\n")
+            after = os.fstat(raw_handle.fileno())
+        with _open_regular_readonly(
+            path,
+            containment_root=containment_root,
+        ) as current_handle:
+            current = os.fstat(current_handle.fileno())
+        if (
+            _file_identity(after) != expected_identity
+            or _file_identity(current) != expected_identity
+        ):
+            raise IntegrationAPIError(
+                "ANALYSIS_RESOURCE_CHANGED",
+                f"FASTA 在内容校验期间发生变化：{path.name}",
+                category="input",
+            )
+    except IntegrationAPIError:
+        raise
+    except GzipProbeLineLimitError as error:
+        raise IntegrationAPIError(
+            "INPUT_RECORD_TOO_LARGE",
+            f"输入文件单行超过安全上限：{path.name}",
+            category="input",
+            details={"max_chars": settings.ANALYSIS_INPUT_TEXT_LINE_MAX_CHARS},
+        ) from error
+    except (OSError, UnicodeError, ValueError) as error:
         raise IntegrationAPIError(
             "FASTA_CONTENT_INVALID",
             f"FASTA 内容无法读取：{path.name}",
             category="input",
         ) from error
-    if not first.startswith(">"):
+    if not first_line.startswith(">"):
         raise IntegrationAPIError(
             "FASTA_CONTENT_INVALID",
             f"FASTA 第一行缺少 > header：{path.name}",
@@ -633,20 +958,46 @@ def _validate_fasta(path: Path) -> None:
         )
 
 
-def _content_checks(observed: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _content_checks(
+    observed: list[dict[str, Any]],
+    *,
+    snapshot_budget: ResourceSnapshotBudget,
+) -> list[dict[str, Any]]:
     reads: dict[int, list[str]] = {1: [], 2: []}
     checked = []
     for item in observed:
+        _snapshot_checkpoint(snapshot_budget)
         semantic = item["semantic_type"]
         path = item["path"]
         if semantic == "bio.fastq.gz.r1":
-            reads[1].append(_validate_fastq(path, expected_mate=1))
+            reads[1].append(
+                _validate_fastq(
+                    path,
+                    expected_mate=1,
+                    expected_identity=item["identity"],
+                    containment_root=item["containment_root"],
+                    snapshot_budget=snapshot_budget,
+                )
+            )
             checked.append({"input": item["input"], "check": "fastq_r1", "ready": True})
         elif semantic == "bio.fastq.gz.r2":
-            reads[2].append(_validate_fastq(path, expected_mate=2))
+            reads[2].append(
+                _validate_fastq(
+                    path,
+                    expected_mate=2,
+                    expected_identity=item["identity"],
+                    containment_root=item["containment_root"],
+                    snapshot_budget=snapshot_budget,
+                )
+            )
             checked.append({"input": item["input"], "check": "fastq_r2", "ready": True})
         elif item["kind"] == "file" and "fasta" in semantic.casefold():
-            _validate_fasta(path)
+            _validate_fasta(
+                path,
+                expected_identity=item["identity"],
+                containment_root=item["containment_root"],
+                snapshot_budget=snapshot_budget,
+            )
             checked.append({"input": item["input"], "check": "fasta", "ready": True})
     if reads[1] or reads[2]:
         if len(reads[1]) != len(reads[2]) or reads[1] != reads[2]:
@@ -666,6 +1017,7 @@ def _prepare_contract_inputs(
     *,
     workflow_name: str,
     input_keys: dict[str, str] | None = None,
+    snapshot_budget: ResourceSnapshotBudget | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
     if not isinstance(raw_inputs, dict):
         raise IntegrationAPIError("INPUTS_INVALID", "inputs 必须是 JSON object。", category="input")
@@ -679,6 +1031,7 @@ def _prepare_contract_inputs(
             details={"inputs": unknown},
         )
     manifests: dict[str, list[dict[str, Any]]] = {"rawdata": [], "database": []}
+    snapshot_budget = snapshot_budget or ResourceSnapshotBudget()
     observed: list[dict[str, Any]] = []
     values: dict[str, Any] = {}
     for name, port in by_name.items():
@@ -702,6 +1055,7 @@ def _prepare_contract_inputs(
             semantic_type=str(port.get("semantic_type") or "core.value.unknown"),
             manifests=manifests,
             observed=observed,
+            snapshot_budget=snapshot_budget,
         )
         try:
             _validate_constraints(port, value)
@@ -713,7 +1067,10 @@ def _prepare_contract_inputs(
             ) from error
         key = input_keys[name] if input_keys else name
         values[f"{workflow_name}.{key}"] = value
-    content_checks = _content_checks(observed)
+    content_checks = _content_checks(
+        observed,
+        snapshot_budget=snapshot_budget,
+    )
     resource_manifests = {
         "input_resource_manifest": (
             {"schema_version": 1, "files": manifests["rawdata"]}
@@ -729,11 +1086,16 @@ def _prepare_contract_inputs(
     return values, resource_manifests, content_checks
 
 
-def _declared_resources(version: WorkflowVersion) -> dict[str, Any]:
+def _declared_resources(
+    version: WorkflowVersion,
+    *,
+    snapshot_budget: ResourceSnapshotBudget | None = None,
+) -> dict[str, Any]:
     resources = version.interface_contract.get("resources") or []
     if not resources:
         return {"database_resource_manifest": None, "checks": []}
     manifests = {"rawdata": [], "database": []}
+    snapshot_budget = snapshot_budget or ResourceSnapshotBudget()
     observed: list[dict[str, Any]] = []
     for index, resource in enumerate(resources, 1):
         if not isinstance(resource, dict):
@@ -757,6 +1119,7 @@ def _declared_resources(version: WorkflowVersion) -> dict[str, Any]:
             semantic_type=str(resource.get("semantic_type") or "core.resource"),
             manifests=manifests,
             observed=observed,
+            snapshot_budget=snapshot_budget,
         )
     return {
         "database_resource_manifest": (
@@ -800,6 +1163,8 @@ def _catalog_entry(
 def _catalog_resources(
     version: WorkflowVersion,
     body: dict[str, Any],
+    *,
+    snapshot_budget: ResourceSnapshotBudget | None = None,
 ) -> dict[str, Any]:
     contract = version.interface_contract.get("database") or {}
     if not isinstance(contract, dict):
@@ -887,13 +1252,22 @@ def _catalog_resources(
             category="resource",
             details={"reference_id": reference_id, "panel_id": panel_id},
         )
-    missing = [
-        item
-        for entry in (reference, panel)
-        if entry is not None
-        for item in _requirements(entry)
-        if not item["present"]
-    ]
+    snapshot_budget = snapshot_budget or ResourceSnapshotBudget()
+    try:
+        missing = [
+            item
+            for entry in (reference, panel)
+            if entry is not None
+            for item in _requirements(entry, snapshot_budget=snapshot_budget)
+            if not item["present"]
+        ]
+    except AnalysisInputError as error:
+        raise IntegrationAPIError(
+            error.code,
+            str(error),
+            category="resource",
+            details=error.details,
+        ) from error
     if missing:
         raise IntegrationAPIError(
             "ANALYSIS_DATABASE_INCOMPLETE",
@@ -909,18 +1283,32 @@ def _catalog_resources(
         },
     }
     checks = []
-    if reference is not None:
-        manifest = _catalog_resource_manifest(reference)
-        manifests["reference_resource_manifest"] = manifest
-        manifests["reference_digest"] = _canonical_digest(manifest)
-        checks.append(
-            {"check": "database_reference", "ready": True, "id": reference_id}
-        )
-    if panel is not None:
-        manifest = _catalog_resource_manifest(panel)
-        manifests["panel_resource_manifest"] = manifest
-        manifests["panel_digest"] = _canonical_digest(manifest)
-        checks.append({"check": "database_panel", "ready": True, "id": panel_id})
+    try:
+        if reference is not None:
+            manifest = _catalog_resource_manifest(
+                reference,
+                snapshot_budget=snapshot_budget,
+            )
+            manifests["reference_resource_manifest"] = manifest
+            manifests["reference_digest"] = _canonical_digest(manifest)
+            checks.append(
+                {"check": "database_reference", "ready": True, "id": reference_id}
+            )
+        if panel is not None:
+            manifest = _catalog_resource_manifest(
+                panel,
+                snapshot_budget=snapshot_budget,
+            )
+            manifests["panel_resource_manifest"] = manifest
+            manifests["panel_digest"] = _canonical_digest(manifest)
+            checks.append({"check": "database_panel", "ready": True, "id": panel_id})
+    except AnalysisInputError as error:
+        raise IntegrationAPIError(
+            error.code,
+            str(error),
+            category="resource",
+            details=error.details,
+        ) from error
     return {"manifests": manifests, "checks": checks}
 
 
@@ -942,13 +1330,19 @@ def _workflow_output_contract(version: WorkflowVersion) -> list[dict[str, Any]]:
 def _preflight_workflow(body: dict[str, Any]) -> dict[str, Any]:
     version = _fixed_workflow(body.get("workflow"))
     workflow_name = str(version.workflow_graph.get("id") or version.workflow.slug)
+    snapshot_budget = ResourceSnapshotBudget()
     input_values, manifests, content_checks = _prepare_contract_inputs(
         _workflow_interface(version),
         body.get("inputs") or {},
         workflow_name=workflow_name,
+        snapshot_budget=snapshot_budget,
     )
-    declared = _declared_resources(version)
-    catalog = _catalog_resources(version, body)
+    declared = _declared_resources(version, snapshot_budget=snapshot_budget)
+    catalog = _catalog_resources(
+        version,
+        body,
+        snapshot_budget=snapshot_budget,
+    )
     if declared["database_resource_manifest"]:
         existing = manifests.get("database_resource_manifest") or {
             "schema_version": 1,
@@ -1030,11 +1424,13 @@ def _preflight_tool(body: dict[str, Any]) -> dict[str, Any]:
             str(error),
             category="workflow",
         ) from error
+    snapshot_budget = ResourceSnapshotBudget()
     input_values, manifests, content_checks = _prepare_contract_inputs(
         item.tool_spec.get("inputs", []),
         body.get("inputs") or {},
         workflow_name="tool_test",
         input_keys=input_nodes,
+        snapshot_budget=snapshot_budget,
     )
     return {
         "tool_version": item,
@@ -1091,7 +1487,14 @@ def _public_value(value: Any) -> Any:
     return value
 
 
-def integration_run_payload(run: AnalysisRun) -> dict[str, Any]:
+def integration_run_payload(
+    run: AnalysisRun,
+    *,
+    include_outputs: bool = True,
+    include_task_timing: bool = True,
+    include_error_details: bool = True,
+    attempt: int | None = None,
+) -> dict[str, Any]:
     if run.workflow_version_id:
         source = {
             "source_type": "workflow_version",
@@ -1108,6 +1511,17 @@ def integration_run_payload(run: AnalysisRun) -> dict[str, Any]:
             "tool_digest": run.tool_version.digest,
             "source_digest": run.source_digest,
         }
+    error = _integration_error(run) if include_error_details else None
+    if not include_error_details and run.error_code:
+        error = {
+            "code": run.error_code,
+            "message": "运行失败；请读取任务详情。",
+            "category": run.error_category,
+            "retryable": run.error_retryable,
+            "details": {},
+        }
+    if attempt is None:
+        attempt = int(run.request_payload.get("attempt") or 1)
     return {
         "id": str(run.id),
         "external_ref": {
@@ -1123,12 +1537,15 @@ def integration_run_payload(run: AnalysisRun) -> dict[str, Any]:
         "output_status": run.output_status,
         "progress": run.progress,
         "current_step": run.current_step,
-        "attempt": int(run.request_payload.get("attempt") or 1),
+        "attempt": attempt,
         "retry_of": str(run.retry_of_id) if run.retry_of_id else None,
         "actor": run.actor,
-        "error": _integration_error(run),
-        "outputs": public_output_manifest(run),
-        "timing": _run_timing_payload(run),
+        "error": error,
+        "outputs": public_output_manifest(run) if include_outputs else [],
+        "timing": _run_timing_payload(
+            run,
+            include_task_timing=include_task_timing,
+        ),
         "created_at": run.created_at,
         "started_at": run.started_at,
         "finished_at": run.finished_at,
@@ -1236,10 +1653,50 @@ def integration_preflight(request):
 @permission_classes([IntegrationScopePermission])
 def integration_analysis_runs(request):
     if request.method == "GET":
-        queryset = _visible_runs(request).filter(run_kind=AnalysisRun.Kind.WORKFLOW)
+        queryset = (
+            _visible_runs(request)
+            .filter(run_kind=AnalysisRun.Kind.WORKFLOW)
+            .annotate(
+                list_attempt=Cast(
+                    "request_payload__attempt",
+                    output_field=IntegerField(),
+                )
+            )
+            .defer(
+                "outputs",
+                "output_manifest",
+                "request_payload",
+                "input_values",
+                "source_bundle",
+                "error",
+                "error_details",
+                "work_directory",
+                "workflow_version__workflow_graph",
+                "workflow_version__editor_document",
+                "workflow_version__tool_specs",
+                "workflow_version__compiled_bundle",
+                "workflow_version__interface_contract",
+                "workflow_version__subworkflow_references",
+                "tool_version__tool_spec",
+            )
+        )
         if request.query_params.get("active") == "1":
             queryset = queryset.exclude(status__in=TERMINAL_STATUSES)
-        return Response({"results": [integration_run_payload(run) for run in queryset[:200]]})
+        return Response(
+            {
+                "view": "summary",
+                "results": [
+                    integration_run_payload(
+                        run,
+                        include_outputs=False,
+                        include_task_timing=False,
+                        include_error_details=False,
+                        attempt=int(run.list_attempt or 1),
+                    )
+                    for run in queryset[:200]
+                ]
+            }
+        )
     try:
         body = dict(request.data)
         external = _external_ref(body.get("external_ref"))
@@ -1459,12 +1916,24 @@ def integration_analysis_run_retry(request, run_id):
         if existing is not None:
             return _idempotent_response(request, existing, digest)
         try:
-            _verify_run_resource_manifests(original)
-        except RuntimeError as error:
+            _verify_run_resource_manifests(
+                original,
+                snapshot_budget=ResourceSnapshotBudget(),
+            )
+        except ResourceSnapshotBudgetError as error:
             raise IntegrationAPIError(
-                "ANALYSIS_RESOURCE_CHANGED",
+                "MANAGED_RESOURCE_LIMIT_EXCEEDED",
                 str(error),
                 category="resource",
+                details={"retry_of": str(original.id)},
+                http_status=status.HTTP_409_CONFLICT,
+            ) from error
+        except RuntimeError as error:
+            failure = _failure_metadata(str(error))
+            raise IntegrationAPIError(
+                str(failure["code"]),
+                str(error),
+                category=str(failure["category"]),
                 details={"retry_of": str(original.id)},
                 http_status=status.HTTP_409_CONFLICT,
             ) from error
@@ -1545,14 +2014,47 @@ def integration_analysis_run_outputs(request, run_id):
 def integration_analysis_run_output_download(request, run_id):
     run = get_object_or_404(_visible_runs(request), pk=run_id)
     key = str(request.query_params.get("key") or "")
+    manifest = run.output_manifest if isinstance(run.output_manifest, dict) else {}
+    has_integrity_v2 = output_manifest_has_integrity_v2(manifest)
+    items = manifest.get("items")
+    if has_integrity_v2 and not isinstance(items, list):
+        return _error_response(
+            request,
+            IntegrationAPIError(
+                "ANALYSIS_OUTPUT_UNVERIFIED",
+                "输出完整性清单无效，无法安全下载。",
+                category="resource",
+                http_status=status.HTTP_409_CONFLICT,
+            ),
+        )
+    safe_items = items if isinstance(items, list) else []
     item = next(
         (
             value
-            for value in run.output_manifest.get("items", [])
-            if isinstance(value, dict) and value.get("kind") == "file" and value.get("key") == key
+            for value in safe_items
+            if isinstance(value, dict) and value.get("key") == key
         ),
         None,
     )
+    if not has_integrity_v2:
+        legacy_output = next(
+            (
+                value
+                for value in _output_payload(run)
+                if value.get("kind") == "file" and value.get("key") == key
+            ),
+            None,
+        )
+        if legacy_output is not None:
+            return _error_response(
+                request,
+                IntegrationAPIError(
+                    "ANALYSIS_OUTPUT_UNVERIFIED",
+                    "历史输出缺少完整性清单，无法安全下载。",
+                    category="resource",
+                    http_status=status.HTTP_409_CONFLICT,
+                ),
+            )
     if item is None:
         return _error_response(
             request,
@@ -1563,22 +2065,52 @@ def integration_analysis_run_output_download(request, run_id):
                 http_status=status.HTTP_404_NOT_FOUND,
             ),
         )
-    try:
-        root = Path(settings.ANALYSIS_RUN_ROOT).resolve()
-        path = _local_run_path(str(item["path"]))
-        path.relative_to(root)
-        stat = path.stat()
-        identity = item.get("identity") or {}
-        actual = (stat.st_size, stat.st_mtime_ns, stat.st_dev, stat.st_ino)
-        expected = (
-            identity.get("size"),
-            identity.get("mtime_ns"),
-            identity.get("device"),
-            identity.get("inode"),
+    if not has_integrity_v2:
+        return _error_response(
+            request,
+            IntegrationAPIError(
+                "ANALYSIS_OUTPUT_UNVERIFIED",
+                "历史输出缺少完整性清单，无法安全下载。",
+                category="resource",
+                http_status=status.HTTP_409_CONFLICT,
+            ),
         )
-        if actual != expected or _file_sha256(path) != item.get("sha256"):
-            raise ValueError
-    except (OSError, ValueError):
+    if item.get("kind") == "unverifiable":
+        return _error_response(
+            request,
+            IntegrationAPIError(
+                "ANALYSIS_OUTPUT_INCOMPLETE",
+                "输出项未完成或完整性清单无效，无法安全下载。",
+                category="resource",
+                http_status=status.HTTP_409_CONFLICT,
+            ),
+        )
+    if item.get("kind") != "file":
+        return _error_response(
+            request,
+            IntegrationAPIError(
+                "ANALYSIS_OUTPUT_NOT_FOUND",
+                "输出文件不存在。",
+                category="application",
+                http_status=status.HTTP_404_NOT_FOUND,
+            ),
+        )
+    if not output_manifest_file_item_is_verified(item):
+        return _error_response(
+            request,
+            IntegrationAPIError(
+                "ANALYSIS_OUTPUT_UNVERIFIED",
+                "输出项完整性清单无效，无法安全下载。",
+                category="resource",
+                http_status=status.HTTP_409_CONFLICT,
+            ),
+        )
+    try:
+        path, handle = open_verified_output(
+            item,
+            run_root=run.work_directory,
+        )
+    except (KeyError, OSError, TypeError, ValueError):
         return _error_response(
             request,
             IntegrationAPIError(
@@ -1588,12 +2120,14 @@ def integration_analysis_run_output_download(request, run_id):
                 http_status=status.HTTP_409_CONFLICT,
             ),
         )
-    return FileResponse(
-        path.open("rb"),
+    response = FileResponse(
+        handle,
         as_attachment=True,
         filename=str(item.get("filename") or path.name),
         content_type=str(item.get("content_type") or "application/octet-stream"),
     )
+    response["ETag"] = f'"{str(item["sha256"]).removeprefix("sha256:")}"'
+    return response
 
 
 @require_service_scopes("analysis:read")

@@ -7,8 +7,7 @@ def allow_django_test_client_host(settings):
         settings.ALLOWED_HOSTS = [*settings.ALLOWED_HOSTS, "testserver"]
 
 
-@pytest.fixture(autouse=True)
-def disable_auth_for_existing_api_contracts(settings):
-    """Keep legacy API tests focused; auth tests opt in explicitly."""
-
+@pytest.fixture
+def auth_disabled(settings):
+    """Explicitly isolate API contract tests that are not authentication tests."""
     settings.AUTH_REQUIRED = False

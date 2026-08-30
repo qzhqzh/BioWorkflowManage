@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+from datetime import timedelta
 from importlib import import_module
+import re
 
 import pytest
 from django.apps import apps
@@ -8,7 +11,12 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.core.management import call_command
 from django.core.management.base import CommandError
+from django.utils import timezone
 from rest_framework.test import APIClient
+
+import workflows.urls as workflow_urls
+from workflows.auth_views import LoginRateThrottle
+from workflows.models import LoginRateLimitBucket
 
 
 DEFAULT_USERNAMES = (
@@ -40,9 +48,251 @@ def test_health_and_csrf_are_public_when_authentication_is_required(settings):
     csrf = client.get("/api/v1/auth/csrf")
 
     assert health.status_code == 200
+    ready = client.get("/api/v1/ready")
+    assert ready.status_code == 200
     assert csrf.status_code == 200
     assert csrf.data["csrf_token"]
     assert "csrftoken" in csrf.cookies
+
+
+@pytest.mark.django_db
+def test_login_requires_csrf_token_when_csrf_checks_are_enabled(settings, seeded_users):
+    settings.AUTH_REQUIRED = True
+    client = APIClient(enforce_csrf_checks=True)
+
+    csrf = client.get("/api/v1/auth/csrf")
+    token = csrf.cookies["csrftoken"].value
+    body = {"username": "zhuqin", "password": "zhuqin"}
+
+    missing = client.post("/api/v1/auth/login", body, format="json")
+    assert missing.status_code == 403
+    assert missing["Content-Type"].startswith("application/json")
+    assert missing.json()["error"] == {
+        "code": "AUTH_CSRF_FAILED",
+        "message": "CSRF 校验失败，请刷新页面后重试。",
+        "request_id": missing["X-Request-ID"],
+    }
+
+    logged_in = client.post(
+        "/api/v1/auth/login",
+        body,
+        format="json",
+        HTTP_X_CSRFTOKEN=token,
+    )
+    assert logged_in.status_code == 200
+    assert logged_in.data["user"]["username"] == "zhuqin"
+
+
+@pytest.mark.django_db
+def test_auth_cookies_are_secure_when_https_flags_are_enabled(
+    settings, seeded_users
+):
+    settings.AUTH_REQUIRED = True
+    settings.SESSION_COOKIE_SECURE = True
+    settings.CSRF_COOKIE_SECURE = True
+    client = APIClient(enforce_csrf_checks=True)
+
+    csrf = client.get("/api/v1/auth/csrf", secure=True)
+    token = csrf.cookies["csrftoken"].value
+    logged_in = client.post(
+        "/api/v1/auth/login",
+        {"username": "zhuqin", "password": "zhuqin"},
+        format="json",
+        secure=True,
+        HTTP_X_CSRFTOKEN=token,
+        HTTP_REFERER="https://testserver/api/v1/auth/login",
+    )
+
+    assert logged_in.status_code == 200
+    assert csrf.cookies["csrftoken"]["secure"] is True
+    assert logged_in.cookies["sessionid"]["secure"] is True
+
+
+@pytest.mark.django_db
+def test_login_attempts_are_rate_limited(settings, monkeypatch):
+    settings.AUTH_REQUIRED = True
+    monkeypatch.setattr(
+        LoginRateThrottle,
+        "THROTTLE_RATES",
+        {"login": "2/min"},
+    )
+    LoginRateThrottle.cache.clear()
+    client = APIClient()
+    request = {"username": "missing", "password": "wrong"}
+
+    first = client.post(
+        "/api/v1/auth/login",
+        request,
+        format="json",
+        REMOTE_ADDR="198.51.100.24",
+    )
+    second = client.post(
+        "/api/v1/auth/login",
+        request,
+        format="json",
+        REMOTE_ADDR="198.51.100.24",
+    )
+    assert LoginRateLimitBucket.objects.get().request_count == 2
+    # Clearing a process-local DRF cache must not reset the shared DB bucket.
+    LoginRateThrottle.cache.clear()
+    limited = client.post(
+        "/api/v1/auth/login",
+        request,
+        format="json",
+        REMOTE_ADDR="198.51.100.24",
+    )
+    LoginRateThrottle.cache.clear()
+
+    assert first.status_code == 401
+    assert second.status_code == 401
+    assert limited.status_code == 429
+    assert limited.data["error"] == {
+        "code": "AUTH_RATE_LIMITED",
+        "message": "登录尝试过于频繁，请稍后重试。",
+        "request_id": limited["X-Request-ID"],
+    }
+
+
+@pytest.mark.django_db
+def test_login_throttle_prunes_expired_shared_buckets(settings, monkeypatch):
+    settings.AUTH_REQUIRED = True
+    settings.LOGIN_THROTTLE_RETENTION_DAYS = 7
+    monkeypatch.setattr(
+        "workflows.auth_views._login_throttle_next_prune_monotonic",
+        0.0,
+    )
+    stale = LoginRateLimitBucket.objects.create(
+        key="f" * 64,
+        window_started_at=timezone.now() - timedelta(days=8),
+        request_count=1,
+    )
+    LoginRateLimitBucket.objects.filter(pk=stale.pk).update(
+        updated_at=timezone.now() - timedelta(days=8)
+    )
+
+    response = APIClient().post(
+        "/api/v1/auth/login",
+        {"username": "missing", "password": "wrong"},
+        format="json",
+        REMOTE_ADDR="198.51.100.99",
+    )
+
+    assert response.status_code == 401
+    assert not LoginRateLimitBucket.objects.filter(pk=stale.pk).exists()
+
+
+@pytest.mark.django_db
+def test_login_throttle_samples_time_after_acquiring_bucket_lock(
+    settings, monkeypatch
+):
+    settings.AUTH_REQUIRED = True
+    monkeypatch.setattr(
+        LoginRateThrottle,
+        "THROTTLE_RATES",
+        {"login": "2/min"},
+    )
+    remote_address = "198.51.100.42"
+    key = hashlib.sha256(f"login:{remote_address}".encode()).hexdigest()
+    window_started_at = timezone.now()
+    LoginRateLimitBucket.objects.create(
+        key=key,
+        window_started_at=window_started_at,
+        request_count=2,
+    )
+    calls = 0
+
+    def lock_wait_clock():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return window_started_at - timedelta(seconds=1)
+        return window_started_at + timedelta(seconds=1)
+
+    monkeypatch.setattr("workflows.auth_views.timezone.now", lock_wait_clock)
+
+    response = APIClient().post(
+        "/api/v1/auth/login",
+        {"username": "missing", "password": "wrong"},
+        format="json",
+        REMOTE_ADDR=remote_address,
+    )
+
+    assert response.status_code == 429
+    assert LoginRateLimitBucket.objects.get(pk=key).request_count == 2
+
+
+@pytest.mark.django_db
+def test_login_throttle_ignores_untrusted_forwarded_for_prefixes(
+    settings, monkeypatch
+):
+    settings.AUTH_REQUIRED = True
+    monkeypatch.setattr(
+        LoginRateThrottle,
+        "THROTTLE_RATES",
+        {"login": "2/min"},
+    )
+    LoginRateThrottle.cache.clear()
+    client = APIClient()
+    request = {"username": "missing", "password": "wrong"}
+    headers = {
+        "REMOTE_ADDR": "172.20.0.10",
+        "HTTP_X_FORWARDED_FOR": "{forged}, 198.51.100.24",
+    }
+
+    responses = [
+        client.post(
+            "/api/v1/auth/login",
+            request,
+            format="json",
+            **{
+                key: value.format(forged=f"203.0.113.{index}")
+                for key, value in headers.items()
+            },
+        )
+        for index in range(1, 4)
+    ]
+    LoginRateThrottle.cache.clear()
+
+    assert [response.status_code for response in responses] == [401, 401, 429]
+
+
+def _concrete_route(route: str) -> str:
+    values = {
+        "uuid": "00000000-0000-4000-8000-000000000000",
+        "int": "1",
+        "slug": "missing",
+        "str": "missing",
+        "path": "missing",
+    }
+
+    def replace(match):
+        converter = match.group("converter") or "str"
+        return values[converter]
+
+    return re.sub(
+        r"<(?:(?P<converter>[^:>]+):)?[^>]+>",
+        replace,
+        route,
+    )
+
+
+@pytest.mark.django_db
+def test_auth_permission_matrix_rejects_anonymous_access(settings):
+    settings.AUTH_REQUIRED = True
+    client = APIClient()
+    public_routes = {"health", "ready", "auth/csrf", "auth/login", "integration/openapi"}
+
+    protected_routes = [
+        pattern.pattern._route
+        for pattern in workflow_urls.urlpatterns
+        if hasattr(pattern.pattern, "_route")
+        and pattern.pattern._route not in public_routes
+    ]
+
+    assert protected_routes
+    for route in protected_routes:
+        response = client.get(f"/api/v1/{_concrete_route(route)}")
+        assert response.status_code == 401, route
 
 
 @pytest.mark.django_db

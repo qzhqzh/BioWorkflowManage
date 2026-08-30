@@ -20,6 +20,33 @@ const events = computed(() => [...(props.run?.events ?? [])].reverse().slice(0, 
 const timing = computed(() => props.run?.timing)
 const graphSummary = computed(() => props.run?.workflow.graph_summary)
 const taskTimings = computed(() => timing.value?.tasks ?? [])
+const outputIncomplete = computed(() => (
+  props.run?.status === 'succeeded' && props.run.output_status === 'incomplete'
+))
+const runStatusLabel = computed(() => (
+  outputIncomplete.value ? '输出不完整' : statusLabels[props.run?.status ?? 'queued']
+))
+const outputErrorDetails = computed(() => {
+  const details = props.run?.error_details
+  if (!details || !Object.keys(details).length) return ''
+  const describe = (value: unknown) => {
+    if (typeof value === 'string') return value
+    if (value && typeof value === 'object') {
+      const item = value as Record<string, unknown>
+      const key = String(item.key ?? item.name ?? '<unknown>')
+      return item.reason ? `${key} (${String(item.reason)})` : key
+    }
+    return String(value)
+  }
+  const lines: string[] = []
+  if (Array.isArray(details.missing) && details.missing.length) {
+    lines.push(`缺失：${details.missing.map(describe).join('、')}`)
+  }
+  if (Array.isArray(details.unverifiable) && details.unverifiable.length) {
+    lines.push(`无法验证：${details.unverifiable.map(describe).join('、')}`)
+  }
+  return lines.join('\n')
+})
 const timingScale = computed(() => Math.max(
   timing.value?.execution_seconds ?? 0,
   ...taskTimings.value.map(task => task.offset_seconds + task.duration_seconds),
@@ -93,8 +120,8 @@ function taskBarStyle(offset: number, duration: number) {
           <h2>{{ run.sample_id }}</h2>
           <p>{{ run.request.dataset_name }}<template v-if="run.request.control_dataset_name"> + {{ run.request.control_dataset_name }}</template></p>
         </div>
-        <span class="analysis-run-status" :class="`analysis-run-status--${run.status}`">
-          {{ statusLabels[run.status] }}
+        <span class="analysis-run-status" :class="`analysis-run-status--${outputIncomplete ? 'incomplete' : run.status}`">
+          {{ runStatusLabel }}
         </span>
       </header>
 
@@ -139,9 +166,10 @@ function taskBarStyle(offset: number, duration: number) {
         </div>
       </details>
 
-      <div v-if="run.error" class="analysis-run-error" role="alert">
-        <strong>{{ run.status === 'canceled' ? '运行已取消' : '运行失败' }}</strong>
+      <div v-if="run.error" class="analysis-run-error" :class="{ 'is-output-incomplete': outputIncomplete }" role="alert">
+        <strong>{{ run.status === 'canceled' ? '运行已取消' : outputIncomplete ? '执行完成，但输出不完整' : '运行失败' }}</strong>
         <pre>{{ run.error }}</pre>
+        <pre v-if="outputErrorDetails">{{ outputErrorDetails }}</pre>
       </div>
 
       <section v-if="timing && (run.started_at || taskTimings.length)" class="analysis-result-section analysis-timing-section">
@@ -200,14 +228,16 @@ function taskBarStyle(offset: number, duration: number) {
               <strong>{{ output.name || output.key }}</strong>
               <code>{{ output.key }}</code>
             </div>
-            <span v-if="output.kind === 'file'">{{ output.size_label }}</span>
+            <span v-if="output.kind === 'file'">{{ output.size_label || '不可下载' }}</span>
+            <span v-else-if="output.kind === 'directory'">{{ output.entry_count ?? 0 }} 项</span>
             <a
               v-if="output.kind === 'file' && output.download_url"
               class="button button--ghost button-link"
               :href="output.download_url"
               download
             >下载</a>
-            <pre v-else>{{ displayValue(output.value) }}</pre>
+            <pre v-else-if="output.kind === 'value'">{{ displayValue(output.value) }}</pre>
+            <pre v-else>{{ output.reason || '该输出无法验证。' }}</pre>
           </div>
         </div>
         <p v-else class="analysis-section-empty">

@@ -16,6 +16,9 @@ from workflows.analysis_runs import _annotation_reference_entry
 from workflows.models import ToolDocument, ToolVersion, WorkflowVersion
 
 
+pytestmark = pytest.mark.usefixtures("auth_disabled")
+
+
 def annosnv_source_spec():
     return {
         "schema_version": "1.0.0",

@@ -8,6 +8,9 @@ from compiler_core import canonical_digest
 from workflows.models import ToolDocument, WDLAuditEvent, WDLAsset
 
 
+pytestmark = pytest.mark.usefixtures("auth_disabled")
+
+
 TASK_WDL = """version 1.0
 
 task Hello {

@@ -287,6 +287,15 @@ class ServiceToken(models.Model):
         ordering = ["-created_at", "-id"]
 
 
+class LoginRateLimitBucket(models.Model):
+    """Shared fixed-window login throttle state for all web workers."""
+
+    key = models.CharField(max_length=64, primary_key=True)
+    window_started_at = models.DateTimeField()
+    request_count = models.PositiveIntegerField(default=0)
+    updated_at = models.DateTimeField(auto_now=True, db_index=True)
+
+
 class WorkflowVersion(ImmutableSnapshot):
     workflow = models.ForeignKey(
         WorkflowDocument,

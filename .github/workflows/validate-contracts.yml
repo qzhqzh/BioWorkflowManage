@@ -161,6 +161,8 @@ jobs:
           DJANGO_SEED_USERS: "1"
           DJANGO_SEED_DEMO: "1"
           DJANGO_SEED_ALLOW_DEFAULT_PASSWORDS: "1"
+          DJANGO_SESSION_COOKIE_SECURE: "0"
+          DJANGO_CSRF_COOKIE_SECURE: "0"
         run: docker compose up -d --build --wait
 
       - name: Run browser smoke tests

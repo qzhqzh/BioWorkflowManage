@@ -18,7 +18,7 @@ from workflows.models import (
 )
 
 
-pytestmark = pytest.mark.django_db
+pytestmark = [pytest.mark.django_db, pytest.mark.usefixtures("auth_disabled")]
 
 
 WDL_SOURCE = """version 1.0

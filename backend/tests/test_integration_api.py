@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
+import time
 import uuid
 from datetime import timedelta
 from io import StringIO
@@ -17,10 +19,18 @@ from compiler_core import canonical_digest, compile_workflow
 from manage_mcp import TOOLS, handle, tool_call
 from workflows.analysis_runtime import (
     _finalize_cancelled_run,
+    _verify_run_resource_manifests,
     claim_next_run,
     process_analysis_run,
 )
-from workflows.integration_outputs import build_output_manifest
+from workflows.integration_api import IntegrationAPIError, _managed_resource
+from workflows.integration_outputs import (
+    ResourceSnapshotBudget,
+    ResourceSnapshotBudgetError,
+    _directory_manifest,
+    _sha256,
+    build_output_manifest,
+)
 from workflows.integration_tokens import issue_service_token
 from workflows.models import (
     AnalysisRun,
@@ -31,6 +41,9 @@ from workflows.models import (
     WorkflowDocument,
     WorkflowVersion,
 )
+
+
+pytestmark = pytest.mark.usefixtures("auth_disabled")
 
 
 ALL_SCOPES = [
@@ -372,6 +385,16 @@ def test_preflight_rejects_unsafe_paths_and_bad_fastq_pair(integration_workspace
         "output_contract",
     }
 
+    digest_mismatch = _submission(version)
+    digest_mismatch["inputs"]["read1"]["sha256"] = "sha256:" + "0" * 64
+    rejected = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        digest_mismatch,
+        format="json",
+    )
+    assert rejected.status_code == 400
+    assert rejected.data["error"]["code"] == "MANAGED_RESOURCE_DIGEST_MISMATCH"
+
     unsafe = _submission(version)
     unsafe["inputs"]["read1"]["relative_path"] = "../escape.fastq.gz"
     rejected = client.post("/api/v1/integration/analysis-runs/preflight", unsafe, format="json")
@@ -405,6 +428,242 @@ def test_preflight_rejects_unsafe_paths_and_bad_fastq_pair(integration_workspace
     )
     assert response.status_code == 400
     assert response.data["error"]["code"] == "FASTQ_GZIP_INVALID"
+
+
+@pytest.mark.django_db
+def test_preflight_rejects_oversized_gzip_header(
+    integration_workspace, settings
+):
+    rawdata, _, _ = integration_workspace
+    _, _, _, client = _token_client()
+    version = _workflow_version()
+    settings.ANALYSIS_INPUT_GZIP_HEADER_MAX_BYTES = 32
+    header_with_unterminated_name = b"\x1f\x8b\x08\x08" + b"\x00" * 6
+    (rawdata / "S001_R1.fastq.gz").write_bytes(
+        header_with_unterminated_name + b"x" * 4096
+    )
+
+    response = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        _submission(version),
+        format="json",
+    )
+
+    assert response.status_code == 400
+    assert response.data["error"]["code"] == "FASTQ_GZIP_INVALID"
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "invalid_gzip",
+    [
+        b"\x1f\x8b\x08\x00" + b"\x00" * 6,
+        b"\x1f\x8b\x08\x00" + b"\x00" * 6 + b"not-deflate",
+        gzip.compress(b"")
+        + b"\x1f\x8b\x08\x08"
+        + b"\x00" * 6
+        + b"x" * 4096,
+    ],
+    ids=["truncated", "invalid-deflate", "record-in-second-member"],
+)
+def test_preflight_rejects_malformed_or_cross_member_gzip(
+    integration_workspace, settings, invalid_gzip
+):
+    rawdata, _, _ = integration_workspace
+    _, _, _, client = _token_client()
+    version = _workflow_version()
+    settings.ANALYSIS_INPUT_GZIP_HEADER_MAX_BYTES = 32
+    (rawdata / "S001_R1.fastq.gz").write_bytes(invalid_gzip)
+
+    response = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        _submission(version),
+        format="json",
+    )
+
+    assert response.status_code == 400
+    assert response.data["error"]["code"] == "FASTQ_GZIP_INVALID"
+
+
+@pytest.mark.django_db
+def test_managed_directory_input_is_content_manifested_and_verified(
+    settings, tmp_path
+):
+    database = tmp_path / "database"
+    resource = database / "bundle"
+    resource.mkdir(parents=True)
+    child = resource / "reference.fa"
+    child.write_bytes(b">chr1\nACGT\n")
+    settings.ANALYSIS_DATABASE_ROOT = database
+    settings.ANALYSIS_DATABASE_EXECUTION_ROOT = database
+    manifests = {"database": []}
+    observed = []
+
+    _managed_resource(
+        {"root_alias": "database", "relative_path": "bundle"},
+        kind="directory",
+        input_name="reference",
+        semantic_type="bio.annotation.database_dir",
+        manifests=manifests,
+        observed=observed,
+        snapshot_budget=ResourceSnapshotBudget(),
+    )
+    item = manifests["database"][0]
+    assert item["verification"] == "directory_identity_sha256"
+    assert item["digest"].startswith("sha256:")
+    assert item["entry_count"] == 1
+
+    run = type(
+        "Run",
+        (),
+        {
+            "request_payload": {
+                "database_resource_manifest": {
+                    "schema_version": 1,
+                    "resources": manifests["database"],
+                }
+            }
+        },
+    )()
+    child_stat = child.stat()
+    time.sleep(0.01)
+    child.write_bytes(b">chr1\nTGCA\n")
+    os.utime(child, ns=(child_stat.st_atime_ns, child_stat.st_mtime_ns))
+
+    with pytest.raises(RuntimeError, match="目录校验和不匹配"):
+        _verify_run_resource_manifests(run)
+
+
+@pytest.mark.django_db
+def test_managed_file_explicit_sha_records_sha256_verification(settings, tmp_path):
+    rawdata = tmp_path / "rawdata"
+    resource = rawdata / "sample.fastq.gz"
+    resource.parent.mkdir(parents=True)
+    resource.write_bytes(b"content")
+    settings.ANALYSIS_RAWDATA_ROOT = rawdata
+    settings.ANALYSIS_RAWDATA_EXECUTION_ROOT = rawdata
+    manifests = {"rawdata": []}
+
+    _managed_resource(
+        {
+            "root_alias": "rawdata",
+            "relative_path": resource.name,
+            "sha256": _sha256(resource),
+        },
+        kind="file",
+        input_name="read1",
+        semantic_type="bio.fastq.gz.r1",
+        manifests=manifests,
+        observed=[],
+        snapshot_budget=ResourceSnapshotBudget(),
+    )
+
+    assert manifests["rawdata"][0]["verification"] == "sha256"
+    assert manifests["rawdata"][0]["sha256"] == _sha256(resource)
+
+
+@pytest.mark.django_db
+def test_managed_directory_ignores_legacy_file_sha_field(settings, tmp_path):
+    database = tmp_path / "database"
+    resource = database / "bundle"
+    resource.mkdir(parents=True)
+    (resource / "reference.fa").write_text(">chr1\n", encoding="utf-8")
+    settings.ANALYSIS_DATABASE_ROOT = database
+    settings.ANALYSIS_DATABASE_EXECUTION_ROOT = database
+    manifests = {"database": []}
+
+    _managed_resource(
+        {
+            "root_alias": "database",
+            "relative_path": "bundle",
+            "sha256": "sha256:" + "0" * 64,
+            "identity_digest": _directory_manifest(resource)["digest"],
+        },
+        kind="directory",
+        input_name="reference",
+        semantic_type="bio.annotation.database_dir",
+        manifests=manifests,
+        observed=[],
+        snapshot_budget=ResourceSnapshotBudget(),
+    )
+
+    item = manifests["database"][0]
+    assert item["warning"] == "legacy_directory_sha256_ignored"
+    assert item["declared_identity_digest"] == _directory_manifest(resource)["digest"]
+
+
+@pytest.mark.django_db
+def test_managed_resource_snapshot_budget_caches_directories_and_limits_total(
+    settings, tmp_path
+):
+    database = tmp_path / "database"
+    resource = database / "bundle"
+    resource.mkdir(parents=True)
+    (resource / "reference.fa").write_bytes(b">chr1\nACGT\n")
+    settings.ANALYSIS_DATABASE_ROOT = database
+    settings.ANALYSIS_DATABASE_EXECUTION_ROOT = database
+    manifests = {"database": []}
+    observed = []
+    budget = ResourceSnapshotBudget(max_resources=2)
+    value = {"root_alias": "database", "relative_path": "bundle"}
+    expected_manifest = _directory_manifest(resource)
+
+    with patch(
+        "workflows.integration_outputs._directory_manifest_isolated",
+        return_value=expected_manifest,
+    ) as snapshot:
+        for input_name in ("reference", "annotation"):
+            _managed_resource(
+                value,
+                kind="directory",
+                input_name=input_name,
+                semantic_type="bio.annotation.database_dir",
+                manifests=manifests,
+                observed=observed,
+                snapshot_budget=budget,
+            )
+        assert snapshot.call_count == 1
+
+    with pytest.raises(IntegrationAPIError) as captured:
+        _managed_resource(
+            value,
+            kind="directory",
+            input_name="third",
+            semantic_type="bio.annotation.database_dir",
+            manifests=manifests,
+            observed=observed,
+            snapshot_budget=budget,
+        )
+    assert captured.value.code == "MANAGED_RESOURCE_LIMIT_EXCEEDED"
+
+
+@pytest.mark.django_db
+def test_managed_file_input_records_identity_and_rejects_same_stat_replacement(
+    integration_workspace,
+):
+    rawdata, _, _ = integration_workspace
+    _, _, _, client = _token_client()
+    version = _workflow_version()
+    submitted = client.post(
+        "/api/v1/integration/analysis-runs",
+        _submission(version),
+        format="json",
+        HTTP_IDEMPOTENCY_KEY="digest-file-run",
+    )
+    assert submitted.status_code == 201, submitted.data
+    run = AnalysisRun.objects.get(pk=submitted.data["id"])
+    item = run.request_payload["input_resource_manifest"]["files"][0]
+    assert item["verification"] == "identity_v2"
+    assert item["ctime_ns"] > 0
+    assert "sha256" not in item
+
+    path = rawdata / item["relative_path"]
+    original_stat = path.stat()
+    path.write_bytes(b"x" * original_stat.st_size)
+    os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+    with pytest.raises(RuntimeError, match="排队后发生变化"):
+        _verify_run_resource_manifests(run)
 
 
 @pytest.mark.django_db
@@ -453,7 +712,8 @@ def test_preflight_validates_and_snapshots_database_catalog(
                     {
                         "id": "hg19",
                         "required": [
-                            {"path": "hg19/reference.fa", "kind": "file"}
+                            {"path": "hg19/reference.fa", "kind": "file"},
+                            {"path": "hg19/bundle", "kind": "directory"},
                         ],
                     }
                 ],
@@ -479,12 +739,15 @@ def test_preflight_validates_and_snapshots_database_catalog(
     assert missing.data["error"]["code"] == "ANALYSIS_DATABASE_INCOMPLETE"
     assert {item["path"] for item in missing.data["error"]["details"]["missing"]} == {
         "hg19/reference.fa",
+        "hg19/bundle",
         "panels/a.bed",
     }
 
     (database / "hg19").mkdir()
+    (database / "hg19/bundle").mkdir()
     (database / "panels").mkdir()
     (database / "hg19/reference.fa").write_text(">chr1\nACGT\n", encoding="utf-8")
+    (database / "hg19/bundle/index.txt").write_text("index\n", encoding="utf-8")
     (database / "panels/a.bed").write_text("chr1\t0\t4\n", encoding="utf-8")
     ready = client.post(
         "/api/v1/integration/analysis-runs/preflight", body, format="json"
@@ -511,6 +774,16 @@ def test_preflight_validates_and_snapshots_database_catalog(
     assert run.request_payload["database_selection"]["reference_id"] == "hg19"
     assert run.request_payload["reference_resource_manifest"]["resources"]
     assert run.request_payload["panel_resource_manifest"]["resources"]
+
+    with patch(
+        "workflows.integration_outputs._directory_manifest_isolated",
+        side_effect=ValueError("snapshot policy exceeded"),
+    ):
+        rejected = client.post(
+            "/api/v1/integration/analysis-runs/preflight", body, format="json"
+        )
+    assert rejected.status_code == 400
+    assert rejected.data["error"]["code"] == "ANALYSIS_RESOURCE_UNSUPPORTED"
 
 
 @pytest.mark.django_db
@@ -661,7 +934,56 @@ def test_retry_is_new_record_and_rejects_changed_inputs(integration_workspace):
     original.refresh_from_db()
     assert original.status == AnalysisRun.Status.FAILED
 
+    current_payload = json.loads(json.dumps(original.request_payload))
+    legacy_payload = json.loads(json.dumps(current_payload))
+    legacy_file = legacy_payload["input_resource_manifest"]["files"][0]
+    legacy_file.pop("ctime_ns")
+    legacy_file.pop("sha256", None)
+    original.request_payload = legacy_payload
+    original.save(update_fields=["request_payload", "updated_at"])
+    outdated = client.post(
+        f"/api/v1/integration/analysis-runs/{original.id}/retry",
+        {
+            "external_ref": {
+                "client_id": "okb",
+                "external_run_id": "okb-run-retry-outdated",
+            }
+        },
+        format="json",
+        HTTP_IDEMPOTENCY_KEY="retry-outdated",
+    )
+    assert outdated.status_code == 409
+    assert outdated.data["error"]["code"] == "ANALYSIS_RESOURCE_MANIFEST_OUTDATED"
+    original.request_payload = current_payload
+    original.save(update_fields=["request_payload", "updated_at"])
+
     rawdata, _, _ = integration_workspace
+    digest_payload = json.loads(json.dumps(current_payload))
+    digest_payload["input_resource_manifest"]["files"][0]["sha256"] = _sha256(
+        rawdata / "S001_R1.fastq.gz"
+    )
+    original.request_payload = digest_payload
+    original.save(update_fields=["request_payload", "updated_at"])
+    with patch(
+        "workflows.integration_outputs.ResourceSnapshotBudget.file_digest",
+        side_effect=ResourceSnapshotBudgetError("资源快照超过请求时间上限。"),
+    ):
+        bounded = client.post(
+            f"/api/v1/integration/analysis-runs/{original.id}/retry",
+            {
+                "external_ref": {
+                    "client_id": "okb",
+                    "external_run_id": "okb-run-retry-budget",
+                }
+            },
+            format="json",
+            HTTP_IDEMPOTENCY_KEY="retry-budget",
+        )
+    assert bounded.status_code == 409
+    assert bounded.data["error"]["code"] == "MANAGED_RESOURCE_LIMIT_EXCEEDED"
+    original.request_payload = current_payload
+    original.save(update_fields=["request_payload", "updated_at"])
+
     _write_fastq(rawdata / "S001_R1.fastq.gz", 1, read_id="replacement")
     changed_body = {
         "external_ref": {
@@ -734,9 +1056,11 @@ def test_semantic_output_manifest_download_and_integrity(
     assert error is None
     execution_root = Path("/execution/analysis-runs")
     settings.ANALYSIS_RUN_EXECUTION_ROOT = execution_root
-    manifest["items"][0]["path"] = str(
-        execution_root / output.relative_to(run_root)
-    )
+    for field in ("path", "source_path"):
+        local_path = Path(manifest["items"][0][field])
+        manifest["items"][0][field] = str(
+            execution_root / local_path.relative_to(run_root)
+        )
     run.outputs = result
     run.output_manifest = manifest
     run.output_status = output_status
@@ -748,6 +1072,7 @@ def test_semantic_output_manifest_download_and_integrity(
     assert item["semantic_type"] == "report.qc_tsv"
     assert item["sha256"].startswith("sha256:")
     assert "path" not in item and "identity" not in item
+    assert "source_path" not in item and "source_identity" not in item
     assert len(listed.data["results"]) == 2
     assert listed.data["results"][1]["value"] == "stored at <managed-root>/internal"
     assert "private" not in json.dumps(listed.data)
@@ -769,6 +1094,146 @@ def test_semantic_output_manifest_download_and_integrity(
     changed = client.get(item["download_url"])
     assert changed.status_code == 409
     assert changed.data["error"]["code"] == "ANALYSIS_OUTPUT_CHANGED"
+
+
+@pytest.mark.django_db
+def test_integration_incomplete_v2_manifest_keeps_verified_file_downloadable(
+    integration_workspace, settings, monkeypatch
+):
+    account, _, _, client = _token_client()
+    version = _workflow_version()
+    _, _, runs = integration_workspace
+    run_directory = runs / "integration-partial"
+    run_directory.mkdir()
+    output = run_directory / "result.tsv"
+    output.write_text("verified\n", encoding="utf-8")
+    settings.ANALYSIS_OUTPUT_VALUE_MAX_BYTES = 16
+    run = AnalysisRun.objects.create(
+        workflow_version=version,
+        service_account=account,
+        external_run_id="integration-partial",
+        idempotency_key="integration-partial",
+        workflow_name="integration_smoke",
+        sample_id="S001",
+        actor="service:okb",
+        source_bundle=version.compiled_bundle,
+        source_digest=version.compiled_digest,
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(run_directory),
+        request_payload={
+            "integration_output_contract": [
+                {
+                    "key": "integration_smoke.result",
+                    "wdl_type": "File",
+                    "required": True,
+                },
+                {
+                    "key": "integration_smoke.note",
+                    "wdl_type": "String",
+                    "required": True,
+                },
+            ]
+        },
+        outputs={
+            "outputs": {
+                "integration_smoke.result": str(output),
+                "integration_smoke.note": "sensitive-marker-" + "x" * 100,
+            }
+        },
+    )
+    manifest, output_status, error = build_output_manifest(run, run.outputs)
+    assert output_status == AnalysisRun.OutputStatus.INCOMPLETE
+    assert error["code"] == "OUTPUT_INTEGRITY_UNVERIFIABLE"
+    run.output_manifest = manifest
+    run.output_status = output_status
+    run.save(update_fields=["output_manifest", "output_status", "updated_at"])
+    monkeypatch.setattr(
+        "workflows.integration_api._output_payload",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("v2 manifest must not read legacy outputs")
+        ),
+    )
+
+    run_list = client.get("/api/v1/integration/analysis-runs")
+    listed = client.get(f"/api/v1/integration/analysis-runs/{run.id}/outputs")
+    results = {item["key"]: item for item in listed.data["results"]}
+    downloaded = client.get(results["integration_smoke.result"]["download_url"])
+    incomplete = client.get(
+        f"/api/v1/integration/analysis-runs/{run.id}/outputs/download",
+        {"key": "integration_smoke.note"},
+    )
+
+    assert run_list.status_code == 200
+    assert run_list.data["view"] == "summary"
+    assert run_list.data["results"][0]["outputs"] == []
+    assert "sensitive-marker" not in str(run_list.data)
+    assert results["integration_smoke.result"]["download_url"]
+    assert "download_url" not in results["integration_smoke.note"]
+    assert results["integration_smoke.note"]["kind"] == "unverifiable"
+    assert downloaded.status_code == 200
+    assert b"".join(downloaded.streaming_content) == b"verified\n"
+    assert incomplete.status_code == 409
+    assert incomplete.data["error"]["code"] == "ANALYSIS_OUTPUT_INCOMPLETE"
+
+
+@pytest.mark.django_db
+def test_integration_legacy_schema_v1_output_is_unverified(
+    integration_workspace,
+):
+    _, _, runs = integration_workspace
+    account, _, _, client = _token_client()
+    version = _workflow_version()
+    run_directory = runs / "legacy-integration-output"
+    run_directory.mkdir()
+    output = run_directory / "result.tsv"
+    output.write_text("legacy\n", encoding="utf-8")
+    run = AnalysisRun.objects.create(
+        workflow_version=version,
+        service_account=account,
+        external_run_id="legacy-output",
+        idempotency_key="legacy-output",
+        workflow_name="integration_smoke",
+        sample_id="S001",
+        actor="service:okb",
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(run_directory),
+        outputs={"outputs": {"integration_smoke.result": str(output)}},
+        output_manifest={
+            "schema_version": 1,
+            "items": [
+                {
+                    "key": "integration_smoke.result",
+                    "kind": "file",
+                    "path": str(output),
+                    "sha256": _sha256(output),
+                }
+            ],
+        },
+        output_status=AnalysisRun.OutputStatus.COMPLETE,
+    )
+
+    listed = client.get(f"/api/v1/integration/analysis-runs/{run.id}/outputs")
+    downloaded = client.get(
+        f"/api/v1/integration/analysis-runs/{run.id}/outputs/download",
+        {"key": "integration_smoke.result"},
+    )
+
+    assert listed.status_code == 200
+    assert "download_url" not in listed.data["results"][0]
+    assert downloaded.status_code == 409
+    assert downloaded.data["error"]["code"] == "ANALYSIS_OUTPUT_UNVERIFIED"
+
+    run.output_manifest = {}
+    run.save(update_fields=["output_manifest", "updated_at"])
+    downloaded_without_manifest = client.get(
+        f"/api/v1/integration/analysis-runs/{run.id}/outputs/download",
+        {"key": "integration_smoke.result"},
+    )
+    assert downloaded_without_manifest.status_code == 409
+    assert (
+        downloaded_without_manifest.data["error"]["code"]
+        == "ANALYSIS_OUTPUT_UNVERIFIED"
+    )
 
 
 @pytest.mark.django_db

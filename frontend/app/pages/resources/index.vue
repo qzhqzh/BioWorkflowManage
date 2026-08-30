@@ -95,10 +95,12 @@ function setBinding(entry: ResourceCatalogEntry, key: string, value: string) {
 }
 
 function requirementState(item: ResourceRequirement) {
-  if (item.present) return '已就绪'
   if (item.reason === 'unconfigured') return '未配置路径'
   if (item.reason === 'checksum_mismatch') return '校验值不一致'
   if (item.reason === 'constraint_mismatch') return '文件名不匹配'
+  if (!item.present) return '文件缺失'
+  if (item.warning === 'legacy_directory_sha256_ignored') return '已就绪（旧目录 SHA-256 未用于校验）'
+  if (item.present) return '已就绪'
   return '文件缺失'
 }
 
@@ -127,6 +129,23 @@ function addRequirement() {
 
 function removeRequirement(index: number) {
   selectedEntry.value?.required.splice(index, 1)
+}
+
+function setRequirementKind(item: ResourceRequirement, kind: 'file' | 'directory') {
+  item.kind = kind
+  if (kind === 'directory') delete item.sha256
+  else delete item.identity_digest
+}
+
+function adoptObservedIdentity(item: ResourceRequirement) {
+  if (!selectedEntry.value || !item.observed_identity_digest) return
+  const requirement = selectedEntry.value.required.find(candidate => (
+    candidate.kind === 'directory' && candidate.path === item.path
+  ))
+  if (!requirement) return
+  requirement.identity_digest = item.observed_identity_digest.replace(/^sha256:/, '')
+  verifiedEntry.value = ''
+  verifyState.value = 'idle'
 }
 
 function addPanel() {
@@ -382,7 +401,7 @@ onMounted(() => void loadCatalog())
             <header>
               <div>
                 <h2>资源检查</h2>
-                <p>{{ isSelectedVerified ? '已完成所选资源的 SHA-256 完整校验。' : '日常检查路径与类型；SHA-256 由完整校验读取。' }}</p>
+                <p>{{ isSelectedVerified ? '已完成所选资源的声明校验值检查。' : '日常检查路径与类型；文件 SHA-256 与目录身份摘要由完整校验读取。' }}</p>
               </div>
               <div class="resource-validation-actions">
                 <span>{{ selectedStatus?.requirements?.length ?? 0 }} 项</span>
@@ -399,6 +418,12 @@ onMounted(() => void loadCatalog())
                 <span class="resource-check-mark" aria-hidden="true">{{ item.present ? '✓' : '!' }}</span>
                 <span><strong>{{ item.label }}</strong><code>{{ requirementPath(item) }}</code></span>
                 <em>{{ requirementState(item) }}</em>
+                <button
+                  v-if="item.kind === 'directory' && item.observed_identity_digest"
+                  type="button"
+                  class="text-button"
+                  @click="adoptObservedIdentity(item)"
+                >采用当前摘要</button>
               </li>
             </ul>
             <p v-else class="empty-state">尚未声明需要检查的资源。</p>
@@ -413,8 +438,9 @@ onMounted(() => void loadCatalog())
               <div v-for="(item, index) in selectedEntry.required" :key="index">
                 <input v-model="item.label" aria-label="资源标签" placeholder="名称" />
                 <input v-model="item.path" aria-label="资源路径" placeholder="相对路径" />
-                <input v-model="item.sha256" aria-label="SHA-256" placeholder="SHA-256（可选）" />
-                <select v-model="item.kind" aria-label="资源类型"><option value="file">文件</option><option value="directory">目录</option></select>
+                <input v-if="item.kind === 'directory'" v-model="item.identity_digest" aria-label="目录身份摘要" placeholder="目录身份摘要（可选）" />
+                <input v-else v-model="item.sha256" aria-label="SHA-256" placeholder="SHA-256（可选）" />
+                <select :value="item.kind" aria-label="资源类型" @change="setRequirementKind(item, ($event.target as HTMLSelectElement).value as 'file' | 'directory')"><option value="file">文件</option><option value="directory">目录</option></select>
                 <button type="button" aria-label="删除资源" @click="removeRequirement(index)">删除</button>
               </div>
             </div>

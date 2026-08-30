@@ -34,7 +34,8 @@
 
 | Method | Path | 用途 |
 |---|---|---|
-| `GET` | `/health` | 进程和依赖健康检查 |
+| `GET` | `/health` | 进程存活检查，不访问数据库 |
+| `GET` | `/ready` | 就绪检查；数据库不可用时返回 503 |
 | `GET` | `/contracts` | 返回可用契约版本列表 |
 | `GET` | `/contracts/{contract_name}` | 返回 JSON Schema 或错误码目录 |
 | `POST` | `/validations/tool-spec` | 校验单个 ToolSpec |
@@ -91,7 +92,7 @@ X-Request-ID: req_...
 
 ToolSpec、Graph、类型和编译问题必须使用 Validation Report，不应只返回通用 message。
 
-## 5. GET /health
+## 5. GET /health 与 /ready
 
 响应：
 
@@ -100,22 +101,43 @@ ToolSpec、Graph、类型和编译问题必须使用 Validation Report，不应�
   "status": "ok",
   "service": "bioworkflow-compiler-api",
   "api_version": "v1",
-  "compiler_contract": "phase1"
-}
-```
-
-可选依赖状态：
-
-```json
-{
+  "compiler_contract": "phase1",
   "dependencies": {
-    "miniwdl": "available",
-    "womtool": "not_configured"
+    "database": "not_checked"
   }
 }
 ```
 
-健康检查不得执行完整编译。
+`/health` 只表示 Web 进程可响应，不将数据库故障误判为进程死亡。`/ready` 会执行数据库探测，正常时返回：
+
+```json
+{
+  "dependencies": {
+    "database": "available"
+  }
+}
+```
+
+数据库不可用时 `/ready` 使用同一 JSON 结构返回 503；Docker healthcheck 必须调用
+`/api/v1/ready`。两个端点都不执行完整编译。
+
+### 5.1 Workflow 列表分页
+
+`GET /editor/workflows` 是有界列表，默认 `page=1&page_size=50`，`page_size` 最大为 100。
+响应包含 `results`、`page`、`page_size`、`total`、`has_next`、`has_previous` 和不受当前分页
+影响的 `summary` 聚合。支持 `q`、`owner=mine|shared`、`kind=workflow|subworkflow`、
+`status=draft|published`；客户端必须按 `has_next` 显式翻页。旧客户端若曾依赖无参数全量返回，
+升级时必须改为分页读取，不能把首 50 条当成完整集合。
+
+`GET /editor/workflows/{slug}/versions` 只有在传入 `page` 或 `page_size` 时启用同一有界分页；
+无分页参数暂时保留历史全量响应，供旧客户端迁移。
+
+### 5.2 运行列表与详情
+
+`GET /analysis-runs` 和 `GET /tool-test-runs` 是轻量列表，响应顶层固定带
+`view: "summary"`。列表项保留身份、状态、进度、稳定错误码和汇总 timing，但固定返回
+`outputs: []`、`request: {}`、`error_details: {}`，且不展开 task timing/Workflow graph。
+需要输出、原始请求、详细错误或 task timing 时，客户端必须调用对应的 `/{run_id}` 详情接口。
 
 ## 6. GET /contracts
 

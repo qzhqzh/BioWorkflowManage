@@ -1,7 +1,9 @@
 import json
+from copy import deepcopy
 from pathlib import Path
 
 from jsonschema import Draft202012Validator
+import pytest
 
 from compiler_core.compiler import compile_workflow, lower_to_ir
 from compiler_core.validation import canonical_digest, validate_tool_spec
@@ -50,6 +52,47 @@ def test_fastp_bwa_fixture_resolves_complete_tool_bundle():
         assert (FIXTURE / relative_path).is_file()
     for relative_path in fixture["expected_artifacts"]:
         assert (FIXTURE / relative_path).is_file()
+
+
+@pytest.mark.parametrize(
+    ("wdl_type", "required", "default"),
+    [
+        ("Int", False, "4"),
+        ("Boolean", False, 1),
+        ("Array[Int]", False, [1, "2"]),
+        ("File", False, "/etc/passwd"),
+        ("Directory", False, "/tmp/database"),
+        ("Int", True, 4),
+    ],
+)
+def test_tool_input_default_must_match_type_and_required_rules(
+    wdl_type, required, default
+):
+    tool = load_json(ROOT / "examples/phase1-fastp/tool-fastp.json")
+    invalid = deepcopy(tool)
+    invalid["inputs"][2].update(
+        {"wdl_type": wdl_type, "required": required, "default": default}
+    )
+
+    validation = validate_tool_spec(invalid)
+
+    assert validation["status"] == "invalid"
+    assert any(item["code"] == "TS004" for item in validation["diagnostics"])
+
+
+def test_optional_scalar_null_default_renders_as_optional_wdl():
+    tool = load_json(ROOT / "examples/phase1-fastp/tool-fastp.json")
+    tool["inputs"][2]["default"] = None
+    graph = load_json(ROOT / "examples/phase1-fastp/workflow-graph.json")
+    tool_node = next(node for node in graph["nodes"] if node["type"] == "tool")
+    tool_node["tool_ref"]["digest"] = canonical_digest(tool)
+
+    validation, artifacts = compile_workflow(graph, [tool])
+
+    assert validation["status"] == "valid"
+    wdl = next(item["content"] for item in artifacts if item["name"] == "workflow.wdl")
+    assert "Int? threads" in wdl
+    assert "threads = None" not in wdl
 
 
 def test_fastp_bwa_fixture_matches_real_compiler_artifacts():

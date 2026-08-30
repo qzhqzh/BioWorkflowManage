@@ -95,12 +95,14 @@ export interface AnalysisCatalog {
 
 export interface AnalysisRunOutput {
   key: string
-  kind: 'file' | 'value'
+  kind: 'file' | 'value' | 'directory' | 'unverifiable'
   name?: string
   size?: number
   size_label?: string
+  entry_count?: number
   download_url?: string
   value?: unknown
+  reason?: string
 }
 
 export interface AnalysisRunEvent {
@@ -132,6 +134,7 @@ export interface AnalysisRunTiming {
 }
 
 export type AnalysisRunStatus = 'queued' | 'preparing' | 'running' | 'cancel_requested' | 'succeeded' | 'failed' | 'canceled'
+export type AnalysisOutputStatus = 'pending' | 'complete' | 'incomplete' | 'unavailable'
 
 export interface AnalysisRun {
   id: string
@@ -148,6 +151,7 @@ export interface AnalysisRun {
   sample_name: string
   actor: string
   status: AnalysisRunStatus
+  output_status: AnalysisOutputStatus
   progress: number
   current_step: string
   request: {
@@ -159,6 +163,10 @@ export interface AnalysisRun {
     sample_gender?: string
   }
   error: string
+  error_code: string
+  error_category: string
+  error_retryable: boolean
+  error_details: Record<string, unknown>
   outputs: AnalysisRunOutput[]
   timing: AnalysisRunTiming
   events?: AnalysisRunEvent[]

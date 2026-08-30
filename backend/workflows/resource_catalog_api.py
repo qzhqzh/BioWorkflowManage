@@ -4,6 +4,7 @@ from rest_framework import status
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 
+from .integration_outputs import ResourceSnapshotBudgetError
 from .resource_catalog import (
     ResourceCatalogError,
     catalog_payload,
@@ -48,6 +49,14 @@ def resource_catalog(request):
             return Response(catalog_payload(verify_entry=verify_entry))
         except ResourceCatalogError as error:
             return _error(error, status.HTTP_400_BAD_REQUEST)
+        except ResourceSnapshotBudgetError as error:
+            return _error(
+                ResourceCatalogError(
+                    "RESOURCE_CATALOG_VERIFY_LIMIT_EXCEEDED",
+                    str(error),
+                ),
+                status.HTTP_400_BAD_REQUEST,
+            )
 
     if "base_version" not in request.data or not request.data.get("base_digest"):
         return _error(

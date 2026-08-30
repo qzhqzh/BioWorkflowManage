@@ -3,30 +3,54 @@ from __future__ import annotations
 import gzip
 import io
 import json
+import os
 import signal
+import stat
 import subprocess
+import sys
+import time
 import uuid
 from datetime import timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from django.contrib.auth import get_user_model
 from django.core.management import call_command
+from django.core.management.base import CommandError
 from django.utils import timezone
 
 from compiler_core import canonical_digest, compile_workflow
+import workflows.analysis_runs as analysis_runs_module
 from workflows.analysis_runtime import (
     GIB,
     _available_memory_bytes,
     _cleanup_swarm_services_for_run,
+    _failure_metadata,
     _is_infrastructure_error,
     _LeaseHeartbeat,
+    _read_result_json,
     _result_error,
     _verify_run_resource_manifests,
     claim_next_run,
     execute_analysis_run,
 )
-from workflows.analysis_runs import _parse_miniwdl_timing
+from workflows.analysis_runs import (
+    AnalysisInputError,
+    _catalog_resource_manifest,
+    _parse_miniwdl_timing,
+)
+from workflows.integration_outputs import (
+    _directory_manifest,
+    _directory_manifest_isolated,
+    _sha256,
+    ResourceSnapshotBudget,
+    backfill_output_manifest,
+    build_output_manifest,
+    open_verified_output,
+    output_manifest_is_current,
+    output_value_limit_reason,
+)
 from workflows.rawdata_index import queue_rawdata_scan, run_rawdata_scan_batch
 from workflows.models import (
     AnalysisRun,
@@ -38,7 +62,7 @@ from workflows.models import (
 )
 
 
-pytestmark = pytest.mark.django_db
+pytestmark = [pytest.mark.django_db, pytest.mark.usefixtures("auth_disabled")]
 
 
 def test_result_error_prefers_nested_runtime_message(tmp_path):
@@ -59,6 +83,42 @@ def test_result_error_prefers_nested_runtime_message(tmp_path):
     assert _result_error(result_path, "fallback") == (
         "docker image not found: example/image:tag"
     )
+
+
+def test_result_json_read_is_bounded(settings, tmp_path):
+    settings.ANALYSIS_RESULT_JSON_MAX_BYTES = 8
+    result_path = tmp_path / "result.json"
+    result_path.write_text('{"outputs": {}}', encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="result.json 超过安全上限"):
+        _read_result_json(result_path)
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity", "1e9999"])
+def test_result_json_rejects_non_finite_numbers(tmp_path, constant):
+    result_path = tmp_path / "result.json"
+    result_path.write_text(
+        f'{{"outputs": {{"value": {constant}}}}}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="不是有效 JSON"):
+        _read_result_json(result_path)
+
+
+def test_inline_output_values_and_empty_legacy_containers_are_bounded(settings):
+    settings.ANALYSIS_OUTPUT_VALUE_MAX_BYTES = 16
+    settings.ANALYSIS_OUTPUT_SNAPSHOT_MAX_ITEMS = 8
+
+    assert output_value_limit_reason("x" * 100) == "output_value_size_exceeded"
+    assert output_value_limit_reason(float("nan")) == "output_value_type_invalid"
+
+    flattened = analysis_runs_module._flatten_outputs(
+        {"values": [[] for _ in range(100)]}
+    )
+    assert len(flattened) <= 8
+    assert flattened[-1][0] == "<truncated>"
+    assert flattened[-1][1].reason == "output_snapshot_item_limit_exceeded"
 
 
 def test_available_memory_bytes_reads_memavailable(tmp_path):
@@ -539,8 +599,10 @@ def test_execute_run_retries_infrastructure_failure_once(
                 )
                 self.exit_code = 1
             else:
+                output = Path(result_path).parents[1] / "final.txt"
+                output.write_text("completed\n", encoding="utf-8")
                 with open(result_path, "w", encoding="utf-8") as handle:
-                    json.dump({"outputs": {"Retryable.sample": "SAMPLE01"}}, handle)
+                    json.dump({"outputs": {"Retryable.result": str(output)}}, handle)
                 self.stderr = io.StringIO(
                     '{"message":"workflow done","level":"NOTICE"}\n'
                 )
@@ -565,6 +627,12 @@ def test_execute_run_retries_infrastructure_failure_once(
     run.refresh_from_db()
     assert calls == 2
     assert run.status == AnalysisRun.Status.SUCCEEDED
+    assert run.output_status == AnalysisRun.OutputStatus.COMPLETE
+    assert run.output_manifest["integrity_version"] == 2
+    output_item = run.output_manifest["items"][0]
+    assert output_item["kind"] == "file"
+    assert output_item["sha256"].startswith("sha256:")
+    assert Path(output_item["path"]).is_file()
     assert run.events.filter(kind="infrastructure").count() == 1
     assert (tmp_path / "runs" / str(run.id) / "attempt-1" / "miniwdl.log").is_file()
     assert (tmp_path / "runs" / str(run.id) / "attempt-2" / "result.json").is_file()
@@ -625,7 +693,9 @@ def test_execute_run_terminates_process_when_event_recording_fails(
     assert signals == [(5678, signal.SIGTERM), (5678, signal.SIGKILL)]
 
 
-def test_worker_rejects_input_replaced_after_submission(settings, tmp_path):
+def test_worker_rejects_legacy_file_manifest_without_trusted_digest(
+    settings, tmp_path
+):
     rawdata = tmp_path / "rawdata"
     fastq = rawdata / "sample_R1.fastq.gz"
     fastq.parent.mkdir()
@@ -652,9 +722,238 @@ def test_worker_rejects_input_replaced_after_submission(settings, tmp_path):
             }
         },
     )()
-    fastq.write_bytes(b"replacement")
+    with pytest.raises(RuntimeError, match="完整性证据过旧"):
+        _verify_run_resource_manifests(run)
 
-    with pytest.raises(RuntimeError, match="排队后发生变化"):
+    assert _failure_metadata("受管资源完整性证据过旧，请重新投递任务") == {
+        "code": "ANALYSIS_RESOURCE_MANIFEST_OUTDATED",
+        "category": "resource",
+        "retryable": False,
+    }
+
+
+def test_worker_rejects_file_when_ancestor_is_replaced_by_symlink(
+    settings, tmp_path
+):
+    rawdata = tmp_path / "rawdata"
+    lane = rawdata / "lane"
+    lane.mkdir(parents=True)
+    resource = lane / "sample.fastq.gz"
+    resource.write_bytes(b"content")
+    observed = resource.stat()
+    settings.ANALYSIS_RAWDATA_ROOT = rawdata
+    run = type(
+        "Run",
+        (),
+        {
+            "request_payload": {
+                "input_resource_manifest": {
+                    "schema_version": 2,
+                    "files": [
+                        {
+                            "relative_path": "lane/sample.fastq.gz",
+                            "kind": "file",
+                            "verification": "identity_v2",
+                            "size": observed.st_size,
+                            "mtime_ns": observed.st_mtime_ns,
+                            "ctime_ns": observed.st_ctime_ns,
+                            "device": observed.st_dev,
+                            "inode": observed.st_ino,
+                        }
+                    ],
+                }
+            }
+        },
+    )()
+    moved = tmp_path / "moved-lane"
+    lane.rename(moved)
+    lane.symlink_to(moved, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="受管资源已不存在"):
+        _verify_run_resource_manifests(
+            run,
+            snapshot_budget=ResourceSnapshotBudget(deadline_seconds=2),
+        )
+
+
+def test_worker_rejects_directory_content_changed_with_original_stat(
+    settings, tmp_path
+):
+    database = tmp_path / "database"
+    resource = database / "reference"
+    resource.mkdir(parents=True)
+    child = resource / "reference.fa"
+    child.write_bytes(b"first\n")
+    settings.ANALYSIS_DATABASE_ROOT = database
+    recorded = _directory_manifest(resource)
+    resource_stat = resource.stat()
+    run = type(
+        "Run",
+        (),
+        {
+            "request_payload": {
+                "database_resource_manifest": {
+                    "schema_version": 1,
+                    "resources": [
+                        {
+                            "relative_path": "reference",
+                            "kind": "directory",
+                            "verification": "directory_identity_sha256",
+                            "digest": recorded["digest"],
+                            "identity": {
+                                "mtime_ns": resource_stat.st_mtime_ns,
+                                "ctime_ns": resource_stat.st_ctime_ns,
+                                "device": resource_stat.st_dev,
+                                "inode": resource_stat.st_ino,
+                            },
+                        }
+                    ],
+                }
+            }
+        },
+    )()
+
+    child_stat = child.stat()
+    time.sleep(0.01)
+    child.write_bytes(b"second")
+    os.utime(child, ns=(child_stat.st_atime_ns, child_stat.st_mtime_ns))
+
+    with pytest.raises(RuntimeError, match="目录校验和不匹配"):
+        _verify_run_resource_manifests(run)
+
+
+def test_directory_manifest_handles_deep_tree_without_python_recursion(
+    settings, tmp_path: Path
+):
+    settings.ANALYSIS_RESOURCE_MANIFEST_MAX_ENTRIES = 2_000
+    settings.ANALYSIS_RESOURCE_MANIFEST_MAX_DEPTH = 2_000
+    root = tmp_path / "deep-tree"
+    root.mkdir()
+    directories = []
+    current = root
+    try:
+        for _ in range(1_050):
+            current = current / "d"
+            current.mkdir()
+            directories.append(current)
+
+        manifest = _directory_manifest(root)
+
+        assert manifest["entry_count"] == 1_050
+        assert manifest["digest"].startswith("sha256:")
+    finally:
+        for directory in reversed(directories):
+            directory.rmdir()
+        root.rmdir()
+
+
+def test_directory_manifest_rejects_excessive_depth(settings, tmp_path: Path):
+    settings.ANALYSIS_RESOURCE_MANIFEST_MAX_DEPTH = 2
+    root = tmp_path / "bounded-depth"
+    leaf = root / "one" / "two" / "three"
+    leaf.mkdir(parents=True)
+
+    with pytest.raises(ValueError, match="目录深度超过安全上限"):
+        _directory_manifest(root)
+
+
+def test_request_directory_manifest_timeout_kills_isolated_process(
+    tmp_path: Path,
+):
+    original_popen = subprocess.Popen
+    processes = []
+
+    def start_sleeping_process(_command, **kwargs):
+        process = original_popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            **kwargs,
+        )
+        processes.append(process)
+        return process
+
+    started_at = time.monotonic()
+    with (
+        patch(
+            "workflows.integration_outputs.subprocess.Popen",
+            side_effect=start_sleeping_process,
+        ),
+        pytest.raises(ValueError, match="目录快照超过时间上限"),
+    ):
+        _directory_manifest_isolated(tmp_path, timeout_seconds=0.05)
+
+    assert time.monotonic() - started_at < 1
+    assert len(processes) == 1
+    for _ in range(1_000):
+        if processes[0].poll() is not None:
+            break
+        time.sleep(0.001)
+    assert processes[0].returncode is not None
+
+
+def test_catalog_directory_identity_digest_is_verified(settings, tmp_path: Path):
+    databases = tmp_path / "databases"
+    bundle = databases / "hg19" / "bundle"
+    bundle.mkdir(parents=True)
+    child = bundle / "reference.fa"
+    child.write_text(">chr1\nACGT\n", encoding="utf-8")
+    settings.ANALYSIS_DATABASE_ROOT = databases
+    expected = _directory_manifest(bundle)["digest"]
+    entry = {
+        "id": "hg19",
+        "required": [
+            {
+                "path": "hg19/bundle",
+                "kind": "directory",
+                "identity_digest": expected.removeprefix("sha256:"),
+            }
+        ],
+    }
+
+    manifest = _catalog_resource_manifest(entry)
+
+    assert manifest["resources"][0]["catalog_identity_digest"] == expected.removeprefix(
+        "sha256:"
+    )
+
+    entry["required"][0]["identity_digest"] = "0" * 64
+    with pytest.raises(AnalysisInputError, match="身份摘要不匹配"):
+        _catalog_resource_manifest(entry)
+
+
+def test_worker_rejects_catalog_checksum_that_differs_from_observed_content(
+    settings, tmp_path
+):
+    database = tmp_path / "database"
+    resource = database / "reference.fa"
+    resource.parent.mkdir(parents=True)
+    resource.write_bytes(b">chr1\nACGT\n")
+    stat = resource.stat()
+    settings.ANALYSIS_DATABASE_ROOT = database
+    run = type(
+        "Run",
+        (),
+        {
+            "request_payload": {
+                "database_resource_manifest": {
+                    "schema_version": 1,
+                    "resources": [
+                        {
+                            "relative_path": resource.name,
+                            "kind": "file",
+                            "size": stat.st_size,
+                            "mtime_ns": stat.st_mtime_ns,
+                            "device": stat.st_dev,
+                            "inode": stat.st_ino,
+                            "sha256": _sha256(resource),
+                            "catalog_sha256": "0" * 64,
+                        }
+                    ],
+                }
+            }
+        },
+    )()
+
+    with pytest.raises(RuntimeError, match="目录声明的校验和不匹配"):
         _verify_run_resource_manifests(run)
 
 
@@ -1030,6 +1329,181 @@ def test_submit_refreshes_cached_fastq_identity(client, analysis_workspace):
     assert recorded["mtime_ns"] == current.st_mtime_ns
     assert recorded["inode"] == current.st_ino
     _verify_run_resource_manifests(run)
+
+
+def test_browser_submit_rejects_empty_fastq_header(client, analysis_workspace):
+    version = _published_fastq_workflow()
+    catalog = client.get("/api/v1/analysis/catalog").data
+    dataset = catalog["datasets"][0]
+    rawdata, _, _, _ = analysis_workspace
+    read1_item = next(item for item in dataset["files"] if item["mate"] == 1)
+    with gzip.open(rawdata / read1_item["relative_path"], "wt", encoding="ascii") as handle:
+        handle.write("@\nACGT\n+\n!!!!\n")
+
+    response = client.post(
+        "/api/v1/analysis-runs",
+        {
+            "workflow": f"published:{version.workflow.slug}:{version.version}",
+            "dataset": dataset["id"],
+        },
+        format="json",
+    )
+
+    assert response.status_code == 400
+    assert response.data["error"]["code"] == "ANALYSIS_FASTQ_INVALID"
+
+
+def test_browser_submit_rejects_fastq_replaced_by_directory(
+    client, analysis_workspace
+):
+    version = _published_fastq_workflow()
+    catalog = client.get("/api/v1/analysis/catalog").data
+    dataset = catalog["datasets"][0]
+    rawdata, _, _, _ = analysis_workspace
+    read1_item = next(item for item in dataset["files"] if item["mate"] == 1)
+    read1 = rawdata / read1_item["relative_path"]
+    read1.unlink()
+    read1.mkdir()
+
+    response = client.post(
+        "/api/v1/analysis-runs",
+        {
+            "workflow": f"published:{version.workflow.slug}:{version.version}",
+            "dataset": dataset["id"],
+        },
+        format="json",
+    )
+
+    assert response.status_code == 400
+    assert response.data["error"]["code"] == "ANALYSIS_FASTQ_INVALID"
+
+
+def test_browser_submit_rejects_oversized_fastq_line(
+    client, analysis_workspace, settings
+):
+    version = _published_fastq_workflow()
+    catalog = client.get("/api/v1/analysis/catalog").data
+    dataset = catalog["datasets"][0]
+    rawdata, _, _, _ = analysis_workspace
+    read1_item = next(item for item in dataset["files"] if item["mate"] == 1)
+    settings.ANALYSIS_INPUT_TEXT_LINE_MAX_CHARS = 16
+    with gzip.open(rawdata / read1_item["relative_path"], "wt", encoding="ascii") as handle:
+        handle.write(f"@{'x' * 32}/1\nACGT\n+\n!!!!\n")
+
+    response = client.post(
+        "/api/v1/analysis-runs",
+        {
+            "workflow": f"published:{version.workflow.slug}:{version.version}",
+            "dataset": dataset["id"],
+        },
+        format="json",
+    )
+
+    assert response.status_code == 400
+    assert response.data["error"]["code"] == "ANALYSIS_FASTQ_RECORD_TOO_LARGE"
+
+
+def test_browser_submit_rejects_oversized_gzip_header(
+    client, analysis_workspace, settings
+):
+    version = _published_fastq_workflow()
+    catalog = client.get("/api/v1/analysis/catalog").data
+    dataset = catalog["datasets"][0]
+    rawdata, _, _, _ = analysis_workspace
+    read1_item = next(item for item in dataset["files"] if item["mate"] == 1)
+    settings.ANALYSIS_INPUT_GZIP_HEADER_MAX_BYTES = 32
+    header_with_unterminated_name = b"\x1f\x8b\x08\x08" + b"\x00" * 6
+    (rawdata / read1_item["relative_path"]).write_bytes(
+        header_with_unterminated_name + b"x" * 4096
+    )
+
+    response = client.post(
+        "/api/v1/analysis-runs",
+        {
+            "workflow": f"published:{version.workflow.slug}:{version.version}",
+            "dataset": dataset["id"],
+        },
+        format="json",
+    )
+
+    assert response.status_code == 400
+    assert response.data["error"]["code"] == "ANALYSIS_FASTQ_INVALID"
+
+
+def test_browser_submit_rejects_fastq_record_in_second_gzip_member(
+    client, analysis_workspace, settings
+):
+    version = _published_fastq_workflow()
+    catalog = client.get("/api/v1/analysis/catalog").data
+    dataset = catalog["datasets"][0]
+    rawdata, _, _, _ = analysis_workspace
+    read1_item = next(item for item in dataset["files"] if item["mate"] == 1)
+    settings.ANALYSIS_INPUT_GZIP_HEADER_MAX_BYTES = 32
+    oversized_second_header = b"\x1f\x8b\x08\x08" + b"\x00" * 6 + b"x" * 4096
+    (rawdata / read1_item["relative_path"]).write_bytes(
+        gzip.compress(b"") + oversized_second_header
+    )
+
+    response = client.post(
+        "/api/v1/analysis-runs",
+        {
+            "workflow": f"published:{version.workflow.slug}:{version.version}",
+            "dataset": dataset["id"],
+        },
+        format="json",
+    )
+
+    assert response.status_code == 400
+    assert response.data["error"]["code"] == "ANALYSIS_FASTQ_INVALID"
+
+
+def test_browser_submit_rejects_fastq_changed_during_validation(
+    client, analysis_workspace, monkeypatch
+):
+    version = _published_fastq_workflow()
+    catalog = client.get("/api/v1/analysis/catalog").data
+    dataset = catalog["datasets"][0]
+    rawdata, _, _, _ = analysis_workspace
+    read1_item = next(item for item in dataset["files"] if item["mate"] == 1)
+    read1 = rawdata / read1_item["relative_path"]
+    original_open = analysis_runs_module._open_regular_readonly
+
+    class ReplacingHandle:
+        def __init__(self, handle):
+            self.handle = handle
+
+        def __getattr__(self, name):
+            return getattr(self.handle, name)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            self.handle.close()
+            read1.write_bytes(b"changed")
+            return False
+
+    def open_with_replacement(path, **kwargs):
+        handle = original_open(path, **kwargs)
+        return ReplacingHandle(handle) if path == read1 else handle
+
+    monkeypatch.setattr(
+        analysis_runs_module,
+        "_open_regular_readonly",
+        open_with_replacement,
+    )
+
+    response = client.post(
+        "/api/v1/analysis-runs",
+        {
+            "workflow": f"published:{version.workflow.slug}:{version.version}",
+            "dataset": dataset["id"],
+        },
+        format="json",
+    )
+
+    assert response.status_code == 400
+    assert response.data["error"]["code"] == "ANALYSIS_RESOURCE_CHANGED"
 
 
 def test_catalog_adds_requested_historical_published_workflow(
@@ -1480,6 +1954,11 @@ def test_run_detail_and_output_download_only_use_recorded_output_key(
         started_at=started_at,
         finished_at=started_at + timedelta(seconds=12),
     )
+    manifest, output_status, error = build_output_manifest(run, run.outputs)
+    assert error is None
+    run.output_manifest = manifest
+    run.output_status = output_status
+    run.save(update_fields=["output_manifest", "output_status", "updated_at"])
 
     detail = client.get(f"/api/v1/analysis-runs/{run.id}")
     assert detail.status_code == 200
@@ -1525,6 +2004,1541 @@ def test_run_detail_and_output_download_only_use_recorded_output_key(
     assert missing.status_code == 404
 
 
+def test_incomplete_v2_manifest_keeps_verified_file_downloadable_without_legacy_fallback(
+    client, analysis_workspace, settings, monkeypatch
+):
+    asset, revision = _asset("partial-output", "PartialOutput")
+    _, _, runs, _ = analysis_workspace
+    run_directory = runs / "partial-output"
+    run_directory.mkdir(parents=True)
+    output = run_directory / "result.txt"
+    output.write_text("verified\n", encoding="utf-8")
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="PartialOutput",
+        sample_id="PARTIAL",
+        status=AnalysisRun.Status.SUCCEEDED,
+        progress=100,
+        work_directory=str(run_directory),
+        request_payload={
+            "integration_output_contract": [
+                {
+                    "key": "PartialOutput.result",
+                    "wdl_type": "File",
+                    "required": True,
+                },
+                {
+                    "key": "PartialOutput.note",
+                    "wdl_type": "String",
+                    "required": True,
+                },
+            ]
+        },
+        outputs={
+            "outputs": {
+                "PartialOutput.result": str(output),
+                "PartialOutput.note": "sensitive-marker-" + "x" * 100,
+            }
+        },
+    )
+    settings.ANALYSIS_OUTPUT_VALUE_MAX_BYTES = 16
+    manifest, output_status, error = build_output_manifest(run, run.outputs)
+    assert output_status == AnalysisRun.OutputStatus.INCOMPLETE
+    assert error["code"] == "OUTPUT_INTEGRITY_UNVERIFIABLE"
+    run.output_manifest = manifest
+    run.output_status = output_status
+    run.save(update_fields=["output_manifest", "output_status", "updated_at"])
+    monkeypatch.setattr(
+        "workflows.analysis_runs._flatten_outputs",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("v2 manifest must not read legacy outputs")
+        ),
+    )
+
+    listed = client.get("/api/v1/analysis-runs")
+    detail = client.get(f"/api/v1/analysis-runs/{run.id}")
+    downloaded = client.get(
+        f"/api/v1/analysis-runs/{run.id}/outputs",
+        {"key": "PartialOutput.result"},
+    )
+    incomplete = client.get(
+        f"/api/v1/analysis-runs/{run.id}/outputs",
+        {"key": "PartialOutput.note"},
+    )
+
+    assert listed.status_code == 200
+    assert listed.data["view"] == "summary"
+    assert listed.data["results"][0]["outputs"] == []
+    assert "sensitive-marker" not in str(listed.data)
+    outputs = {item["key"]: item for item in detail.data["outputs"]}
+    assert outputs["PartialOutput.result"]["download_url"]
+    assert outputs["PartialOutput.note"] == {
+        "key": "PartialOutput.note",
+        "kind": "unverifiable",
+        "name": "PartialOutput.note",
+        "reason": "output_value_size_exceeded",
+    }
+    assert downloaded.status_code == 200
+    assert b"".join(downloaded.streaming_content) == b"verified\n"
+    assert incomplete.status_code == 409
+    assert incomplete.data["error"]["code"] == "ANALYSIS_OUTPUT_INCOMPLETE"
+
+
+def test_browser_output_download_rejects_tampered_persisted_manifest(
+    client, analysis_workspace
+):
+    asset, revision = _asset("manifest-output", "ManifestOutput")
+    _, _, runs, _ = analysis_workspace
+    run_directory = runs / "manifest-run"
+    run_directory.mkdir(parents=True)
+    output = run_directory / "summary.txt"
+    output.write_text("original\n", encoding="utf-8")
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="ManifestOutput",
+        sample_id="MANIFEST",
+        actor="local-user",
+        status=AnalysisRun.Status.SUCCEEDED,
+        progress=100,
+        work_directory=str(run_directory),
+        outputs={
+            "outputs": {
+                "ManifestOutput.summary": str(output),
+                "ManifestOutput.optional": None,
+            }
+        },
+    )
+    manifest, output_status, error = build_output_manifest(
+        run, run.outputs
+    )
+    assert error is None
+    assert output_status == AnalysisRun.OutputStatus.COMPLETE
+    run.output_manifest = manifest
+    run.output_status = output_status
+    run.save(update_fields=["output_manifest", "output_status", "updated_at"])
+
+    detail = client.get(f"/api/v1/analysis-runs/{run.id}")
+    assert detail.status_code == 200
+    assert next(
+        item
+        for item in detail.data["outputs"]
+        if item["key"] == "ManifestOutput.optional"
+    )["value"] is None
+    item = next(
+        item
+        for item in detail.data["outputs"]
+        if item["key"] == "ManifestOutput.summary"
+    )
+    downloaded = client.get(item["download_url"])
+    assert downloaded.status_code == 200
+    assert b"".join(downloaded.streaming_content) == b"original\n"
+
+    output_stat = output.stat()
+    output.write_text("tampered\n", encoding="utf-8")
+    os.utime(output, ns=(output_stat.st_atime_ns, output_stat.st_mtime_ns))
+    changed = client.get(item["download_url"])
+    assert changed.status_code == 409
+    assert changed.data["error"]["code"] == "ANALYSIS_OUTPUT_CHANGED"
+
+
+def test_output_snapshot_is_reused_and_stream_handle_is_race_safe(
+    client, analysis_workspace
+):
+    asset, revision = _asset("snapshot-reuse", "SnapshotReuse")
+    _, _, runs, _ = analysis_workspace
+    run_directory = runs / "snapshot-reuse"
+    run_directory.mkdir(parents=True)
+    output = run_directory / "result.txt"
+    output.write_text("immutable\n", encoding="utf-8")
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="SnapshotReuse",
+        sample_id="REUSE",
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(run_directory),
+        outputs={
+            "outputs": {
+                "SnapshotReuse.first": str(output),
+                "SnapshotReuse.second": str(output),
+            }
+        },
+    )
+
+    manifest, output_status, error = build_output_manifest(run, run.outputs)
+
+    assert error is None
+    file_items = [item for item in manifest["items"] if item["kind"] == "file"]
+    assert len(file_items) == 2
+    assert file_items[0]["path"] == file_items[1]["path"]
+    assert file_items[0]["identity"] == file_items[1]["identity"]
+    _, handle = open_verified_output(file_items[0], run_root=run.work_directory)
+    output.write_text("changed after open\n", encoding="utf-8")
+    try:
+        assert handle.read() == b"immutable\n"
+    finally:
+        handle.close()
+
+    run.output_manifest = manifest
+    run.output_status = output_status
+    run.save(update_fields=["output_manifest", "output_status", "updated_at"])
+    for item in file_items:
+        response = client.get(
+            f"/api/v1/analysis-runs/{run.id}/outputs",
+            {"key": item["key"]},
+        )
+        assert response.status_code == 409
+
+
+def test_output_download_rejects_tampered_snapshot(client, analysis_workspace):
+    asset, revision = _asset("snapshot-tamper", "SnapshotTamper")
+    _, _, runs, _ = analysis_workspace
+    run_directory = runs / "snapshot-tamper"
+    run_directory.mkdir(parents=True)
+    output = run_directory / "result.txt"
+    output.write_text("trusted\n", encoding="utf-8")
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="SnapshotTamper",
+        sample_id="TAMPER",
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(run_directory),
+        outputs={"outputs": {"SnapshotTamper.result": str(output)}},
+    )
+    manifest, output_status, error = build_output_manifest(run, run.outputs)
+    assert error is None
+    run.output_manifest = manifest
+    run.output_status = output_status
+    run.save(update_fields=["output_manifest", "output_status", "updated_at"])
+    snapshot = Path(manifest["items"][0]["path"])
+    snapshot.chmod(0o644)
+    snapshot.write_text("attacker\n", encoding="utf-8")
+
+    response = client.get(
+        f"/api/v1/analysis-runs/{run.id}/outputs",
+        {"key": "SnapshotTamper.result"},
+    )
+
+    assert response.status_code == 409
+    assert response.data["error"]["code"] == "ANALYSIS_OUTPUT_CHANGED"
+
+
+def test_output_snapshot_limits_report_specific_incomplete_reason(
+    analysis_workspace, settings, monkeypatch
+):
+    asset, revision = _asset("snapshot-limits", "SnapshotLimits")
+    _, _, runs, _ = analysis_workspace
+    run_directory = runs / "snapshot-limits"
+    run_directory.mkdir(parents=True)
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="SnapshotLimits",
+        sample_id="LIMIT",
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(run_directory),
+        outputs={"outputs": {"SnapshotLimits.values": [1, 2, 3]}},
+    )
+    settings.ANALYSIS_OUTPUT_SNAPSHOT_MAX_ITEMS = 2
+
+    manifest, output_status, error = build_output_manifest(run, run.outputs)
+
+    assert output_status == AnalysisRun.OutputStatus.INCOMPLETE
+    assert error["code"] == "OUTPUT_INTEGRITY_UNVERIFIABLE"
+    assert manifest["unverifiable_outputs"] == [
+        {
+            "key": "SnapshotLimits.values[1]",
+            "reason": "output_snapshot_item_limit_exceeded",
+        }
+    ]
+
+    output = run_directory / "large.bin"
+    output.write_bytes(b"1234")
+    run.outputs = {"outputs": {"SnapshotLimits.file": str(output)}}
+    settings.ANALYSIS_OUTPUT_SNAPSHOT_MAX_ITEMS = 256
+    monkeypatch.setattr(
+        "workflows.integration_outputs.shutil.disk_usage",
+        lambda _path: type("Usage", (), {"free": 0})(),
+    )
+    manifest, output_status, _ = build_output_manifest(run, run.outputs)
+    assert output_status == AnalysisRun.OutputStatus.INCOMPLETE
+    assert manifest["unverifiable_outputs"][0]["reason"] == (
+        "output_snapshot_storage_insufficient"
+    )
+
+
+def test_output_snapshot_copy_is_bounded_when_source_grows(
+    analysis_workspace, settings, monkeypatch
+):
+    asset, revision = _asset("snapshot-growth", "SnapshotGrowth")
+    _, _, runs, _ = analysis_workspace
+    run_directory = runs / "snapshot-growth"
+    run_directory.mkdir(parents=True)
+    output = run_directory / "growing.bin"
+    output.write_bytes(b"a" * (2 * 1024 * 1024))
+    initial_size = output.stat().st_size
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="SnapshotGrowth",
+        sample_id="GROWTH",
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(run_directory),
+        outputs={"outputs": {"SnapshotGrowth.file": str(output)}},
+    )
+    settings.ANALYSIS_OUTPUT_SNAPSHOT_MIN_FREE_BYTES = 0
+    original_open = analysis_runs_module._open_regular_readonly
+    bytes_read = 0
+
+    class GrowingHandle:
+        def __init__(self, handle):
+            self.handle = handle
+            self.appended = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.handle.close()
+
+        def fileno(self):
+            return self.handle.fileno()
+
+        def read(self, size=-1):
+            nonlocal bytes_read
+            data = self.handle.read(size)
+            bytes_read += len(data)
+            if not self.appended:
+                with output.open("ab") as writer:
+                    writer.write(b"b" * (4 * 1024 * 1024))
+                self.appended = True
+            return data
+
+        def seek(self, *args):
+            return self.handle.seek(*args)
+
+    def open_with_growth(path, **kwargs):
+        handle = original_open(path, **kwargs)
+        return GrowingHandle(handle) if Path(path) == output else handle
+
+    monkeypatch.setattr(
+        "workflows.integration_outputs._open_regular_readonly",
+        open_with_growth,
+    )
+
+    manifest, output_status, error = build_output_manifest(run, run.outputs)
+
+    assert output_status == AnalysisRun.OutputStatus.INCOMPLETE
+    assert error["code"] == "OUTPUT_INTEGRITY_UNVERIFIABLE"
+    assert manifest["unverifiable_outputs"][0]["reason"] == "file_digest_failed"
+    assert bytes_read <= initial_size + 1
+    assert not list((run_directory / ".verified-outputs").glob(".snapshot-*"))
+
+
+def test_output_snapshot_rejects_atomic_source_replacement(
+    analysis_workspace, settings, monkeypatch
+):
+    asset, revision = _asset("snapshot-replace", "SnapshotReplace")
+    _, _, runs, _ = analysis_workspace
+    run_directory = runs / "snapshot-replace"
+    run_directory.mkdir(parents=True)
+    output = run_directory / "output.bin"
+    output.write_bytes(b"a" * (2 * 1024 * 1024))
+    replacement = run_directory / "replacement.bin"
+    replacement.write_bytes(b"b" * output.stat().st_size)
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="SnapshotReplace",
+        sample_id="REPLACE",
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(run_directory),
+        outputs={"outputs": {"SnapshotReplace.file": str(output)}},
+    )
+    settings.ANALYSIS_OUTPUT_SNAPSHOT_MIN_FREE_BYTES = 0
+    original_open = analysis_runs_module._open_regular_readonly
+    replaced = False
+
+    class ReplacingHandle:
+        def __init__(self, handle):
+            self.handle = handle
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.handle.close()
+
+        def fileno(self):
+            return self.handle.fileno()
+
+        def read(self, size=-1):
+            nonlocal replaced
+            data = self.handle.read(size)
+            if data and not replaced:
+                os.replace(replacement, output)
+                replaced = True
+            return data
+
+    def open_with_replacement(path, **kwargs):
+        handle = original_open(path, **kwargs)
+        return ReplacingHandle(handle) if Path(path) == output else handle
+
+    monkeypatch.setattr(
+        "workflows.integration_outputs._open_regular_readonly",
+        open_with_replacement,
+    )
+
+    manifest, output_status, error = build_output_manifest(run, run.outputs)
+
+    assert replaced is True
+    assert output_status == AnalysisRun.OutputStatus.INCOMPLETE
+    assert error["code"] == "OUTPUT_INTEGRITY_UNVERIFIABLE"
+    assert manifest["unverifiable_outputs"][0]["reason"] == "file_digest_failed"
+    snapshot_root = run_directory / ".verified-outputs"
+    assert not list(snapshot_root.glob(".snapshot-*"))
+    assert not [item for item in snapshot_root.iterdir() if not item.name.startswith(".")]
+
+
+def test_output_snapshot_rejects_ancestor_symlink_replacement(
+    analysis_workspace, tmp_path, monkeypatch
+):
+    asset, revision = _asset("snapshot-ancestor", "SnapshotAncestor")
+    _, _, runs, _ = analysis_workspace
+    run_directory = runs / "snapshot-ancestor"
+    output_directory = run_directory / "lane"
+    output_directory.mkdir(parents=True)
+    output = output_directory / "result.txt"
+    output.write_text("trusted\n", encoding="utf-8")
+    outside_directory = tmp_path / "outside-output"
+    outside_directory.mkdir()
+    (outside_directory / output.name).write_text("secret\n", encoding="utf-8")
+    moved_directory = run_directory / "lane-original"
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="SnapshotAncestor",
+        sample_id="ANCESTOR",
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(run_directory),
+        outputs={"outputs": {"SnapshotAncestor.file": str(output)}},
+    )
+    original_open = analysis_runs_module._open_regular_readonly
+    replaced = False
+
+    def open_after_ancestor_replacement(path, **kwargs):
+        nonlocal replaced
+        if Path(path) == output and not replaced:
+            output_directory.rename(moved_directory)
+            output_directory.symlink_to(outside_directory, target_is_directory=True)
+            replaced = True
+        return original_open(path, **kwargs)
+
+    monkeypatch.setattr(
+        "workflows.integration_outputs._open_regular_readonly",
+        open_after_ancestor_replacement,
+    )
+
+    manifest, output_status, error = build_output_manifest(run, run.outputs)
+
+    assert replaced is True
+    assert output_status == AnalysisRun.OutputStatus.INCOMPLETE
+    assert error["code"] == "OUTPUT_INTEGRITY_UNVERIFIABLE"
+    assert manifest["unverifiable_outputs"] == [
+        {
+            "key": "SnapshotAncestor.file",
+            "reason": "file_digest_failed",
+        }
+    ]
+    snapshot_root = run_directory / ".verified-outputs"
+    assert list(snapshot_root.iterdir()) == []
+
+
+def test_output_snapshot_rejects_snapshot_directory_replacement(
+    analysis_workspace, monkeypatch
+):
+    asset, revision = _asset("snapshot-store-race", "SnapshotStoreRace")
+    _, _, runs, _ = analysis_workspace
+    run_directory = runs / "snapshot-store-race"
+    run_directory.mkdir(parents=True)
+    output = run_directory / "result.txt"
+    output.write_text("trusted\n", encoding="utf-8")
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="SnapshotStoreRace",
+        sample_id="STORE-RACE",
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(run_directory),
+        outputs={"outputs": {"SnapshotStoreRace.file": str(output)}},
+    )
+    snapshot_root = run_directory / ".verified-outputs"
+    moved_snapshot_root = run_directory / ".verified-outputs-moved"
+    original_open = os.open
+    snapshot_open_count = 0
+
+    def open_after_snapshot_directory_replacement(path, *args, **kwargs):
+        nonlocal snapshot_open_count
+        if path == ".verified-outputs" and kwargs.get("dir_fd") is not None:
+            snapshot_open_count += 1
+            if snapshot_open_count == 2:
+                snapshot_root.rename(moved_snapshot_root)
+                snapshot_root.mkdir()
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "workflows.integration_outputs.os.open",
+        open_after_snapshot_directory_replacement,
+    )
+
+    manifest, output_status, error = build_output_manifest(run, run.outputs)
+
+    assert snapshot_open_count == 2
+    assert output_status == AnalysisRun.OutputStatus.INCOMPLETE
+    assert error["code"] == "OUTPUT_INTEGRITY_UNVERIFIABLE"
+    assert manifest["unverifiable_outputs"] == [
+        {
+            "key": "SnapshotStoreRace.file",
+            "reason": "file_digest_failed",
+        }
+    ]
+    assert list(snapshot_root.iterdir()) == []
+    assert not [
+        item for item in moved_snapshot_root.iterdir() if not item.name.startswith(".")
+    ]
+
+
+def test_output_traversal_budget_counts_null_array_items(
+    analysis_workspace, settings
+):
+    asset, revision = _asset("snapshot-null-budget", "SnapshotNullBudget")
+    _, _, runs, _ = analysis_workspace
+    run_directory = runs / "snapshot-null-budget"
+    run_directory.mkdir(parents=True)
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="SnapshotNullBudget",
+        sample_id="NULLS",
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(run_directory),
+        outputs={"outputs": {"SnapshotNullBudget.values": [None, None, None]}},
+    )
+    settings.ANALYSIS_OUTPUT_SNAPSHOT_MAX_ITEMS = 2
+
+    manifest, output_status, _ = build_output_manifest(run, run.outputs)
+
+    assert output_status == AnalysisRun.OutputStatus.INCOMPLETE
+    assert manifest["unverifiable_outputs"] == [
+        {
+            "key": "SnapshotNullBudget.values[1]",
+            "reason": "output_snapshot_item_limit_exceeded",
+        }
+    ]
+
+
+def test_contracted_output_container_shapes_fail_closed(analysis_workspace):
+    asset, revision = _asset("output-shapes", "OutputShapes")
+    _, _, runs, _ = analysis_workspace
+    run_directory = runs / "output-shapes"
+    run_directory.mkdir(parents=True)
+    contract = {
+        "key": "OutputShapes.value",
+        "name": "value",
+        "label": "Value",
+        "semantic_type": "core.value.string",
+        "wdl_type": "Array[String]",
+        "required": True,
+    }
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="OutputShapes",
+        sample_id="SHAPES",
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(run_directory),
+        request_payload={"integration_output_contract": [contract]},
+        outputs={"outputs": {"OutputShapes.value": []}},
+    )
+
+    manifest, output_status, error = build_output_manifest(run, run.outputs)
+    assert output_status == AnalysisRun.OutputStatus.COMPLETE
+    assert error is None
+    assert manifest["items"][0]["value"] == []
+
+    run.outputs = {"outputs": {"OutputShapes.value": "not-an-array"}}
+    manifest, output_status, _ = build_output_manifest(run, run.outputs)
+    assert output_status == AnalysisRun.OutputStatus.INCOMPLETE
+    assert manifest["unverifiable_outputs"][0]["reason"] == "output_type_invalid"
+
+    contract["wdl_type"] = "Pair[String,String]"
+    run.request_payload = {"integration_output_contract": [contract]}
+    run.outputs = {
+        "outputs": {"OutputShapes.value": {"left": None, "right": "ok"}}
+    }
+    manifest, output_status, _ = build_output_manifest(run, run.outputs)
+    assert output_status == AnalysisRun.OutputStatus.INCOMPLETE
+    assert manifest["unverifiable_outputs"][0]["key"] == "OutputShapes.value.left"
+
+
+def test_uncontracted_output_keys_are_bounded(analysis_workspace, settings):
+    asset, revision = _asset("output-extra-keys", "OutputExtraKeys")
+    _, _, runs, _ = analysis_workspace
+    run_directory = runs / "output-extra-keys"
+    run_directory.mkdir(parents=True)
+    contract = {
+        "key": "OutputExtraKeys.expected",
+        "name": "expected",
+        "semantic_type": "core.value.string",
+        "wdl_type": "String",
+        "required": True,
+    }
+    values = {"OutputExtraKeys.expected": "ok"}
+    values.update({f"OutputExtraKeys.extra{index}": index for index in range(10)})
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="OutputExtraKeys",
+        sample_id="EXTRA",
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(run_directory),
+        request_payload={"integration_output_contract": [contract]},
+        outputs={"outputs": values},
+    )
+    settings.ANALYSIS_OUTPUT_SNAPSHOT_MAX_ITEMS = 2
+
+    manifest, output_status, _ = build_output_manifest(run, run.outputs)
+
+    assert output_status == AnalysisRun.OutputStatus.INCOMPLETE
+    assert manifest["uncontracted_output_key_count"] == 10
+    assert len(manifest["uncontracted_output_keys"]) == 2
+    assert manifest["uncontracted_output_keys_truncated"] is True
+    assert manifest["unverifiable_outputs"][-1]["reason"] == (
+        "output_manifest_uncontracted_key_limit_exceeded"
+    )
+
+
+def test_missing_output_contract_is_bounded(analysis_workspace, settings):
+    asset, revision = _asset("missing-contract-budget", "MissingContractBudget")
+    _, _, runs, _ = analysis_workspace
+    run_directory = runs / "missing-contract-budget"
+    run_directory.mkdir(parents=True)
+    contract = [
+        {
+            "key": f"MissingContractBudget.result{index}",
+            "name": f"result{index}",
+            "semantic_type": "core.value.string",
+            "wdl_type": "String",
+            "required": True,
+        }
+        for index in range(10)
+    ]
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="MissingContractBudget",
+        sample_id="MISSING-CONTRACT-BUDGET",
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(run_directory),
+        request_payload={"integration_output_contract": contract},
+        outputs={"outputs": {}},
+    )
+    settings.ANALYSIS_OUTPUT_SNAPSHOT_MAX_ITEMS = 2
+
+    manifest, output_status, error = build_output_manifest(run, run.outputs)
+
+    assert output_status == AnalysisRun.OutputStatus.INCOMPLETE
+    assert error["code"] == "REQUIRED_OUTPUT_MISSING"
+    assert len(manifest["missing_required"]) == 2
+    assert manifest["missing_required_truncated"] is True
+    assert manifest["unverifiable_outputs"][-1]["reason"] == (
+        "output_snapshot_item_limit_exceeded"
+    )
+
+
+def test_directory_output_cannot_overlap_snapshot_store(analysis_workspace):
+    asset, revision = _asset("snapshot-directory-conflict", "SnapshotConflict")
+    _, _, runs, _ = analysis_workspace
+    run_directory = runs / "snapshot-directory-conflict"
+    snapshot_root = run_directory / ".verified-outputs"
+    snapshot_root.mkdir(parents=True)
+    output = run_directory / "result.txt"
+    output.write_text("result\n", encoding="utf-8")
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="SnapshotConflict",
+        sample_id="CONFLICT",
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(run_directory),
+        request_payload={
+            "integration_output_contract": [
+                {
+                    "key": "SnapshotConflict.directory",
+                    "wdl_type": "Directory",
+                    "required": True,
+                },
+                {
+                    "key": "SnapshotConflict.file",
+                    "wdl_type": "File",
+                    "required": True,
+                },
+            ]
+        },
+        outputs={
+            "outputs": {
+                "SnapshotConflict.directory": str(snapshot_root),
+                "SnapshotConflict.file": str(output),
+            }
+        },
+    )
+
+    manifest, output_status, _ = build_output_manifest(run, run.outputs)
+
+    assert output_status == AnalysisRun.OutputStatus.INCOMPLETE
+    assert manifest["unverifiable_outputs"][0]["reason"] == (
+        "output_directory_conflicts_with_snapshot_store"
+    )
+
+
+def test_output_snapshot_checkpoint_aborts_and_removes_temporary_file(
+    analysis_workspace, settings
+):
+    asset, revision = _asset("snapshot-cancel", "SnapshotCancel")
+    _, _, runs, _ = analysis_workspace
+    run_directory = runs / "snapshot-cancel"
+    run_directory.mkdir(parents=True)
+    output = run_directory / "large.bin"
+    output.write_bytes(b"x" * (2 * 1024 * 1024))
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="SnapshotCancel",
+        sample_id="CANCEL",
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(run_directory),
+        outputs={"outputs": {"SnapshotCancel.file": str(output)}},
+    )
+    settings.ANALYSIS_OUTPUT_SNAPSHOT_MIN_FREE_BYTES = 0
+    checkpoints = 0
+
+    def cancel_during_copy():
+        nonlocal checkpoints
+        checkpoints += 1
+        if checkpoints == 3:
+            raise RuntimeError("lease lost")
+
+    with pytest.raises(RuntimeError, match="lease lost"):
+        build_output_manifest(
+            run,
+            run.outputs,
+            checkpoint=cancel_during_copy,
+        )
+
+    snapshot_root = run_directory / ".verified-outputs"
+    assert not list(snapshot_root.glob(".snapshot-*"))
+
+
+def test_output_snapshot_checkpoint_before_publish_leaves_no_target(
+    analysis_workspace, settings
+):
+    asset, revision = _asset("snapshot-prepublish-cancel", "SnapshotPrepublishCancel")
+    _, _, runs, _ = analysis_workspace
+    run_directory = runs / "snapshot-prepublish-cancel"
+    run_directory.mkdir(parents=True)
+    output = run_directory / "result.bin"
+    output.write_bytes(b"verified output")
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="SnapshotPrepublishCancel",
+        sample_id="PREPUBLISH-CANCEL",
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(run_directory),
+        outputs={
+            "outputs": {"SnapshotPrepublishCancel.result": str(output)}
+        },
+    )
+    settings.ANALYSIS_OUTPUT_SNAPSHOT_MIN_FREE_BYTES = 0
+    checkpoints = 0
+
+    def cancel_during_snapshot_rehash():
+        nonlocal checkpoints
+        checkpoints += 1
+        if checkpoints == 5:
+            raise RuntimeError("lease lost before publish")
+
+    with pytest.raises(RuntimeError, match="lease lost before publish"):
+        build_output_manifest(
+            run,
+            run.outputs,
+            checkpoint=cancel_during_snapshot_rehash,
+        )
+
+    snapshot_root = run_directory / ".verified-outputs"
+    assert list(snapshot_root.iterdir()) == []
+
+
+def test_output_snapshot_directory_fsync_failure_removes_published_target(
+    analysis_workspace, settings, monkeypatch
+):
+    asset, revision = _asset("snapshot-fsync-failure", "SnapshotFsyncFailure")
+    _, _, runs, _ = analysis_workspace
+    run_directory = runs / "snapshot-fsync-failure"
+    run_directory.mkdir(parents=True)
+    output = run_directory / "result.bin"
+    output.write_bytes(b"verified output")
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="SnapshotFsyncFailure",
+        sample_id="FSYNC-FAILURE",
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(run_directory),
+        outputs={"outputs": {"SnapshotFsyncFailure.result": str(output)}},
+    )
+    settings.ANALYSIS_OUTPUT_SNAPSHOT_MIN_FREE_BYTES = 0
+    original_fsync = os.fsync
+
+    def fail_directory_fsync(descriptor):
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError("directory fsync failed")
+        return original_fsync(descriptor)
+
+    monkeypatch.setattr("workflows.integration_outputs.os.fsync", fail_directory_fsync)
+
+    manifest, output_status, error = build_output_manifest(run, run.outputs)
+
+    assert output_status == AnalysisRun.OutputStatus.INCOMPLETE
+    assert error["code"] == "OUTPUT_INTEGRITY_UNVERIFIABLE"
+    assert manifest["unverifiable_outputs"][0]["reason"] == "file_digest_failed"
+    snapshot_root = run_directory / ".verified-outputs"
+    assert not [path for path in snapshot_root.iterdir() if not path.name.startswith(".")]
+
+
+def test_output_snapshot_accepts_hardlink_ctime_change(
+    analysis_workspace, settings, monkeypatch
+):
+    asset, revision = _asset("snapshot-link-ctime", "SnapshotLinkCtime")
+    _, _, runs, _ = analysis_workspace
+    run_directory = runs / "snapshot-link-ctime"
+    run_directory.mkdir(parents=True)
+    output = run_directory / "result.bin"
+    output.write_bytes(b"verified output")
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="SnapshotLinkCtime",
+        sample_id="LINK-CTIME",
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(run_directory),
+        outputs={"outputs": {"SnapshotLinkCtime.result": str(output)}},
+    )
+    settings.ANALYSIS_OUTPUT_SNAPSHOT_MIN_FREE_BYTES = 0
+    original_link = os.link
+    ctime_changed = False
+
+    def link_with_distinct_ctime(source, target, **kwargs):
+        nonlocal ctime_changed
+        before_ctime = os.stat(
+            source,
+            dir_fd=kwargs.get("src_dir_fd"),
+            follow_symlinks=False,
+        ).st_ctime_ns
+        original_link(source, target, **kwargs)
+        for _ in range(100):
+            os.chmod(target, 0o444, dir_fd=kwargs.get("dst_dir_fd"))
+            if (
+                os.stat(
+                    target,
+                    dir_fd=kwargs.get("dst_dir_fd"),
+                    follow_symlinks=False,
+                ).st_ctime_ns
+                != before_ctime
+            ):
+                ctime_changed = True
+                return
+            time.sleep(0.001)
+        raise AssertionError("hardlink ctime did not change")
+
+    monkeypatch.setattr("workflows.integration_outputs.os.link", link_with_distinct_ctime)
+
+    manifest, output_status, error = build_output_manifest(run, run.outputs)
+
+    assert ctime_changed is True
+    assert error is None
+    assert output_status == AnalysisRun.OutputStatus.COMPLETE
+    assert output_manifest_is_current(manifest)
+
+
+def test_output_directory_snapshot_uses_one_global_entry_budget(
+    analysis_workspace, settings
+):
+    asset, revision = _asset("directory-budget", "DirectoryBudget")
+    _, _, runs, _ = analysis_workspace
+    run_directory = runs / "directory-budget"
+    output_directory = run_directory / "result"
+    output_directory.mkdir(parents=True)
+    (output_directory / "one.txt").write_text("one\n", encoding="utf-8")
+    (output_directory / "two.txt").write_text("two\n", encoding="utf-8")
+    settings.ANALYSIS_OUTPUT_SNAPSHOT_MAX_DIRECTORY_ENTRIES = 3
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="DirectoryBudget",
+        sample_id="DIRECTORY-BUDGET",
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(run_directory),
+        request_payload={
+            "integration_output_contract": [
+                {
+                    "key": "DirectoryBudget.result",
+                    "wdl_type": "Directory",
+                    "required": True,
+                }
+            ]
+        },
+        outputs={
+            "outputs": {"DirectoryBudget.result": str(output_directory)}
+        },
+    )
+
+    manifest, output_status, error = build_output_manifest(run, run.outputs)
+
+    assert output_status == AnalysisRun.OutputStatus.INCOMPLETE
+    assert error["code"] == "OUTPUT_INTEGRITY_UNVERIFIABLE"
+    assert manifest["unverifiable_outputs"] == [
+        {
+            "key": "DirectoryBudget.result",
+            "reason": "output_snapshot_directory_entry_limit_exceeded",
+        }
+    ]
+
+
+def test_output_directory_snapshot_reuses_identical_source(
+    analysis_workspace,
+):
+    asset, revision = _asset("directory-cache", "DirectoryCache")
+    _, _, runs, _ = analysis_workspace
+    run_directory = runs / "directory-cache"
+    output_directory = run_directory / "result"
+    output_directory.mkdir(parents=True)
+    (output_directory / "result.txt").write_text("ok\n", encoding="utf-8")
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="DirectoryCache",
+        sample_id="DIRECTORY-CACHE",
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(run_directory),
+        request_payload={
+            "integration_output_contract": [
+                {"key": key, "wdl_type": "Directory", "required": True}
+                for key in ("DirectoryCache.first", "DirectoryCache.second")
+            ]
+        },
+        outputs={
+            "outputs": {
+                "DirectoryCache.first": str(output_directory),
+                "DirectoryCache.second": str(output_directory),
+            }
+        },
+    )
+
+    with patch(
+        "workflows.integration_outputs._directory_manifest",
+        wraps=_directory_manifest,
+    ) as snapshot:
+        manifest, output_status, error = build_output_manifest(run, run.outputs)
+
+    assert error is None
+    assert output_status == AnalysisRun.OutputStatus.COMPLETE
+    assert len(manifest["items"]) == 2
+    assert snapshot.call_count == 2
+
+
+def test_directory_manifest_closes_child_descriptor_when_checkpoint_aborts(
+    tmp_path: Path,
+):
+    root = tmp_path / "descriptor-cleanup"
+    (root / "child").mkdir(parents=True)
+    opened: list[int] = []
+    closed: list[int] = []
+    original_open = os.open
+    original_close = os.close
+
+    def tracked_open(*args, **kwargs):
+        descriptor = original_open(*args, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+
+    def tracked_close(descriptor):
+        closed.append(descriptor)
+        original_close(descriptor)
+
+    def abort_after_child_open():
+        if len(opened) >= 2:
+            raise RuntimeError("lease lost")
+
+    with (
+        patch("workflows.directory_identity.os.open", side_effect=tracked_open),
+        patch("workflows.directory_identity.os.close", side_effect=tracked_close),
+        pytest.raises(RuntimeError, match="lease lost"),
+    ):
+        _directory_manifest(root, checkpoint=abort_after_child_open)
+
+    assert opened
+    assert set(opened) <= set(closed)
+
+
+def test_browser_output_download_refuses_legacy_file_without_manifest(
+    client, analysis_workspace
+):
+    asset, revision = _asset("legacy-output", "LegacyOutput")
+    _, _, runs, _ = analysis_workspace
+    run_directory = runs / "legacy-run"
+    run_directory.mkdir(parents=True)
+    output = run_directory / "result.txt"
+    output.write_text("legacy\n", encoding="utf-8")
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="LegacyOutput",
+        sample_id="LEGACY",
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(run_directory),
+        outputs={"outputs": {"LegacyOutput.result": str(output)}},
+    )
+
+    response = client.get(
+        f"/api/v1/analysis-runs/{run.id}/outputs",
+        {"key": "LegacyOutput.result"},
+    )
+
+    assert response.status_code == 409
+    assert response.data["error"]["code"] == "ANALYSIS_OUTPUT_UNVERIFIED"
+
+    dry_run = io.StringIO()
+    call_command(
+        "backfill_analysis_output_manifests",
+        dry_run=True,
+        stdout=dry_run,
+    )
+    run.refresh_from_db()
+    assert run.output_manifest == {}
+    assert "待补建 1 条" in dry_run.getvalue()
+
+    call_command(
+        "backfill_analysis_output_manifests",
+        actor="pytest",
+        stdout=io.StringIO(),
+    )
+    run.refresh_from_db()
+    assert run.output_manifest["schema_version"] == 1
+    assert run.output_manifest["provenance"]["kind"] == "historical_backfill"
+    assert run.output_manifest["provenance"]["source"] == "management-command:pytest"
+    assert run.output_manifest["provenance"]["baselined_at"]
+    assert run.events.filter(kind="output_manifest_backfill").count() == 1
+
+    downloaded = client.get(
+        f"/api/v1/analysis-runs/{run.id}/outputs",
+        {"key": "LegacyOutput.result"},
+    )
+    assert downloaded.status_code == 200
+    assert b"".join(downloaded.streaming_content) == b"legacy\n"
+
+    call_command(
+        "backfill_analysis_output_manifests",
+        actor="pytest-rerun",
+        stdout=io.StringIO(),
+    )
+    assert run.events.filter(kind="output_manifest_backfill").count() == 1
+
+
+def test_browser_output_download_treats_schema_v1_without_integrity_as_unverified(
+    client, analysis_workspace
+):
+    asset, revision = _asset("legacy-v1-output", "LegacyV1Output")
+    _, _, runs, _ = analysis_workspace
+    run_directory = runs / "legacy-v1-run"
+    run_directory.mkdir(parents=True)
+    output = run_directory / "result.txt"
+    output.write_text("legacy\n", encoding="utf-8")
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="LegacyV1Output",
+        sample_id="LEGACY-V1",
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(run_directory),
+        outputs={"outputs": {"LegacyV1Output.result": str(output)}},
+        output_manifest={
+            "schema_version": 1,
+            "items": [
+                {
+                    "key": "LegacyV1Output.result",
+                    "kind": "file",
+                    "path": str(output),
+                    "sha256": _sha256(output),
+                }
+            ],
+        },
+    )
+
+    detail = client.get(f"/api/v1/analysis-runs/{run.id}")
+    assert detail.status_code == 200
+    assert "download_url" not in detail.data["outputs"][0]
+    download = client.get(
+        f"/api/v1/analysis-runs/{run.id}/outputs",
+        {"key": "LegacyV1Output.result"},
+    )
+
+    assert download.status_code == 409
+    assert download.data["error"]["code"] == "ANALYSIS_OUTPUT_UNVERIFIED"
+
+
+def test_backfill_preserves_legacy_file_evidence_and_created_at(
+    analysis_workspace,
+):
+    asset, revision = _asset("legacy-evidence", "LegacyEvidence")
+    _, _, runs, _ = analysis_workspace
+    run_directory = runs / "legacy-evidence"
+    run_directory.mkdir(parents=True)
+    output = run_directory / "result.txt"
+    output.write_text("original\n", encoding="utf-8")
+    created_at = "2025-01-02T03:04:05+00:00"
+    legacy_manifest = {
+        "schema_version": 1,
+        "created_at": created_at,
+        "items": [
+            {
+                "key": "LegacyEvidence.result",
+                "kind": "file",
+                "path": str(output),
+                "sha256": _sha256(output),
+            }
+        ],
+    }
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="LegacyEvidence",
+        sample_id="EVIDENCE",
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(run_directory),
+        outputs={"outputs": {"LegacyEvidence.result": str(output)}},
+        output_manifest=legacy_manifest,
+        output_status=AnalysisRun.OutputStatus.INCOMPLETE,
+        error="输出清单不完整。",
+        error_code="OUTPUT_INTEGRITY_UNVERIFIABLE",
+        error_category="application",
+        error_details={"unverifiable": ["LegacyEvidence.result"]},
+    )
+
+    assert backfill_output_manifest(run, source="pytest") is True
+    run.refresh_from_db()
+
+    assert run.output_manifest["integrity_version"] == 2
+    assert run.output_manifest["created_at"] == created_at
+    assert run.output_manifest["items"][0]["sha256"] == legacy_manifest["items"][0]["sha256"]
+    assert run.output_status == AnalysisRun.OutputStatus.COMPLETE
+    assert run.error == ""
+    assert run.error_code == ""
+    assert run.error_category == ""
+    assert run.error_retryable is False
+    assert run.error_details == {}
+    provenance = run.output_manifest["provenance"]
+    assert provenance["kind"] == "completion_manifest_upgrade"
+    assert provenance["previous_manifest_digest"].startswith("sha256:")
+    assert provenance["baselined_directory_keys"] == []
+
+
+def test_backfill_rejects_unknown_legacy_manifest_item(analysis_workspace):
+    asset, revision = _asset("legacy-unknown-item", "LegacyUnknownItem")
+    _, _, runs, _ = analysis_workspace
+    run_directory = runs / "legacy-unknown-item"
+    run_directory.mkdir(parents=True)
+    output = run_directory / "result.txt"
+    output.write_text("original\n", encoding="utf-8")
+    legacy_manifest = {
+        "schema_version": 1,
+        "items": [{"key": "LegacyUnknownItem.result", "kind": "mystery"}],
+    }
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="LegacyUnknownItem",
+        sample_id="UNKNOWN-ITEM",
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(run_directory),
+        outputs={"outputs": {"LegacyUnknownItem.result": str(output)}},
+        output_manifest=legacy_manifest,
+    )
+
+    with pytest.raises(ValueError, match="未知条目类型"):
+        backfill_output_manifest(run, source="pytest")
+    run.refresh_from_db()
+
+    assert run.output_manifest == legacy_manifest
+
+
+def test_backfill_repairs_status_for_current_manifest(analysis_workspace):
+    asset, revision = _asset("current-status", "CurrentStatus")
+    _, _, runs, _ = analysis_workspace
+    run_directory = runs / "current-status"
+    run_directory.mkdir(parents=True)
+    output = run_directory / "result.txt"
+    output.write_text("original\n", encoding="utf-8")
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="CurrentStatus",
+        sample_id="CURRENT-STATUS",
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(run_directory),
+        outputs={"outputs": {"CurrentStatus.result": str(output)}},
+    )
+    manifest, output_status, error = build_output_manifest(run, run.outputs)
+    assert error is None
+    assert output_status == AnalysisRun.OutputStatus.COMPLETE
+    run.output_manifest = manifest
+    run.output_status = AnalysisRun.OutputStatus.INCOMPLETE
+    run.error = "输出清单不完整。"
+    run.error_code = "REQUIRED_OUTPUT_MISSING"
+    run.error_category = "application"
+    run.error_retryable = False
+    run.error_details = {"missing": ["CurrentStatus.result"]}
+    run.save(
+        update_fields=[
+            "output_manifest",
+            "output_status",
+            "error",
+            "error_code",
+            "error_category",
+            "error_retryable",
+            "error_details",
+            "updated_at",
+        ]
+    )
+
+    assert backfill_output_manifest(run, source="pytest") is True
+    run.refresh_from_db()
+
+    assert run.output_status == AnalysisRun.OutputStatus.COMPLETE
+    assert run.error == ""
+    assert run.error_code == ""
+    assert run.error_category == ""
+    assert run.error_retryable is False
+    assert run.error_details == {}
+    assert run.events.filter(
+        kind="output_manifest_backfill",
+        details__repair="output_status",
+    ).exists()
+
+
+def test_backfill_command_reports_resumable_failure_cursor(analysis_workspace):
+    asset, revision = _asset("backfill-cursor", "BackfillCursor")
+    _, _, runs, _ = analysis_workspace
+    first_id = uuid.UUID(int=1)
+    second_id = uuid.UUID(int=2)
+    first = AnalysisRun.objects.create(
+        id=first_id,
+        asset=asset,
+        revision=revision,
+        workflow_name="BackfillCursor",
+        sample_id="CURSOR-FAIL",
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(runs / "missing"),
+        outputs={"outputs": {}},
+    )
+    run_directory = runs / "cursor-success"
+    run_directory.mkdir(parents=True)
+    output = run_directory / "result.txt"
+    output.write_text("ok\n", encoding="utf-8")
+    second = AnalysisRun.objects.create(
+        id=second_id,
+        asset=asset,
+        revision=revision,
+        workflow_name="BackfillCursor",
+        sample_id="CURSOR-SUCCESS",
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(run_directory),
+        outputs={"outputs": {"BackfillCursor.result": str(output)}},
+    )
+
+    with pytest.raises(CommandError, match=f"最后 ID: {first.id}"):
+        call_command(
+            "backfill_analysis_output_manifests",
+            limit=1,
+            actor="pytest",
+            stdout=io.StringIO(),
+            stderr=io.StringIO(),
+        )
+    second.refresh_from_db()
+    assert second.output_manifest == {}
+
+    call_command(
+        "backfill_analysis_output_manifests",
+        after_id=str(first.id),
+        limit=1,
+        actor="pytest",
+        stdout=io.StringIO(),
+    )
+    second.refresh_from_db()
+    assert output_manifest_is_current(second.output_manifest)
+
+
+def test_backfill_rejects_tampered_legacy_file_without_overwriting_evidence(
+    analysis_workspace,
+):
+    asset, revision = _asset("legacy-tamper", "LegacyTamper")
+    _, _, runs, _ = analysis_workspace
+    run_directory = runs / "legacy-tamper"
+    run_directory.mkdir(parents=True)
+    output = run_directory / "result.txt"
+    output.write_text("original\n", encoding="utf-8")
+    legacy_manifest = {
+        "schema_version": 1,
+        "items": [
+            {
+                "key": "LegacyTamper.result",
+                "kind": "file",
+                "path": str(output),
+                "sha256": _sha256(output),
+            }
+        ],
+    }
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="LegacyTamper",
+        sample_id="TAMPER",
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(run_directory),
+        outputs={"outputs": {"LegacyTamper.result": str(output)}},
+        output_manifest=legacy_manifest,
+        output_status=AnalysisRun.OutputStatus.COMPLETE,
+    )
+    output.write_text("tampered\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="原完整性证据不一致"):
+        backfill_output_manifest(run, source="pytest")
+    run.refresh_from_db()
+
+    assert run.output_manifest == legacy_manifest
+    assert run.events.filter(kind="output_manifest_backfill").count() == 0
+
+
+def test_backfill_records_legacy_directory_without_digest_as_baseline(
+    analysis_workspace,
+):
+    asset, revision = _asset("legacy-directory", "LegacyDirectory")
+    _, _, runs, _ = analysis_workspace
+    run_directory = runs / "legacy-directory"
+    output_directory = run_directory / "result"
+    output_directory.mkdir(parents=True)
+    (output_directory / "summary.txt").write_text("ok\n", encoding="utf-8")
+    legacy_manifest = {
+        "schema_version": 1,
+        "items": [
+            {
+                "key": "LegacyDirectory.result",
+                "kind": "directory",
+                "path": str(output_directory),
+                "identity": {},
+            }
+        ],
+    }
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="LegacyDirectory",
+        sample_id="DIRECTORY",
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(run_directory),
+        outputs={"outputs": {"LegacyDirectory.result": str(output_directory)}},
+        output_manifest=legacy_manifest,
+    )
+
+    assert backfill_output_manifest(run, source="pytest") is True
+    run.refresh_from_db()
+
+    assert run.output_manifest["items"][0]["digest"].startswith("sha256:")
+    assert run.output_manifest["provenance"]["baselined_directory_keys"] == [
+        "LegacyDirectory.result"
+    ]
+
+
+def test_backfill_does_not_overwrite_concurrently_changed_manifest(
+    analysis_workspace,
+):
+    asset, revision = _asset("legacy-concurrent", "LegacyConcurrent")
+    _, _, runs, _ = analysis_workspace
+    run_directory = runs / "legacy-concurrent"
+    run_directory.mkdir(parents=True)
+    output = run_directory / "result.txt"
+    output.write_text("original\n", encoding="utf-8")
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="LegacyConcurrent",
+        sample_id="CONCURRENT",
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(run_directory),
+        outputs={"outputs": {"LegacyConcurrent.result": str(output)}},
+    )
+    original_builder = build_output_manifest
+    concurrent_manifest = {"schema_version": 1, "items": [], "changed": True}
+
+    def build_after_concurrent_change(*args, **kwargs):
+        result = original_builder(*args, **kwargs)
+        AnalysisRun.objects.filter(pk=run.pk).update(
+            output_manifest=concurrent_manifest
+        )
+        return result
+
+    with patch(
+        "workflows.integration_outputs.build_output_manifest",
+        side_effect=build_after_concurrent_change,
+    ):
+        assert backfill_output_manifest(run, source="pytest") is False
+    run.refresh_from_db()
+
+    assert run.output_manifest == concurrent_manifest
+    assert run.events.filter(kind="output_manifest_backfill").count() == 0
+
+
+def test_backfill_rejects_missing_uncontracted_output_path(analysis_workspace):
+    asset, revision = _asset("legacy-missing-file", "LegacyMissingFile")
+    _, _, runs, _ = analysis_workspace
+    run_directory = runs / "legacy-missing-file"
+    run_directory.mkdir(parents=True)
+    missing = run_directory / "result.txt"
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="LegacyMissingFile",
+        sample_id="MISSING-FILE",
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(run_directory),
+        outputs={"outputs": {"LegacyMissingFile.result": str(missing)}},
+    )
+
+    with pytest.raises(ValueError, match="无法生成完整"):
+        backfill_output_manifest(run, source="pytest")
+    run.refresh_from_db()
+
+    assert run.output_manifest == {}
+
+
+def test_output_manifest_current_check_rejects_malformed_items():
+    assert output_manifest_is_current(
+        {
+            "schema_version": 1,
+            "integrity_version": 2,
+            "items": None,
+            "missing_required": [],
+            "unverifiable_outputs": [],
+        }
+    ) is False
+
+
+def test_resource_verification_timeout_has_stable_retryable_failure_metadata():
+    assert _failure_metadata("目录快照超过时间上限：database") == {
+        "code": "ANALYSIS_RESOURCE_VERIFICATION_TIMEOUT",
+        "category": "infrastructure",
+        "retryable": True,
+    }
+
+
+def test_uncontracted_unverifiable_directory_marks_output_incomplete(
+    client, analysis_workspace,
+):
+    asset, revision = _asset("unverifiable-output", "UnverifiableOutput")
+    _, _, runs, _ = analysis_workspace
+    run_directory = runs / "unverifiable-run"
+    output_directory = run_directory / "result"
+    output_directory.mkdir(parents=True)
+    (output_directory / "link").symlink_to(run_directory)
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="UnverifiableOutput",
+        sample_id="UNVERIFIABLE",
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(run_directory),
+        outputs={"outputs": {"UnverifiableOutput.result": str(output_directory)}},
+    )
+
+    manifest, output_status, error = build_output_manifest(run, run.outputs)
+
+    assert output_status == AnalysisRun.OutputStatus.INCOMPLETE
+    assert error["code"] == "OUTPUT_INTEGRITY_UNVERIFIABLE"
+    assert manifest["unverifiable_outputs"] == [
+        {
+            "key": "UnverifiableOutput.result",
+            "reason": "directory_snapshot_failed",
+        }
+    ]
+    assert manifest["items"][0]["kind"] == "unverifiable"
+    run.output_manifest = manifest
+    run.output_status = output_status
+    run.error = "输出清单不完整。"
+    run.error_code = error["code"]
+    run.error_category = error["category"]
+    run.error_retryable = error["retryable"]
+    run.error_details = error["details"]
+    run.save(
+        update_fields=[
+            "output_manifest",
+            "output_status",
+            "error",
+            "error_code",
+            "error_category",
+            "error_retryable",
+            "error_details",
+            "updated_at",
+        ]
+    )
+
+    detail = client.get(f"/api/v1/analysis-runs/{run.id}")
+
+    assert detail.status_code == 200
+    assert detail.data["status"] == AnalysisRun.Status.SUCCEEDED
+    assert detail.data["output_status"] == AnalysisRun.OutputStatus.INCOMPLETE
+    assert detail.data["error_code"] == "OUTPUT_INTEGRITY_UNVERIFIABLE"
+    assert detail.data["error_details"]["unverifiable"][0]["key"] == (
+        "UnverifiableOutput.result"
+    )
+
+
+def test_output_manifest_backfill_fails_when_historical_directory_is_missing(
+    analysis_workspace,
+):
+    asset, revision = _asset("missing-legacy-output", "MissingLegacyOutput")
+    _, _, runs, _ = analysis_workspace
+    AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="MissingLegacyOutput",
+        sample_id="MISSING",
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(runs / "missing-run"),
+        outputs={"outputs": {}},
+    )
+
+    with pytest.raises(CommandError, match="成功 0，失败 1"):
+        call_command(
+            "backfill_analysis_output_manifests",
+            actor="pytest",
+            stdout=io.StringIO(),
+            stderr=io.StringIO(),
+        )
+
+
 def test_run_output_translates_host_execution_path_for_backend_mount(
     client, analysis_workspace, settings
 ):
@@ -1548,6 +3562,11 @@ def test_run_output_translates_host_execution_path_for_backend_mount(
             "outputs": {"HostOutput.result": str(host_root / "host-run/out/result.txt")}
         },
     )
+    manifest, output_status, error = build_output_manifest(run, run.outputs)
+    assert error is None
+    run.output_manifest = manifest
+    run.output_status = output_status
+    run.save(update_fields=["output_manifest", "output_status", "updated_at"])
 
     detail = client.get(f"/api/v1/analysis-runs/{run.id}")
     downloaded = client.get(

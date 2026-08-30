@@ -48,7 +48,7 @@
         "summary": "列出当前 Service Account 的运行",
         "x-required-scope": "analysis:read",
         "parameters": [{"name": "active", "in": "query", "schema": {"type": "string", "enum": ["0", "1"]}}],
-        "responses": {"200": {"description": "运行列表"}}
+        "responses": {"200": {"description": "轻量运行摘要列表；完整字段通过详情接口读取", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AnalysisRunList"}}}}}
       },
       "post": {
         "operationId": "submitAnalysisRun",
@@ -120,7 +120,7 @@
         "summary": "读取语义化输出清单",
         "x-required-scope": "analysis:read",
         "parameters": [{"$ref": "#/components/parameters/RunId"}],
-        "responses": {"200": {"description": "输出清单"}}
+        "responses": {"200": {"description": "按单项公开的输出清单；incomplete 清单中的已验证 File 仍可下载"}}
       }
     },
     "/analysis-runs/{run_id}/outputs/download": {
@@ -129,7 +129,7 @@
         "summary": "校验成功时输出证据后流式下载文件",
         "x-required-scope": "analysis:download",
         "parameters": [{"$ref": "#/components/parameters/RunId"}, {"name": "key", "in": "query", "required": true, "schema": {"type": "string"}}],
-        "responses": {"200": {"description": "文件流"}, "409": {"$ref": "#/components/responses/Error"}}
+        "responses": {"200": {"description": "文件流"}, "404": {"$ref": "#/components/responses/Error"}, "409": {"$ref": "#/components/responses/Error"}}
       }
     },
     "/tool-test-runs/preflight": {
@@ -186,7 +186,16 @@
         "properties": {
           "root_alias": {"type": "string", "enum": ["rawdata", "database"]},
           "relative_path": {"type": "string"},
-          "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+          "sha256": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "description": "File 内容摘要。Directory 上仅作为兼容字段接受，已弃用。"
+          },
+          "identity_digest": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "description": "Directory 的 sha256-tree-identity-v1 身份摘要。"
+          }
         }
       },
       "DatabaseSelection": {
@@ -266,6 +275,15 @@
           "progress": {"type": "integer", "minimum": 0, "maximum": 100},
           "error": {"oneOf": [{"$ref": "#/components/schemas/Error"}, {"type": "null"}]},
           "outputs": {"type": "array", "items": {"type": "object"}}
+        }
+      },
+      "AnalysisRunList": {
+        "type": "object",
+        "description": "列表项为轻量摘要：outputs 固定为空，错误详情与 task timing 不展开。",
+        "required": ["view", "results"],
+        "properties": {
+          "view": {"type": "string", "const": "summary"},
+          "results": {"type": "array", "maxItems": 200, "items": {"$ref": "#/components/schemas/AnalysisRun"}}
         }
       },
       "ErrorEnvelope": {"type": "object", "required": ["error"], "properties": {"error": {"$ref": "#/components/schemas/Error"}}},

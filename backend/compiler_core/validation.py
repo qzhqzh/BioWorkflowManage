@@ -124,21 +124,49 @@ def schema_diagnostics(document: Any, schema_name: str) -> list[dict[str, Any]]:
 
 def validate_tool_spec(tool: dict[str, Any]) -> dict[str, Any]:
     diagnostics = schema_diagnostics(tool, "tool-spec.schema.json")
+    raw_inputs = tool.get("inputs")
+    inputs = raw_inputs if isinstance(raw_inputs, list) else []
+    for index, port in enumerate(inputs):
+        if not isinstance(port, dict) or "default" not in port:
+            continue
+        wdl_type = str(port.get("wdl_type") or "")
+        default = port.get("default")
+        default_matches = (
+            not bool(port.get("required", False))
+            and wdl_type not in {"File", "Directory"}
+            and (
+                default is None
+                or _parameter_value_matches(default, wdl_type)
+            )
+        )
+        if not default_matches:
+            diagnostics.append(
+                diagnostic(
+                    "TS004",
+                    "tool_spec",
+                    "Input default does not match its WDL type or required rule.",
+                    path=f"/inputs/{index}/default",
+                )
+            )
     task_kind = tool.get("task_kind", "standard")
     annotation = tool.get("annotation")
     if task_kind == "annotation" and isinstance(annotation, dict):
+        raw_options = annotation.get("options")
+        options = raw_options if isinstance(raw_options, list) else []
+        raw_presets = annotation.get("presets")
+        presets = raw_presets if isinstance(raw_presets, list) else []
         selector_name = annotation.get("selector_input")
         selector = next(
             (
                 item
-                for item in tool.get("inputs", [])
-                if item.get("name") == selector_name
+                for item in inputs
+                if isinstance(item, dict) and item.get("name") == selector_name
             ),
             None,
         )
         option_ids = [
             item.get("id")
-            for item in annotation.get("options", [])
+            for item in options
             if isinstance(item, dict) and item.get("id")
         ]
         option_set = set(option_ids)
@@ -157,7 +185,7 @@ def validate_tool_spec(tool: dict[str, Any]) -> dict[str, Any]:
                     "TA002",
                     "tool_spec",
                     "Annotation selector input must use WDL type Array[String].",
-                    path=f"/inputs/{tool.get('inputs', []).index(selector)}/wdl_type",
+                    path=f"/inputs/{inputs.index(selector)}/wdl_type",
                 )
             )
         elif selector.get("default") != option_ids:
@@ -166,7 +194,7 @@ def validate_tool_spec(tool: dict[str, Any]) -> dict[str, Any]:
                     "TA003",
                     "tool_spec",
                     "Annotation selector default must include every option in canonical order.",
-                    path=f"/inputs/{tool.get('inputs', []).index(selector)}/default",
+                    path=f"/inputs/{inputs.index(selector)}/default",
                 )
             )
         if len(option_ids) != len(option_set):
@@ -178,8 +206,14 @@ def validate_tool_spec(tool: dict[str, Any]) -> dict[str, Any]:
                     path="/annotation/options",
                 )
             )
-        for index, option in enumerate(annotation.get("options", [])):
-            for dependency in option.get("requires", []):
+        for index, option in enumerate(options):
+            if not isinstance(option, dict):
+                continue
+            raw_dependencies = option.get("requires")
+            dependencies = (
+                raw_dependencies if isinstance(raw_dependencies, list) else []
+            )
+            for dependency in dependencies:
                 if dependency not in option_set or dependency == option.get("id"):
                     diagnostics.append(
                         diagnostic(
@@ -189,8 +223,12 @@ def validate_tool_spec(tool: dict[str, Any]) -> dict[str, Any]:
                             path=f"/annotation/options/{index}/requires",
                         )
                     )
-        for index, preset in enumerate(annotation.get("presets", [])):
-            if not set(preset.get("items", [])).issubset(option_set):
+        for index, preset in enumerate(presets):
+            if not isinstance(preset, dict):
+                continue
+            raw_items = preset.get("items")
+            items = raw_items if isinstance(raw_items, list) else []
+            if not set(items).issubset(option_set):
                 diagnostics.append(
                     diagnostic(
                         "TA006",
@@ -239,6 +277,48 @@ def _port(node: dict[str, Any], port_name: str, direction: str, callable_spec: d
         return node.get("port") if port_name == "value" else None
     ports = callable_spec.get("inputs" if direction == "in" else "outputs", []) if callable_spec else []
     return next((port for port in ports if port["name"] == port_name), None)
+
+
+def _parameter_type_supported(wdl_type: str) -> bool:
+    if wdl_type in {"String", "Int", "Float", "Boolean"}:
+        return True
+    if wdl_type.startswith("Array[") and wdl_type.endswith("]"):
+        return _parameter_type_supported(wdl_type[len("Array[") : -1])
+    return False
+
+
+def _parameter_value_matches(value: Any, wdl_type: str) -> bool:
+    """Return whether a JSON parameter value can be used as the given WDL type.
+
+    Parameter values are intentionally limited to scalar values and arrays of
+    scalar values.  File-like inputs must be supplied through graph edges so a
+    host path cannot be smuggled into the generated WDL.
+    """
+
+    # Be tolerant of the IR spelling for optional types for callers that use
+    # this domain helper directly.  Graph schema validation still owns the
+    # public representation (required=false rather than a trailing '?').
+    if wdl_type.endswith("?"):
+        return _parameter_value_matches(value, wdl_type[:-1])
+
+    if not _parameter_type_supported(wdl_type):
+        return False
+    if value is None:
+        return False
+    if wdl_type == "String":
+        return isinstance(value, str)
+    if wdl_type == "Boolean":
+        return isinstance(value, bool)
+    if wdl_type == "Int":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if wdl_type == "Float":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if wdl_type.startswith("Array[") and wdl_type.endswith("]"):
+        if not isinstance(value, list):
+            return False
+        item_type = wdl_type[len("Array[") : -1]
+        return all(_parameter_value_matches(item, item_type) for item in value)
+    return False
 
 
 def _topological_calls(graph: dict[str, Any]) -> tuple[list[str], bool]:
@@ -358,8 +438,32 @@ def validate_workflow_graph(
             diagnostics.append(diagnostic("WG012", "type", "WDL type mismatch.", location=location))
         source_semantic = source_port.get("semantic_type")
         target_semantic = target_port.get("semantic_type")
-        if source_semantic != target_semantic and "core.file.any" not in {source_semantic, target_semantic}:
+        target_accepts_any_file = (
+            target_semantic == "core.file.any"
+            and source_port["wdl_type"] == "File"
+            and target_port["wdl_type"] == "File"
+        )
+        if source_semantic != target_semantic and not target_accepts_any_file:
             diagnostics.append(diagnostic("WG013", "type", "Semantic type mismatch.", location=location))
+
+    for node in nodes.values():
+        if node["type"] != "workflow_output":
+            continue
+        inbound_edges = [
+            edge
+            for edge in graph["edges"]
+            if edge["target"]["node_id"] == node["id"]
+            and edge["target"]["port"] == "value"
+        ]
+        if len(inbound_edges) != 1:
+            diagnostics.append(
+                diagnostic(
+                    "WG015",
+                    "graph",
+                    "Workflow output must have exactly one inbound edge.",
+                    location={"node_id": node["id"], "port": "value"},
+                )
+            )
 
     for node_id, tool in resolved.items():
         node = nodes[node_id]
@@ -376,6 +480,31 @@ def validate_workflow_graph(
                     )
             continue
         parameters = node.get("parameter_values", {})
+        input_ports = {port["name"]: port for port in tool["inputs"]}
+        for parameter_name, parameter_value in parameters.items():
+            port = input_ports.get(parameter_name)
+            if port is None:
+                diagnostics.append(
+                    diagnostic(
+                        "WG009",
+                        "graph",
+                        f"Parameter value references unknown input port {parameter_name}.",
+                        location={"node_id": node_id, "port": parameter_name},
+                    )
+                )
+                continue
+            if not _parameter_value_matches(
+                parameter_value,
+                port["wdl_type"],
+            ):
+                diagnostics.append(
+                    diagnostic(
+                        "WG010",
+                        "type",
+                        f"Parameter value for {parameter_name} does not match WDL type {port['wdl_type']}.",
+                        location={"node_id": node_id, "port": parameter_name},
+                    )
+                )
         for port in tool["inputs"]:
             if port.get("required", False) and "default" not in port:
                 bound = (node_id, port["name"]) in inbound or port["name"] in parameters

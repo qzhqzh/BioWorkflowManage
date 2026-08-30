@@ -8,7 +8,7 @@ import uuid
 from pathlib import Path
 
 from django.db import IntegrityError, connection, transaction
-from django.db.models import Max
+from django.db.models import Count, Max, Q
 from rest_framework import status
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
@@ -41,6 +41,9 @@ CONTRACTS = {
     "error-catalog": ("error-catalog.json", "1.0.0"),
 }
 WDL_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+WORKFLOW_LIST_DEFAULT_PAGE_SIZE = 50
+WORKFLOW_LIST_MAX_PAGE = 1_000_000
+WORKFLOW_LIST_MAX_PAGE_SIZE = 100
 
 
 def _actor(request) -> str:
@@ -180,7 +183,19 @@ def _with_request_id(response: Response, request_id: str) -> Response:
 
 @api_view(["GET"])
 def health(request):
-    request_id = _request_id(request)
+    return _health_response(request, database=None)
+
+
+@api_view(["GET"])
+def ready(request):
+    database = _database_status()
+    response = _health_response(request, database=database)
+    if database != "available":
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    return response
+
+
+def _database_status() -> str:
     database = "available"
     try:
         with connection.cursor() as cursor:
@@ -188,13 +203,18 @@ def health(request):
             cursor.fetchone()
     except Exception:
         database = "unavailable"
+    return database
+
+
+def _health_response(request, *, database: str | None) -> Response:
+    request_id = _request_id(request)
     body = {
-        "status": "ok" if database == "available" else "degraded",
+        "status": "ok" if database in {None, "available"} else "degraded",
         "service": "bioworkflow-compiler-api",
         "api_version": "v1",
         "compiler_contract": "phase1",
         "dependencies": {
-            "database": database,
+            "database": database or "not_checked",
             "miniwdl": "available" if shutil.which("miniwdl") else "not_configured",
         },
     }
@@ -1239,7 +1259,122 @@ def workflow_documents(request):
             request_id,
         )
 
-    documents = WorkflowDocument.objects.all()
+    try:
+        page = int(request.query_params.get("page", 1))
+        if not 1 <= page <= WORKFLOW_LIST_MAX_PAGE:
+            raise ValueError
+    except (TypeError, ValueError):
+        return _with_request_id(
+            Response(
+                {
+                    "error": {
+                        "code": "WORKFLOW_PAGE_INVALID",
+                        "message": f"page 必须是 1 到 {WORKFLOW_LIST_MAX_PAGE} 的整数。",
+                        "request_id": request_id,
+                    }
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            ),
+            request_id,
+        )
+    try:
+        page_size = int(
+            request.query_params.get("page_size", WORKFLOW_LIST_DEFAULT_PAGE_SIZE)
+        )
+    except (TypeError, ValueError):
+        page_size = WORKFLOW_LIST_DEFAULT_PAGE_SIZE
+    page_size = min(max(1, page_size), WORKFLOW_LIST_MAX_PAGE_SIZE)
+
+    summary = WorkflowDocument.objects.aggregate(
+        my_total=Count("id", filter=Q(created_by=actor), distinct=True),
+        my_subworkflows=Count(
+            "id",
+            filter=Q(created_by=actor, kind=WorkflowDocument.Kind.SUBWORKFLOW),
+            distinct=True,
+        ),
+        my_published_subworkflows=Count(
+            "id",
+            filter=Q(
+                created_by=actor,
+                kind=WorkflowDocument.Kind.SUBWORKFLOW,
+                versions__isnull=False,
+            ),
+            distinct=True,
+        ),
+        my_draft_subworkflows=Count(
+            "id",
+            filter=Q(
+                created_by=actor,
+                kind=WorkflowDocument.Kind.SUBWORKFLOW,
+                versions__isnull=True,
+            ),
+            distinct=True,
+        ),
+        my_workflows=Count(
+            "id",
+            filter=Q(created_by=actor, kind=WorkflowDocument.Kind.WORKFLOW),
+            distinct=True,
+        ),
+        my_draft_workflows=Count(
+            "id",
+            filter=Q(
+                created_by=actor,
+                kind=WorkflowDocument.Kind.WORKFLOW,
+                versions__isnull=True,
+            ),
+            distinct=True,
+        ),
+    )
+    documents = WorkflowDocument.objects.annotate(
+        latest_version=Max("versions__version")
+    )
+    owner = request.query_params.get("owner")
+    if owner == "mine":
+        documents = documents.filter(created_by=actor)
+    elif owner == "shared":
+        documents = documents.exclude(created_by=actor)
+    kind_filter = request.query_params.get("kind")
+    if kind_filter in WorkflowDocument.Kind.values:
+        documents = documents.filter(kind=kind_filter)
+    status_filter = request.query_params.get("status")
+    if status_filter == "draft":
+        documents = documents.filter(latest_version__isnull=True)
+    elif status_filter == "published":
+        documents = documents.filter(latest_version__isnull=False)
+    query = str(request.query_params.get("q") or "").strip()[:256]
+    if query:
+        documents = documents.filter(
+            Q(name__icontains=query)
+            | Q(slug__icontains=query)
+            | Q(description__icontains=query)
+            | Q(created_by__icontains=query)
+        )
+    ordering = request.query_params.get("ordering")
+    documents = (
+        documents.order_by("-updated_at", "slug")
+        if ordering == "updated"
+        else documents.order_by("slug")
+    )
+    total = documents.count()
+    start = (page - 1) * page_size
+    items = list(documents[start : start + page_size])
+    latest_version_filter = Q()
+    for item in items:
+        if item.kind == WorkflowDocument.Kind.SUBWORKFLOW and item.latest_version:
+            latest_version_filter |= Q(
+                workflow_id=item.pk,
+                version=item.latest_version,
+            )
+    latest_versions = (
+        {
+            item.workflow_id: _workflow_version_payload(item)
+            for item in WorkflowVersion.objects.filter(latest_version_filter)
+            .select_related("workflow")
+            .order_by("workflow_id")
+        }
+        if latest_version_filter
+        else {}
+    )
     return _with_request_id(
         Response(
             {
@@ -1253,13 +1388,18 @@ def workflow_documents(request):
                         "updated_by": item.updated_by,
                         "document_version": item.document_version,
                         "is_mine": item.created_by == actor,
-                        "latest_version": item.versions.aggregate(value=Max("version"))[
-                            "value"
-                        ],
+                        "latest_version": item.latest_version,
+                        "latest_version_snapshot": latest_versions.get(item.pk),
                         "updated_at": item.updated_at.isoformat(),
                     }
-                    for item in documents
-                ]
+                    for item in items
+                ],
+                "page": page,
+                "page_size": page_size,
+                "total": total,
+                "has_next": start + page_size < total,
+                "has_previous": page > 1,
+                "summary": summary,
             }
         ),
         request_id,
@@ -1345,13 +1485,57 @@ def workflow_versions(request, slug: str):
             request_id,
         )
     if request.method == "GET":
+        versions = document.versions.order_by("-version")
+        if "page" in request.query_params or "page_size" in request.query_params:
+            try:
+                page = int(request.query_params.get("page", 1))
+                if not 1 <= page <= WORKFLOW_LIST_MAX_PAGE:
+                    raise ValueError
+            except (TypeError, ValueError):
+                return _with_request_id(
+                    Response(
+                        {
+                            "error": {
+                                "code": "WORKFLOW_PAGE_INVALID",
+                                "message": "page 必须是有效的正整数。",
+                                "request_id": request_id,
+                            }
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    ),
+                    request_id,
+                )
+            try:
+                page_size = int(request.query_params.get("page_size", 50))
+            except (TypeError, ValueError):
+                page_size = 50
+            page_size = min(max(1, page_size), WORKFLOW_LIST_MAX_PAGE_SIZE)
+            total = versions.count()
+            start = (page - 1) * page_size
+            return _with_request_id(
+                Response(
+                    {
+                        "slug": slug,
+                        "results": [
+                            _workflow_version_payload(item)
+                            for item in versions[start : start + page_size]
+                        ],
+                        "page": page,
+                        "page_size": page_size,
+                        "total": total,
+                        "has_next": start + page_size < total,
+                        "has_previous": page > 1,
+                    }
+                ),
+                request_id,
+            )
         return _with_request_id(
             Response(
                 {
                     "slug": slug,
                     "results": [
                         _workflow_version_payload(item)
-                        for item in document.versions.all()
+                        for item in versions
                     ],
                 }
             ),

@@ -4,8 +4,11 @@ export interface ResourceRequirement {
   kind: 'file' | 'directory' | 'configuration'
   alternatives?: string[]
   sha256?: string
+  identity_digest?: string
+  observed_identity_digest?: string
   present?: boolean
   reason?: 'missing' | 'unconfigured' | 'checksum_mismatch' | 'constraint_mismatch' | ''
+  warning?: 'legacy_directory_sha256_ignored' | ''
   binding?: string
   expected?: string[]
 }

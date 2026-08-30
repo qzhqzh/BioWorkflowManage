@@ -4066,6 +4066,11 @@ kbd {
   color: var(--color-error);
 }
 
+.tool-run-status.is-incomplete {
+  background: var(--color-warning-soft);
+  color: oklch(0.42 0.1 75);
+}
+
 .tool-run-status.is-canceled {
   background: var(--color-surface-strong);
   color: var(--color-muted);
@@ -7801,6 +7806,11 @@ kbd {
   color: var(--color-error) !important;
 }
 
+.analysis-run-status--incomplete {
+  background: var(--color-warning-soft);
+  color: oklch(0.42 0.1 75) !important;
+}
+
 .analysis-run-status--canceled {
   background: var(--color-surface-strong);
   color: var(--color-muted) !important;
@@ -7960,6 +7970,12 @@ kbd {
   white-space: pre-wrap;
   font-family: var(--font-mono);
   font-size: var(--text-caption);
+}
+
+.analysis-run-error.is-output-incomplete {
+  border-left-color: var(--color-warning);
+  background: var(--color-warning-soft);
+  color: oklch(0.42 0.1 75);
 }
 
 .analysis-result-section {

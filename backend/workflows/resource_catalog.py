@@ -10,6 +10,11 @@ from typing import Any
 from django.conf import settings
 from django.db import IntegrityError, transaction
 
+from .integration_outputs import (
+    ResourceSnapshotBudget,
+    ResourceSnapshotBudgetError,
+    _directory_manifest,
+)
 from .models import AnalysisResourceCatalog, AnalysisResourceCatalogRevision
 
 
@@ -119,6 +124,18 @@ def _validate_required(items: Any, *, owner: str) -> list[dict[str, Any]]:
                     f"{owner}.required[{index}].sha256 格式无效。",
                 )
             normalized_item["sha256"] = sha256.lower()
+        identity_digest = str(item.get("identity_digest") or "").removeprefix(
+            "sha256:"
+        )
+        if identity_digest:
+            if kind != "directory" or not re.fullmatch(
+                r"[0-9a-fA-F]{64}", identity_digest
+            ):
+                raise ResourceCatalogError(
+                    "RESOURCE_CATALOG_INVALID",
+                    f"{owner}.required[{index}].identity_digest 仅支持 64 位目录身份摘要。",
+                )
+            normalized_item["identity_digest"] = identity_digest.lower()
         normalized.append(normalized_item)
     return normalized
 
@@ -468,11 +485,16 @@ def entry_binding(entry: dict[str, Any], name: str) -> Any:
 
 
 def entry_requirements(
-    entry: dict[str, Any], *, verify_checksums: bool = False
+    entry: dict[str, Any],
+    *,
+    verify_checksums: bool = False,
+    snapshot_budget: Any | None = None,
 ) -> list[dict[str, Any]]:
     root = Path(settings.ANALYSIS_DATABASE_ROOT)
+    if verify_checksums and snapshot_budget is None:
+        snapshot_budget = ResourceSnapshotBudget()
     results = []
-    for item in catalog_resource_specs(entry):
+    for resource_index, item in enumerate(catalog_resource_specs(entry)):
         relative_path = str(item.get("path") or "")
         kind = str(item.get("kind") or "file")
         candidates = [
@@ -481,7 +503,12 @@ def entry_requirements(
         ]
         present = False
         checksum_mismatch = False
-        for candidate_path in candidates:
+        observed_identity_digest = ""
+        for candidate_index, candidate_path in enumerate(candidates):
+            if snapshot_budget is not None:
+                snapshot_budget.claim_unique(
+                    f"catalog:{resource_index}:{candidate_index}:{kind}:{candidate_path}"
+                )
             try:
                 safe = _safe_relative_path(candidate_path, label="resource path")
                 candidate = (root.resolve() / safe).resolve()
@@ -489,23 +516,50 @@ def entry_requirements(
                 present = (
                     candidate.is_dir() if kind == "directory" else candidate.is_file()
                 )
-                if present and item.get("sha256") and verify_checksums:
-                    digest = hashlib.sha256()
-                    with candidate.open("rb") as handle:
-                        for chunk in iter(lambda: handle.read(4 * 1024 * 1024), b""):
-                            digest.update(chunk)
-                    checksum_mismatch = digest.hexdigest() != item["sha256"]
+                checksum = (
+                    item.get("identity_digest")
+                    if kind == "directory"
+                    else item.get("sha256")
+                )
+                if present and verify_checksums and kind == "directory":
+                    directory_manifest = (
+                        snapshot_budget.directory_manifest(
+                            candidate,
+                            containment_root=root,
+                        )
+                        if snapshot_budget is not None
+                        else _directory_manifest(candidate)
+                    )
+                    observed_identity_digest = directory_manifest["digest"]
+                    actual_digest = observed_identity_digest.removeprefix("sha256:")
+                    if checksum:
+                        checksum_mismatch = actual_digest != checksum
+                        present = not checksum_mismatch
+                elif present and checksum and verify_checksums:
+                    actual_digest = snapshot_budget.file_digest(
+                        candidate,
+                        containment_root=root.resolve(),
+                    ).removeprefix("sha256:")
+                    checksum_mismatch = actual_digest != checksum
                     present = not checksum_mismatch
+            except ResourceSnapshotBudgetError:
+                raise
             except (OSError, ValueError, ResourceCatalogError):
                 present = False
             if present:
                 break
-        results.append(
-            {
+        result = {
                 "path": relative_path,
                 "label": str(item.get("label") or relative_path),
                 "kind": kind,
                 "present": present,
+                "warning": (
+                    "legacy_directory_sha256_ignored"
+                    if kind == "directory"
+                    and item.get("sha256")
+                    and not item.get("identity_digest")
+                    else ""
+                ),
                 "reason": (
                     "checksum_mismatch"
                     if checksum_mismatch
@@ -514,7 +568,9 @@ def entry_requirements(
                     else ""
                 ),
             }
-        )
+        if observed_identity_digest:
+            result["observed_identity_digest"] = observed_identity_digest
+        results.append(result)
     configured_binding_keys = {
         str(item.get("binding") or "") for item in results if item.get("binding")
     }
@@ -578,9 +634,16 @@ def catalog_resource_specs(entry: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def entry_status(
-    entry: dict[str, Any], *, verify_checksums: bool = False
+    entry: dict[str, Any],
+    *,
+    verify_checksums: bool = False,
+    snapshot_budget: ResourceSnapshotBudget | None = None,
 ) -> dict[str, Any]:
-    requirements = entry_requirements(entry, verify_checksums=verify_checksums)
+    requirements = entry_requirements(
+        entry,
+        verify_checksums=verify_checksums,
+        snapshot_budget=snapshot_budget,
+    )
     missing = [item for item in requirements if not item["present"]]
     return {
         "ready": not missing,
@@ -609,12 +672,18 @@ def catalog_payload(
                 catalog__key=CATALOG_KEY
             )[:30]
         ]
+    snapshot_budget = ResourceSnapshotBudget() if verify_entry is not None else None
     references = [
         {
             **item,
             **entry_status(
                 item,
                 verify_checksums=verify_entry == ("references", item["id"]),
+                snapshot_budget=(
+                    snapshot_budget
+                    if verify_entry == ("references", item["id"])
+                    else None
+                ),
             ),
         }
         for item in document["references"]
@@ -625,6 +694,11 @@ def catalog_payload(
             **entry_status(
                 item,
                 verify_checksums=verify_entry == ("panels", item["id"]),
+                snapshot_budget=(
+                    snapshot_budget
+                    if verify_entry == ("panels", item["id"])
+                    else None
+                ),
             ),
         }
         for item in document["panels"]

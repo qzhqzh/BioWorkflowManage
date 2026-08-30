@@ -50,7 +50,7 @@ def _lower_tool_task(tool: dict[str, Any], digest: str) -> dict[str, Any]:
     task_inputs = []
     for port in sorted(tool["inputs"], key=lambda item: item["name"]):
         item: dict[str, Any] = {"name": port["name"], "type": _type(port)}
-        if "default" in port:
+        if port.get("default") is not None:
             item["default"] = _literal(port["default"], port["wdl_type"])
         task_inputs.append(item)
     return {
@@ -150,7 +150,7 @@ def lower_to_ir(
                 )
             elif port["name"] in node.get("parameter_values", {}):
                 bindings[port["name"]] = _literal(node["parameter_values"][port["name"]], port["wdl_type"])
-            elif "default" in port:
+            elif port.get("default") is not None:
                 bindings[port["name"]] = _literal(port["default"], port["wdl_type"])
         if is_subworkflow:
             calls.append(

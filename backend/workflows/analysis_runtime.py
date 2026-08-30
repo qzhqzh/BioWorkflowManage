@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
 import signal
+import stat as stat_module
 import subprocess
 import threading
 import time
@@ -19,7 +21,15 @@ from django.db import close_old_connections, transaction
 from django.db.models import F
 from django.utils import timezone
 
-from .integration_outputs import build_output_manifest
+from .integration_outputs import (
+    _directory_manifest,
+    _file_identity,
+    _open_regular_readonly,
+    _sha256,
+    build_output_manifest,
+    ResourceSnapshotBudget,
+    ResourceSnapshotBudgetError,
+)
 from .models import AnalysisRun, AnalysisRunEvent
 from .wdl_packages import normalize_package_path
 from .wdl_source_references import (
@@ -530,6 +540,8 @@ def _verify_manifest_files(
     root: Path,
     *,
     nested: bool = False,
+    checkpoint=None,
+    snapshot_budget: ResourceSnapshotBudget | None = None,
 ) -> None:
     if not manifest:
         return
@@ -537,49 +549,213 @@ def _verify_manifest_files(
         for key in ("primary", "control"):
             value = manifest.get(key)
             if isinstance(value, dict):
-                _verify_manifest_files(value, root)
+                _verify_manifest_files(
+                    value,
+                    root,
+                    checkpoint=checkpoint,
+                    snapshot_budget=snapshot_budget,
+                )
         return
     items = manifest.get("files") or manifest.get("resources") or []
     resolved_root = root.resolve()
     for item in items:
+        if checkpoint is not None:
+            checkpoint()
+        if snapshot_budget is not None:
+            snapshot_budget.checkpoint()
+        if not isinstance(item, dict):
+            raise RuntimeError(
+                "受管资源完整性证据过旧，请重新投递任务：manifest item"
+            )
         relative = Path(str(item.get("relative_path") or ""))
         if relative.is_absolute() or ".." in relative.parts:
             raise RuntimeError("受管资源 manifest 路径无效。")
-        path = (resolved_root / relative).resolve()
+        path = resolved_root / relative
+        if snapshot_budget is None:
+            path = path.resolve()
+        if snapshot_budget is not None:
+            snapshot_budget.claim_unique(
+                f"retry:{resolved_root}:{item.get('kind')}:{relative}"
+            )
         try:
             path.relative_to(resolved_root)
-            stat = path.stat()
-        except (OSError, ValueError) as error:
+        except ValueError as error:
             raise RuntimeError(f"受管资源已不存在：{relative}") from error
         if item.get("kind") == "directory":
-            if not path.is_dir():
-                raise RuntimeError(f"受管资源不再是目录：{relative}")
+            identity = item.get("identity")
+            if (
+                item.get("verification") != "directory_identity_sha256"
+                or not re.fullmatch(
+                    r"sha256:[0-9a-f]{64}",
+                    str(item.get("digest") or ""),
+                )
+                or not isinstance(identity, dict)
+                or not all(
+                    isinstance(identity.get(field), int)
+                    and not isinstance(identity.get(field), bool)
+                    for field in ("mtime_ns", "ctime_ns", "device", "inode")
+                )
+            ):
+                raise RuntimeError(
+                    "受管资源完整性证据过旧，请重新投递任务："
+                    f"{relative}"
+                )
+            expected_identity = [
+                identity["mtime_ns"],
+                identity["ctime_ns"],
+                identity["device"],
+                identity["inode"],
+            ]
+            expected_digest = str(item.get("digest") or "")
+            try:
+                observed_directory = (
+                    snapshot_budget.directory_manifest(
+                        path,
+                        containment_root=resolved_root,
+                    )
+                    if snapshot_budget is not None
+                    else _directory_manifest(path, checkpoint=checkpoint)
+                )
+            except ResourceSnapshotBudgetError:
+                raise
+            except (OSError, ValueError) as error:
+                raise RuntimeError(
+                    f"受管资源目录无法校验：{relative}"
+                ) from error
+            actual_identity = [
+                observed_directory["identity"]["mtime_ns"],
+                observed_directory["identity"]["ctime_ns"],
+                observed_directory["identity"]["device"],
+                observed_directory["identity"]["inode"],
+            ]
+            if actual_identity != expected_identity:
+                raise RuntimeError(f"受管资源目录在排队后发生变化：{relative}")
+            actual_digest = observed_directory["digest"]
+            if actual_digest != expected_digest:
+                raise RuntimeError(f"受管资源目录校验和不匹配：{relative}")
+            catalog_identity_digest = str(
+                item.get("catalog_identity_digest") or ""
+            )
+            normalized_catalog = (
+                catalog_identity_digest
+                if catalog_identity_digest.startswith("sha256:")
+                else f"sha256:{catalog_identity_digest}"
+            )
+            if catalog_identity_digest and actual_digest != normalized_catalog:
+                raise RuntimeError(
+                    f"受管资源与目录声明的身份摘要不匹配：{relative}"
+                )
             continue
-        expected = (
-            int(item.get("size", -1)),
-            int(item.get("mtime_ns", -1)),
-            int(item.get("device", -1)),
-            int(item.get("inode", -1)),
-        )
-        actual = (stat.st_size, stat.st_mtime_ns, stat.st_dev, stat.st_ino)
+        expected_sha256 = str(item.get("sha256") or "")
+        catalog_sha256 = str(item.get("catalog_sha256") or "")
+        has_trusted_digest = bool(expected_sha256 or catalog_sha256)
+        identity_fields = ("size", "mtime_ns", "device", "inode")
+        if (
+            not all(
+                isinstance(item.get(field), int)
+                and not isinstance(item.get(field), bool)
+                for field in identity_fields
+            )
+            or (
+                not has_trusted_digest
+                and (
+                    item.get("verification") != "identity_v2"
+                    or not isinstance(item.get("ctime_ns"), int)
+                    or isinstance(item.get("ctime_ns"), bool)
+                )
+            )
+        ):
+            raise RuntimeError(
+                "受管资源完整性证据过旧，请重新投递任务："
+                f"{relative}"
+            )
+        expected = [
+            item["size"],
+            item["mtime_ns"],
+            item["device"],
+            item["inode"],
+        ]
+        try:
+            if snapshot_budget is not None:
+                observed_file_identity = snapshot_budget.file_identity(
+                    path,
+                    containment_root=resolved_root,
+                )
+            else:
+                stat = path.stat()
+                if not stat_module.S_ISREG(stat.st_mode):
+                    raise RuntimeError(f"受管资源不再是普通文件：{relative}")
+                observed_file_identity = {
+                    "size": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                    "ctime_ns": stat.st_ctime_ns,
+                    "device": stat.st_dev,
+                    "inode": stat.st_ino,
+                }
+        except (OSError, ValueError) as error:
+            raise RuntimeError(f"受管资源已不存在：{relative}") from error
+        actual = [
+            observed_file_identity["size"],
+            observed_file_identity["mtime_ns"],
+            observed_file_identity["device"],
+            observed_file_identity["inode"],
+        ]
+        if item.get("ctime_ns") is not None:
+            expected.append(item["ctime_ns"])
+            actual.append(observed_file_identity["ctime_ns"])
         if actual != expected:
             raise RuntimeError(f"受管资源在排队后发生变化：{relative}")
-        expected_sha256 = str(item.get("sha256") or "").removeprefix("sha256:")
-        if expected_sha256 and path.is_file():
-            digest = hashlib.sha256()
-            with path.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            if digest.hexdigest() != expected_sha256:
+        if has_trusted_digest:
+            try:
+                actual_sha256 = (
+                    snapshot_budget.file_digest(
+                        path,
+                        expected_identity=observed_file_identity,
+                        containment_root=resolved_root,
+                    )
+                    if snapshot_budget is not None
+                    else _sha256(
+                        path,
+                        checkpoint=checkpoint,
+                        max_bytes=int(
+                            settings.ANALYSIS_MANAGED_FILE_CHECKSUM_MAX_BYTES
+                        ),
+                        containment_root=resolved_root,
+                    )
+                )
+            except ResourceSnapshotBudgetError:
+                raise
+            except (OSError, ValueError) as error:
+                raise RuntimeError(f"受管文件无法稳定校验：{relative}") from error
+            normalized_expected = (
+                expected_sha256
+                if expected_sha256.startswith("sha256:")
+                else f"sha256:{expected_sha256}"
+            )
+            normalized_catalog = (
+                catalog_sha256
+                if catalog_sha256.startswith("sha256:")
+                else f"sha256:{catalog_sha256}"
+            )
+            if expected_sha256 and actual_sha256 != normalized_expected:
                 raise RuntimeError(f"受管资源校验和不匹配：{relative}")
+            if catalog_sha256 and actual_sha256 != normalized_catalog:
+                raise RuntimeError(f"受管资源与目录声明的校验和不匹配：{relative}")
 
 
-def _verify_run_resource_manifests(run: AnalysisRun) -> None:
+def _verify_run_resource_manifests(
+    run: AnalysisRun,
+    *,
+    checkpoint=None,
+    snapshot_budget: ResourceSnapshotBudget | None = None,
+) -> None:
     payload = run.request_payload
     _verify_manifest_files(
         payload.get("input_resource_manifest"),
         Path(settings.ANALYSIS_RAWDATA_ROOT),
         nested="primary" in (payload.get("input_resource_manifest") or {}),
+        checkpoint=checkpoint,
+        snapshot_budget=snapshot_budget,
     )
     for key in (
         "database_resource_manifest",
@@ -589,6 +765,8 @@ def _verify_run_resource_manifests(run: AnalysisRun) -> None:
         _verify_manifest_files(
             payload.get(key),
             Path(settings.ANALYSIS_DATABASE_ROOT),
+            checkpoint=checkpoint,
+            snapshot_budget=snapshot_budget,
         )
 
 
@@ -632,12 +810,67 @@ def _log_message(line: str) -> tuple[str, str, dict[str, Any]]:
     return message, level, safe_details
 
 
+def _read_result_json(result_path: Path, *, checkpoint=None) -> Any:
+    max_bytes = max(
+        1,
+        int(getattr(settings, "ANALYSIS_RESULT_JSON_MAX_BYTES", 64 * 1024 * 1024)),
+    )
+    try:
+        with _open_regular_readonly(result_path) as handle:
+            before = os.fstat(handle.fileno())
+            if before.st_size > max_bytes:
+                raise RuntimeError(
+                    "miniwdl result.json 超过安全上限"
+                    f"（{max_bytes} 字节）。"
+                )
+            remaining = before.st_size
+            chunks: list[bytes] = []
+            while remaining:
+                if checkpoint is not None:
+                    checkpoint()
+                chunk = handle.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise RuntimeError("miniwdl result.json 在读取期间被截断。")
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            if handle.read(1):
+                raise RuntimeError("miniwdl result.json 在读取期间增长。")
+            after = os.fstat(handle.fileno())
+            current = os.stat(result_path, follow_symlinks=False)
+    except RuntimeError:
+        raise
+    except (OSError, ValueError) as error:
+        raise RuntimeError("miniwdl result.json 无法安全读取。") from error
+    if (
+        _file_identity(before) != _file_identity(after)
+        or _file_identity(after) != _file_identity(current)
+    ):
+        raise RuntimeError("miniwdl result.json 在读取期间发生变化。")
+    try:
+        def finite_float(raw: str) -> float:
+            value = float(raw)
+            if not math.isfinite(value):
+                raise ValueError("result.json 包含非有限数值。")
+            return value
+
+        def reject_constant(raw: str) -> None:
+            raise ValueError(f"result.json 包含非标准数值：{raw}")
+
+        return json.loads(
+            b"".join(chunks).decode("utf-8"),
+            parse_constant=reject_constant,
+            parse_float=finite_float,
+        )
+    except (UnicodeError, ValueError, json.JSONDecodeError) as error:
+        raise RuntimeError("miniwdl result.json 不是有效 JSON。") from error
+
+
 def _result_error(result_path: Path, fallback: str) -> str:
     if not result_path.is_file():
         return fallback
     try:
-        result = json.loads(result_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        result = _read_result_json(result_path)
+    except RuntimeError:
         return fallback
 
     def message_from(value: Any) -> str:
@@ -670,6 +903,25 @@ def _is_infrastructure_error(message: str, log_path: Path) -> bool:
 
 def _failure_metadata(message: str) -> dict[str, Any]:
     lowered = message.lower()
+    if any(
+        marker in message
+        for marker in (
+            "资源快照超过请求时间上限",
+            "目录快照超过时间上限",
+            "目录快照校验正忙",
+        )
+    ):
+        return {
+            "code": "ANALYSIS_RESOURCE_VERIFICATION_TIMEOUT",
+            "category": "infrastructure",
+            "retryable": True,
+        }
+    if "完整性证据过旧" in message:
+        return {
+            "code": "ANALYSIS_RESOURCE_MANIFEST_OUTDATED",
+            "category": "resource",
+            "retryable": False,
+        }
     if "受管资源" in message or "resource" in lowered and "changed" in lowered:
         return {
             "code": "ANALYSIS_RESOURCE_CHANGED",
@@ -724,7 +976,21 @@ def execute_analysis_run(
         raise RuntimeError("analysis-worker 中没有 miniwdl 可执行文件。")
     root = Path(settings.ANALYSIS_RUN_ROOT).resolve()
     root.mkdir(parents=True, exist_ok=True)
-    _verify_run_resource_manifests(run)
+
+    def resource_checkpoint() -> None:
+        if heartbeat is not None and heartbeat.lease_lost.is_set():
+            raise AnalysisRunLeaseLost(
+                f"analysis run {run.id} lease was lost during resource verification"
+            )
+
+    _verify_run_resource_manifests(
+        run,
+        checkpoint=resource_checkpoint,
+        snapshot_budget=ResourceSnapshotBudget(
+            deadline_seconds=settings.ANALYSIS_WORKER_RESOURCE_MANIFEST_TIMEOUT_SECONDS,
+            checkpoint=resource_checkpoint,
+        ),
+    )
     run_directory = root / str(run.id)
     _update_run(run, work_directory=str(run_directory))
     run_directory.mkdir(parents=False, exist_ok=False)
@@ -889,7 +1155,10 @@ def execute_analysis_run(
         if exit_code == 0:
             if not paths["result"].is_file():
                 raise RuntimeError("miniwdl 已退出，但没有生成 result.json。")
-            parsed_result = json.loads(paths["result"].read_text(encoding="utf-8"))
+            parsed_result = _read_result_json(
+                paths["result"],
+                checkpoint=resource_checkpoint,
+            )
             if not isinstance(parsed_result, dict):
                 raise RuntimeError("miniwdl result.json 不是 JSON object。")
             result = parsed_result
@@ -942,15 +1211,25 @@ def execute_analysis_run(
     output_manifest = {}
     output_status = AnalysisRun.OutputStatus.COMPLETE
     output_error = None
-    if run.service_account_id:
-        output_manifest, output_status, output_error = build_output_manifest(run, result)
+
+    def output_snapshot_checkpoint() -> None:
+        if heartbeat is not None and heartbeat.lease_lost.is_set():
+            raise AnalysisRunLeaseLost(
+                f"analysis run {run.id} lease is no longer active"
+            )
+
+    output_manifest, output_status, output_error = build_output_manifest(
+        run,
+        result,
+        checkpoint=output_snapshot_checkpoint,
+    )
     current_step = (
         "工具测试完成"
         if run.run_kind == AnalysisRun.Kind.TOOL_TEST
         else "分析完成"
     )
     if output_error:
-        current_step = "执行完成，但必需输出不完整"
+        current_step = "执行完成，但输出清单不完整"
     _update_run(
         run,
         status=AnalysisRun.Status.SUCCEEDED,
@@ -959,7 +1238,7 @@ def execute_analysis_run(
         outputs=result,
         output_manifest=output_manifest,
         output_status=output_status,
-        error="" if output_error is None else "必需输出不完整。",
+        error="" if output_error is None else "输出清单不完整。",
         error_code=output_error["code"] if output_error else "",
         error_category=output_error["category"] if output_error else "",
         error_retryable=output_error["retryable"] if output_error else False,
@@ -972,7 +1251,7 @@ def execute_analysis_run(
     if output_error:
         _event(
             run,
-            "WDL 执行成功，但必需输出不完整。",
+            "WDL 执行成功，但输出清单不完整。",
             kind="output",
             level="error",
             details=output_error["details"],

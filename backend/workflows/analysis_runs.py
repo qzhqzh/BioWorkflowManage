@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import gzip
 import hashlib
 import json
 import mimetypes
+import os
 import re
+import stat as stat_module
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,18 @@ from .resource_catalog import (
     load_active_catalog,
 )
 from .rawdata_index import indexed_rawdata_catalog, link_run_to_indexed_dataset
+from .integration_outputs import (
+    _open_regular_readonly,
+    _read_gzip_text_lines,
+    GzipProbeLineLimitError,
+    ResourceSnapshotBudget,
+    ResourceSnapshotBudgetError,
+    ResourceSnapshotChangedError,
+    open_verified_output,
+    output_manifest_file_item_is_verified,
+    output_manifest_has_integrity_v2,
+    output_value_limit_reason,
+)
 
 
 SAFE_SAMPLE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -407,7 +420,11 @@ def _parse_miniwdl_timing(
     }
 
 
-def _run_timing_payload(run: AnalysisRun) -> dict[str, Any]:
+def _run_timing_payload(
+    run: AnalysisRun,
+    *,
+    include_task_timing: bool = True,
+) -> dict[str, Any]:
     timing: dict[str, Any] = {"tasks": []}
     if run.started_at:
         timing["queue_seconds"] = _seconds(
@@ -415,7 +432,7 @@ def _run_timing_payload(run: AnalysisRun) -> dict[str, Any]:
         )
         end = run.finished_at or run.updated_at
         timing["total_seconds"] = _seconds((end - run.started_at).total_seconds())
-    if not run.work_directory:
+    if not include_task_timing or not run.work_directory:
         return timing
     try:
         run_directory = _accessible_run_path(Path(run.work_directory))
@@ -452,18 +469,84 @@ def _dataset_paths(dataset: dict[str, Any]) -> tuple[Path, Path]:
     return paths[1], paths[2]
 
 
-def _first_fastq_identifier(path: Path) -> str:
+def _stat_identity(value: os.stat_result) -> dict[str, int]:
+    return {
+        "size": value.st_size,
+        "mtime_ns": value.st_mtime_ns,
+        "ctime_ns": value.st_ctime_ns,
+        "device": value.st_dev,
+        "inode": value.st_ino,
+    }
+
+
+def _fastq_snapshot(
+    path: Path,
+    *,
+    snapshot_budget: ResourceSnapshotBudget,
+    containment_root: Path,
+) -> tuple[str, dict[str, int]]:
     try:
-        with gzip.open(path, mode="rt", encoding="ascii", newline="") as handle:
-            lines = [handle.readline().rstrip("\r\n") for _ in range(4)]
-    except (EOFError, OSError, UnicodeError) as error:
+        snapshot_budget.claim_item()
+    except ResourceSnapshotBudgetError as error:
+        raise AnalysisInputError(
+            "ANALYSIS_RESOURCE_LIMIT_EXCEEDED",
+            str(error),
+        ) from error
+    line_limit = int(settings.ANALYSIS_INPUT_TEXT_LINE_MAX_CHARS)
+    try:
+        snapshot_budget.checkpoint()
+        with _open_regular_readonly(
+            path,
+            containment_root=containment_root,
+        ) as raw_handle:
+            before = os.fstat(raw_handle.fileno())
+            if not stat_module.S_ISREG(before.st_mode) or before.st_size == 0:
+                raise AnalysisInputError(
+                    "ANALYSIS_FASTQ_MISSING",
+                    f"原始数据不存在或为空：{path.name}",
+                )
+            lines = _read_gzip_text_lines(
+                raw_handle,
+                line_count=4,
+                max_chars=line_limit,
+                encoding="ascii",
+                checkpoint=snapshot_budget.checkpoint,
+            )
+            after = os.fstat(raw_handle.fileno())
+        with _open_regular_readonly(
+            path,
+            containment_root=containment_root,
+        ) as current_handle:
+            current = os.fstat(current_handle.fileno())
+    except AnalysisInputError:
+        raise
+    except ResourceSnapshotBudgetError as error:
+        raise AnalysisInputError(
+            "ANALYSIS_RESOURCE_LIMIT_EXCEEDED",
+            str(error),
+        ) from error
+    except GzipProbeLineLimitError as error:
+        raise AnalysisInputError(
+            "ANALYSIS_FASTQ_RECORD_TOO_LARGE",
+            f"{path.name} 的 FASTQ 单行超过安全上限。",
+            details={"max_chars": line_limit},
+        ) from error
+    except (EOFError, OSError, UnicodeError, ValueError) as error:
         raise AnalysisInputError(
             "ANALYSIS_FASTQ_INVALID",
             f"{path.name} 不是可读的 gzip FASTQ：{error}",
         ) from error
+    identity = _stat_identity(after)
+    if identity != _stat_identity(before) or identity != _stat_identity(current):
+        raise AnalysisInputError(
+            "ANALYSIS_RESOURCE_CHANGED",
+            f"原始数据在校验期间发生变化：{path.name}",
+        )
     header, sequence, plus, quality = lines
+    header_parts = header[1:].split(maxsplit=1) if header.startswith("@") else []
+    identifier = header_parts[0] if header_parts else ""
     if (
-        not header.startswith("@")
+        not identifier
         or not sequence
         or not plus.startswith("+")
         or len(sequence) != len(quality)
@@ -472,24 +555,44 @@ def _first_fastq_identifier(path: Path) -> str:
             "ANALYSIS_FASTQ_INVALID",
             f"{path.name} 的首条 FASTQ 记录不完整。",
         )
-    identifier = header[1:].split(maxsplit=1)[0]
-    return identifier[:-2] if identifier.endswith(("/1", "/2")) else identifier
+    normalized_identifier = (
+        identifier[:-2] if identifier.endswith(("/1", "/2")) else identifier
+    )
+    return normalized_identifier, identity
 
 
-def _validate_dataset(dataset: dict[str, Any]) -> tuple[Path, Path]:
+def _validated_dataset_snapshot(
+    dataset: dict[str, Any],
+    *,
+    snapshot_budget: ResourceSnapshotBudget,
+) -> tuple[Path, Path, list[dict[str, Any]]]:
     read1, read2 = _dataset_paths(dataset)
-    for path in (read1, read2):
-        if not path.is_file() or path.stat().st_size == 0:
-            raise AnalysisInputError(
-                "ANALYSIS_FASTQ_MISSING",
-                f"原始数据不存在或为空：{path.name}",
-            )
-    if _first_fastq_identifier(read1) != _first_fastq_identifier(read2):
+    snapshots: list[dict[str, Any]] = []
+    identifiers: dict[int, str] = {}
+    root = Path(settings.ANALYSIS_RAWDATA_ROOT).resolve()
+    for item in dataset["files"]:
+        path = _safe_path(root, item["relative_path"])
+        identifier, identity = _fastq_snapshot(
+            path,
+            snapshot_budget=snapshot_budget,
+            containment_root=root,
+        )
+        mate = int(item["mate"])
+        identifiers[mate] = identifier
+        snapshots.append(
+            {
+                "mate": mate,
+                "relative_path": item["relative_path"],
+                "verification": "identity_v2",
+                **identity,
+            }
+        )
+    if identifiers.get(1) != identifiers.get(2):
         raise AnalysisInputError(
             "ANALYSIS_FASTQ_PAIR_MISMATCH",
             "R1 与 R2 的首条 read ID 不一致。",
         )
-    return read1, read2
+    return read1, read2, snapshots
 
 
 def load_database_catalog() -> dict[str, Any]:
@@ -499,33 +602,30 @@ def load_database_catalog() -> dict[str, Any]:
         raise AnalysisInputError(error.code, str(error), details=error.details) from error
 
 
-def _requirements(entry: dict[str, Any]) -> list[dict[str, Any]]:
-    return entry_requirements(entry)
+def _requirements(
+    entry: dict[str, Any],
+    *,
+    snapshot_budget: ResourceSnapshotBudget | None = None,
+) -> list[dict[str, Any]]:
+    try:
+        return entry_requirements(entry, snapshot_budget=snapshot_budget)
+    except ResourceSnapshotBudgetError as error:
+        raise AnalysisInputError(
+            "ANALYSIS_RESOURCE_LIMIT_EXCEEDED",
+            str(error),
+        ) from error
 
 
-def _dataset_manifest(dataset: dict[str, Any]) -> dict[str, Any]:
-    root = Path(settings.ANALYSIS_RAWDATA_ROOT)
-    files = []
-    for item in dataset["files"]:
-        path = _safe_path(root, item["relative_path"])
-        try:
-            stat = path.stat()
-        except OSError as error:
-            raise AnalysisInputError(
-                "ANALYSIS_FASTQ_MISSING",
-                f"原始数据不存在或无法读取：{path.name}",
-            ) from error
-        files.append(
-            {
-                "mate": item["mate"],
-                "relative_path": item["relative_path"],
-                "verification": "identity",
-                "size": stat.st_size,
-                "mtime_ns": stat.st_mtime_ns,
-                "device": stat.st_dev,
-                "inode": stat.st_ino,
-            }
-        )
+def _dataset_manifest(
+    dataset: dict[str, Any],
+    *,
+    snapshot_budget: ResourceSnapshotBudget | None = None,
+) -> dict[str, Any]:
+    snapshot_budget = snapshot_budget or ResourceSnapshotBudget()
+    _, _, files = _validated_dataset_snapshot(
+        dataset,
+        snapshot_budget=snapshot_budget,
+    )
     return {
         "schema_version": 1,
         "dataset_id": dataset["id"],
@@ -533,12 +633,18 @@ def _dataset_manifest(dataset: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _catalog_resource_manifest(entry: dict[str, Any]) -> dict[str, Any]:
+def _catalog_resource_manifest(
+    entry: dict[str, Any],
+    *,
+    snapshot_budget: ResourceSnapshotBudget | None = None,
+) -> dict[str, Any]:
     root = Path(settings.ANALYSIS_DATABASE_ROOT)
+    snapshot_budget = snapshot_budget or ResourceSnapshotBudget()
     resources = []
-    for item in catalog_resource_specs(entry):
+    for resource_index, item in enumerate(catalog_resource_specs(entry)):
         if not isinstance(item, dict):
             continue
+        kind = str(item.get("kind") or "file")
         candidates = [
             str(item.get("path") or ""),
             *[
@@ -547,35 +653,108 @@ def _catalog_resource_manifest(entry: dict[str, Any]) -> dict[str, Any]:
                 if isinstance(path, str)
             ],
         ]
-        for relative_path in candidates:
+        matched = False
+        for candidate_index, relative_path in enumerate(candidates):
+            try:
+                snapshot_budget.claim_unique(
+                    f"catalog:{resource_index}:{candidate_index}:{kind}:{relative_path}"
+                )
+            except ResourceSnapshotBudgetError as error:
+                raise AnalysisInputError(
+                    "ANALYSIS_RESOURCE_LIMIT_EXCEEDED",
+                    str(error),
+                ) from error
             try:
                 path = _safe_path(root, relative_path)
-                stat = path.stat()
+                stat = os.stat(path, follow_symlinks=False)
             except (AnalysisInputError, OSError):
                 continue
-            kind = str(item.get("kind") or "file")
+            expected_mode = (
+                stat_module.S_ISDIR if kind == "directory" else stat_module.S_ISREG
+            )
+            if not expected_mode(stat.st_mode):
+                continue
             resource = {
                 "relative_path": relative_path,
                 "kind": kind,
                 "verification": (
-                    "exists"
+                    "directory_identity_sha256"
                     if kind == "directory"
-                    else ("sha256" if item.get("sha256") else "identity")
+                    else "identity_v2"
                 ),
             }
-            if kind != "directory":
+            if kind == "directory":
+                try:
+                    directory_manifest = snapshot_budget.directory_manifest(
+                        path,
+                        containment_root=root,
+                    )
+                except ResourceSnapshotBudgetError as error:
+                    raise AnalysisInputError(
+                        "ANALYSIS_RESOURCE_LIMIT_EXCEEDED",
+                        str(error),
+                    ) from error
+                except ResourceSnapshotChangedError as error:
+                    raise AnalysisInputError(
+                        "ANALYSIS_RESOURCE_CHANGED",
+                        str(error),
+                    ) from error
+                except (OSError, ValueError) as error:
+                    raise AnalysisInputError(
+                        "ANALYSIS_RESOURCE_UNSUPPORTED",
+                        f"数据库目录包含不受支持或过多的节点：{relative_path}",
+                    ) from error
+                catalog_identity_digest = str(item.get("identity_digest") or "")
+                normalized_catalog_identity = (
+                    catalog_identity_digest
+                    if catalog_identity_digest.startswith("sha256:")
+                    else f"sha256:{catalog_identity_digest}"
+                )
+                if (
+                    catalog_identity_digest
+                    and directory_manifest["digest"] != normalized_catalog_identity
+                ):
+                    raise AnalysisInputError(
+                        "ANALYSIS_RESOURCE_CHECKSUM_MISMATCH",
+                        f"数据库目录身份摘要不匹配：{relative_path}",
+                    )
+                resource.update(
+                    {
+                        "digest": directory_manifest["digest"],
+                        "entry_count": directory_manifest["entry_count"],
+                        "identity": {
+                            "mtime_ns": stat.st_mtime_ns,
+                            "ctime_ns": stat.st_ctime_ns,
+                            "device": stat.st_dev,
+                            "inode": stat.st_ino,
+                        },
+                    }
+                )
+                if catalog_identity_digest:
+                    resource["catalog_identity_digest"] = (
+                        catalog_identity_digest.removeprefix("sha256:")
+                    )
+            else:
+                catalog_sha256 = str(item.get("sha256") or "")
                 resource.update(
                     {
                         "size": stat.st_size,
                         "mtime_ns": stat.st_mtime_ns,
+                        "ctime_ns": stat.st_ctime_ns,
                         "device": stat.st_dev,
                         "inode": stat.st_ino,
                     }
                 )
-            if item.get("sha256"):
-                resource["sha256"] = item["sha256"]
+                if catalog_sha256:
+                    resource["catalog_sha256"] = catalog_sha256
             resources.append(resource)
+            matched = True
             break
+        if not matched:
+            raise AnalysisInputError(
+                "ANALYSIS_RESOURCE_CHANGED",
+                f"数据库资源在生成运行清单前缺失或类型已变化：{candidates[0]}",
+            )
     return {
         "schema_version": 1,
         "resource_id": entry.get("id"),
@@ -640,7 +819,11 @@ def _catalog_entry_payload(
     }
 
 
-def _legacy_reference_requirements(reference: dict[str, Any]) -> list[dict[str, Any]]:
+def _legacy_reference_requirements(
+    reference: dict[str, Any],
+    *,
+    snapshot_budget: ResourceSnapshotBudget | None = None,
+) -> list[dict[str, Any]]:
     directories = reference.get("directories")
     if not isinstance(directories, dict):
         directories = {}
@@ -672,12 +855,21 @@ def _legacy_reference_requirements(reference: dict[str, Any]) -> list[dict[str, 
             ]
         )
     if declared:
-        checks.extend(entry_requirements({"required": declared}))
+        checks.extend(
+            _requirements(
+                {"required": declared},
+                snapshot_budget=snapshot_budget,
+            )
+        )
     return checks
 
 
-def _legacy_panel_requirements(panel: dict[str, Any]) -> list[dict[str, Any]]:
-    return entry_requirements(
+def _legacy_panel_requirements(
+    panel: dict[str, Any],
+    *,
+    snapshot_budget: ResourceSnapshotBudget | None = None,
+) -> list[dict[str, Any]]:
+    return _requirements(
         {
             "required": [],
             "bindings": panel.get("bindings") or {},
@@ -690,7 +882,8 @@ def _legacy_panel_requirements(panel: dict[str, Any]) -> list[dict[str, Any]]:
                 for key, _label, _kind in LEGACY_PANEL_BINDINGS
                 if key in panel
             },
-        }
+        },
+        snapshot_budget=snapshot_budget,
     )
 
 
@@ -1128,7 +1321,7 @@ def _published_inputs(
     dataset: dict[str, Any],
     reference: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    read1, read2 = _validate_dataset(dataset)
+    read1, read2 = _dataset_paths(dataset)
     execution_paths = {
         "bio.fastq.gz.r1": _execution_path(
             read1,
@@ -1328,8 +1521,8 @@ def _build_inputs(
     panel: dict[str, Any],
     values: dict[str, str],
 ) -> dict[str, Any]:
-    raw1, raw2 = _validate_dataset(dataset)
-    control_paths = _validate_dataset(control) if control is not None else None
+    raw1, raw2 = _dataset_paths(dataset)
+    control_paths = _dataset_paths(control) if control is not None else None
     rawdata_root = Path(settings.ANALYSIS_RAWDATA_ROOT)
     rawdata_execution_root = Path(settings.ANALYSIS_RAWDATA_EXECUTION_ROOT)
     database_root = Path(settings.ANALYSIS_DATABASE_ROOT)
@@ -1432,19 +1625,64 @@ def _build_inputs(
     return inputs
 
 
+class _LegacyOutputLimit:
+    def __init__(self, reason: str):
+        self.reason = reason
+
+
 def _flatten_outputs(value: Any, prefix: str = "") -> list[tuple[str, Any]]:
-    if isinstance(value, dict):
-        flattened = []
-        for key, item in value.items():
-            name = f"{prefix}.{key}" if prefix else str(key)
-            flattened.extend(_flatten_outputs(item, name))
-        return flattened
-    if isinstance(value, list):
-        flattened = []
-        for index, item in enumerate(value):
-            flattened.extend(_flatten_outputs(item, f"{prefix}[{index}]"))
-        return flattened
-    return [(prefix, value)]
+    """Flatten legacy output JSON within the same item/depth/value safety limits."""
+
+    max_items = max(
+        1,
+        int(getattr(settings, "ANALYSIS_OUTPUT_SNAPSHOT_MAX_ITEMS", 256)),
+    )
+    max_depth = max(
+        1,
+        int(getattr(settings, "ANALYSIS_OUTPUT_MANIFEST_MAX_DEPTH", 32)),
+    )
+    flattened: list[tuple[str, Any]] = []
+    item_limit_reached = False
+    visited_nodes = 0
+
+    def append(name: str, item: Any) -> bool:
+        nonlocal item_limit_reached
+        if len(flattened) >= max_items:
+            item_limit_reached = True
+            return False
+        flattened.append((name, item))
+        return True
+
+    def visit(item: Any, name: str, depth: int) -> bool:
+        nonlocal item_limit_reached, visited_nodes
+        visited_nodes += 1
+        if visited_nodes > max_items:
+            item_limit_reached = True
+            return False
+        if depth > max_depth:
+            return append(name, _LegacyOutputLimit("output_manifest_depth_exceeded"))
+        if isinstance(item, dict):
+            for key, child in item.items():
+                child_name = f"{name}.{key}" if name else str(key)
+                if not visit(child, child_name, depth + 1):
+                    return False
+            return True
+        if isinstance(item, list):
+            for index, child in enumerate(item):
+                if not visit(child, f"{name}[{index}]", depth + 1):
+                    return False
+            return True
+        reason = output_value_limit_reason(item)
+        return append(name, item if reason is None else _LegacyOutputLimit(reason))
+
+    visit(value, prefix, 0)
+    if item_limit_reached:
+        sentinel = ("<truncated>", _LegacyOutputLimit("output_snapshot_item_limit_exceeded"))
+        if len(flattened) >= max_items:
+            flattened[-1] = sentinel
+        else:
+            flattened.append(sentinel)
+    return flattened
 
 
 def _accessible_run_path(path: Path) -> Path:
@@ -1463,7 +1701,48 @@ def _accessible_run_path(path: Path) -> Path:
 
 
 def _output_payload(run: AnalysisRun) -> list[dict[str, Any]]:
-    if not run.outputs or not run.work_directory:
+    manifest = run.output_manifest if isinstance(run.output_manifest, dict) else {}
+    if output_manifest_has_integrity_v2(manifest):
+        payload = []
+        items = manifest.get("items")
+        if not isinstance(items, list):
+            return payload
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("kind") or "value")
+            output = {
+                "key": str(item.get("key") or ""),
+                "kind": kind,
+                "name": str(
+                    item.get("filename") or item.get("name") or item.get("key") or ""
+                ),
+            }
+            if kind == "file":
+                size = item.get("size")
+                if isinstance(size, int):
+                    output["size"] = size
+                    output["size_label"] = _format_size(size)
+                if output_manifest_file_item_is_verified(item):
+                    output["download_url"] = (
+                        f"/api/v1/analysis-runs/{run.id}/outputs"
+                        f"?key={quote(output['key'], safe='')}"
+                    )
+            elif kind == "value":
+                reason = output_value_limit_reason(item.get("value"))
+                if reason is None:
+                    output["value"] = item.get("value")
+                else:
+                    output["kind"] = "unverifiable"
+                    output["reason"] = reason
+            elif "entry_count" in item:
+                output["entry_count"] = item["entry_count"]
+            if item.get("reason"):
+                output["reason"] = str(item["reason"])
+            payload.append(output)
+        return payload
+
+    if not run.work_directory or not run.outputs:
         return []
     try:
         root = _accessible_run_path(Path(run.work_directory))
@@ -1472,6 +1751,16 @@ def _output_payload(run: AnalysisRun) -> list[dict[str, Any]]:
     outputs = run.outputs.get("outputs", run.outputs)
     payload = []
     for key, value in _flatten_outputs(outputs):
+        if isinstance(value, _LegacyOutputLimit):
+            payload.append(
+                {
+                    "key": key,
+                    "kind": "unverifiable",
+                    "name": key,
+                    "reason": value.reason,
+                }
+            )
+            continue
         if isinstance(value, str):
             path = Path(value)
             try:
@@ -1487,10 +1776,6 @@ def _output_payload(run: AnalysisRun) -> list[dict[str, Any]]:
                         "name": resolved.name,
                         "size": resolved.stat().st_size,
                         "size_label": _format_size(resolved.stat().st_size),
-                        "download_url": (
-                            f"/api/v1/analysis-runs/{run.id}/outputs"
-                            f"?key={quote(key, safe='')}"
-                        ),
                     }
                 )
                 continue
@@ -1499,7 +1784,14 @@ def _output_payload(run: AnalysisRun) -> list[dict[str, Any]]:
 
 
 def analysis_run_payload(
-    run: AnalysisRun, *, include_events: bool = False
+    run: AnalysisRun,
+    *,
+    include_events: bool = False,
+    include_outputs: bool = True,
+    include_task_timing: bool = True,
+    include_request: bool = True,
+    include_error_details: bool = True,
+    include_graph_summary: bool = True,
 ) -> dict[str, Any]:
     if run.workflow_version_id:
         workflow_payload = {
@@ -1509,8 +1801,11 @@ def analysis_run_payload(
             "revision": run.workflow_version.version,
             "digest": run.source_digest,
             "source_type": "workflow_version",
-            "graph_summary": _workflow_graph_summary(run.workflow_version),
         }
+        if include_graph_summary:
+            workflow_payload["graph_summary"] = _workflow_graph_summary(
+                run.workflow_version
+            )
     else:
         workflow_payload = {
             "slug": run.asset.slug,
@@ -1527,12 +1822,20 @@ def analysis_run_payload(
         "sample_name": run.sample_name,
         "actor": run.actor,
         "status": run.status,
+        "output_status": run.output_status,
         "progress": run.progress,
         "current_step": run.current_step,
-        "request": run.request_payload,
-        "error": run.error,
-        "outputs": _output_payload(run),
-        "timing": _run_timing_payload(run),
+        "request": run.request_payload if include_request else {},
+        "error": run.error if include_error_details else "",
+        "error_code": run.error_code,
+        "error_category": run.error_category,
+        "error_retryable": run.error_retryable,
+        "error_details": run.error_details if include_error_details else {},
+        "outputs": _output_payload(run) if include_outputs else [],
+        "timing": _run_timing_payload(
+            run,
+            include_task_timing=include_task_timing,
+        ),
         "created_at": run.created_at,
         "started_at": run.started_at,
         "finished_at": run.finished_at,
@@ -1623,9 +1926,44 @@ def analysis_catalog(request):
 @api_view(["GET", "POST"])
 def analysis_runs(request):
     if request.method == "GET":
-        runs = _visible_runs(request)[:50]
-        return Response({"results": [analysis_run_payload(run) for run in runs]})
+        runs = _visible_runs(request).defer(
+            "outputs",
+            "output_manifest",
+            "request_payload",
+            "input_values",
+            "source_bundle",
+            "error",
+            "error_details",
+            "work_directory",
+            "revision__content",
+            "revision__diff",
+            "revision__note",
+            "revision__analysis",
+            "workflow_version__workflow_graph",
+            "workflow_version__editor_document",
+            "workflow_version__tool_specs",
+            "workflow_version__compiled_bundle",
+            "workflow_version__interface_contract",
+            "workflow_version__subworkflow_references",
+        )[:50]
+        return Response(
+            {
+                "view": "summary",
+                "results": [
+                    analysis_run_payload(
+                        run,
+                        include_outputs=False,
+                        include_task_timing=False,
+                        include_request=False,
+                        include_error_details=False,
+                        include_graph_summary=False,
+                    )
+                    for run in runs
+                ]
+            }
+        )
 
+    snapshot_budget = ResourceSnapshotBudget()
     try:
         workflow_slug = str(request.data.get("workflow") or "")
         datasets = discover_fastq_datasets()
@@ -1661,7 +1999,10 @@ def analysis_runs(request):
                 annotation_reference = _annotation_reference_entry(
                     workflow_version, reference
                 )
-                requirements = _requirements(annotation_reference)
+                requirements = _requirements(
+                    annotation_reference,
+                    snapshot_budget=snapshot_budget,
+                )
                 if any(not item["present"] for item in requirements):
                     raise AnalysisInputError(
                         "ANALYSIS_DATABASE_INCOMPLETE",
@@ -1674,9 +2015,17 @@ def analysis_runs(request):
                     )
                 _validate_annotation_reference(workflow_version, reference)
             input_values = _published_inputs(workflow_version, dataset, reference)
-            input_manifest = _dataset_manifest(dataset)
+            input_manifest = _dataset_manifest(
+                dataset,
+                snapshot_budget=snapshot_budget,
+            )
             database_manifest = (
-                _catalog_resource_manifest(annotation_reference) if reference else None
+                _catalog_resource_manifest(
+                    annotation_reference,
+                    snapshot_budget=snapshot_budget,
+                )
+                if reference
+                else None
             )
             run = AnalysisRun.objects.create(
                 workflow_version=workflow_version,
@@ -1804,14 +2153,20 @@ def analysis_runs(request):
                 "所选 Panel 不适用于当前流程。",
             )
         adapter_missing = [
-            *_legacy_reference_requirements(reference),
-            *_legacy_panel_requirements(panel),
+            *_legacy_reference_requirements(
+                reference,
+                snapshot_budget=snapshot_budget,
+            ),
+            *_legacy_panel_requirements(
+                panel,
+                snapshot_budget=snapshot_budget,
+            ),
         ]
         missing = [
             item
             for item in [
-                *_requirements(reference),
-                *_requirements(panel),
+                *_requirements(reference, snapshot_budget=snapshot_budget),
+                *_requirements(panel, snapshot_budget=snapshot_budget),
                 *adapter_missing,
             ]
             if not item["present"]
@@ -1852,15 +2207,31 @@ def analysis_runs(request):
 
     try:
         input_manifest = {
-            "primary": _dataset_manifest(dataset),
-            "control": _dataset_manifest(control) if control else None,
+            "primary": _dataset_manifest(
+                dataset,
+                snapshot_budget=snapshot_budget,
+            ),
+            "control": (
+                _dataset_manifest(
+                    control,
+                    snapshot_budget=snapshot_budget,
+                )
+                if control
+                else None
+            ),
         }
+        reference_manifest = _catalog_resource_manifest(
+            reference,
+            snapshot_budget=snapshot_budget,
+        )
+        panel_manifest = _catalog_resource_manifest(
+            panel,
+            snapshot_budget=snapshot_budget,
+        )
     except AnalysisInputError as error:
         return _error(
             error.code, str(error), status.HTTP_400_BAD_REQUEST, details=error.details
         )
-    reference_manifest = _catalog_resource_manifest(reference)
-    panel_manifest = _catalog_resource_manifest(panel)
     run = AnalysisRun.objects.create(
         asset=asset,
         revision=revision,
@@ -1923,37 +2294,88 @@ def analysis_run_detail(request, run_id):
 def analysis_run_output(request, run_id):
     run = get_object_or_404(_visible_runs(request), pk=run_id)
     key = str(request.query_params.get("key") or "")
-    output = next(
-        (
-            item
-            for item in _output_payload(run)
-            if item.get("kind") == "file" and item.get("key") == key
-        ),
-        None,
+    manifest = run.output_manifest if isinstance(run.output_manifest, dict) else {}
+    if output_manifest_has_integrity_v2(manifest):
+        items = manifest.get("items")
+        if not isinstance(items, list):
+            return _error(
+                "ANALYSIS_OUTPUT_UNVERIFIED",
+                "输出完整性清单无效，无法安全下载。",
+                status.HTTP_409_CONFLICT,
+            )
+        item = next(
+            (
+                value
+                for value in items
+                if isinstance(value, dict) and value.get("key") == key
+            ),
+            None,
+        )
+        if item is None:
+            return _error(
+                "ANALYSIS_OUTPUT_NOT_FOUND",
+                "输出文件不存在。",
+                status.HTTP_404_NOT_FOUND,
+            )
+        if item.get("kind") == "unverifiable":
+            return _error(
+                "ANALYSIS_OUTPUT_INCOMPLETE",
+                "输出项未完成或完整性清单无效，无法安全下载。",
+                status.HTTP_409_CONFLICT,
+            )
+        if item.get("kind") != "file":
+            return _error(
+                "ANALYSIS_OUTPUT_NOT_FOUND",
+                "输出文件不存在。",
+                status.HTTP_404_NOT_FOUND,
+            )
+        if not output_manifest_file_item_is_verified(item):
+            return _error(
+                "ANALYSIS_OUTPUT_UNVERIFIED",
+                "输出项完整性清单无效，无法安全下载。",
+                status.HTTP_409_CONFLICT,
+            )
+        try:
+            path, handle = open_verified_output(
+                item,
+                run_root=run.work_directory,
+            )
+        except (OSError, TypeError, ValueError, KeyError):
+            return _error(
+                "ANALYSIS_OUTPUT_CHANGED",
+                "输出文件与成功时的不可变清单不一致。",
+                status.HTTP_409_CONFLICT,
+            )
+    else:
+        legacy_output = next(
+            (
+                value
+                for value in _output_payload(run)
+                if value.get("kind") == "file" and value.get("key") == key
+            ),
+            None,
+        )
+        if legacy_output is None:
+            return _error(
+                "ANALYSIS_OUTPUT_NOT_FOUND",
+                "输出文件不存在。",
+                status.HTTP_404_NOT_FOUND,
+            )
+        return _error(
+            "ANALYSIS_OUTPUT_UNVERIFIED",
+            "历史输出缺少完整性清单，无法安全下载。",
+            status.HTTP_409_CONFLICT,
+        )
+    content_type = str(
+        item.get("content_type")
+        or mimetypes.guess_type(str(item.get("filename") or path.name))[0]
+        or "application/octet-stream"
     )
-    if output is None:
-        return _error(
-            "ANALYSIS_OUTPUT_NOT_FOUND",
-            "输出文件不存在。",
-            status.HTTP_404_NOT_FOUND,
-        )
-    values = dict(_flatten_outputs(run.outputs.get("outputs", run.outputs)))
-    try:
-        root = _accessible_run_path(Path(run.work_directory))
-        path = _accessible_run_path(Path(values[key]))
-        path.relative_to(root)
-        if not path.is_file():
-            raise ValueError
-    except (OSError, TypeError, ValueError):
-        return _error(
-            "ANALYSIS_OUTPUT_NOT_FOUND",
-            "输出文件不存在。",
-            status.HTTP_404_NOT_FOUND,
-        )
-    content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    return FileResponse(
-        path.open("rb"),
+    response = FileResponse(
+        handle,
         as_attachment=True,
-        filename=path.name,
+        filename=str(item.get("filename") or path.name),
         content_type=content_type,
     )
+    response["ETag"] = f'"{str(item["sha256"]).removeprefix("sha256:")}"'
+    return response

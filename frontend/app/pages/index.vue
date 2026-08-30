@@ -106,6 +106,20 @@ interface WorkflowLibraryEntry {
   updated_at: string
   created_by?: string
   is_mine?: boolean
+  latest_version_snapshot?: WorkflowVersionEntry | null
+}
+interface WorkflowLibraryPage {
+  results: WorkflowLibraryEntry[]
+  page?: number
+  page_size?: number
+  total?: number
+  has_next?: boolean
+}
+interface WorkflowLibraryFilters {
+  q: string
+  owner: 'all' | 'mine' | 'shared'
+  kind: 'all' | 'workflow' | 'subworkflow'
+  status: 'all' | 'draft' | 'published'
 }
 interface WorkflowInterfacePort {
   name: string
@@ -147,6 +161,9 @@ interface WorkflowDocumentPayload {
   workflow_graph: Record<string, any>
   tool_specs: Record<string, any>[]
   updated_by: string
+  created_by?: string
+  is_mine?: boolean
+  latest_version: number | null
   updated_at: string
   document_version: number
   document_digest: string
@@ -336,7 +353,19 @@ const workflowCreateRequest = ref<'workflow' | 'subworkflow'>()
 const workflowDocuments = ref<WorkflowLibraryEntry[]>([])
 const workflowLibraryState = ref<'loading' | 'ready' | 'error'>('loading')
 const workflowLibraryError = ref('')
+const workflowLibraryPage = ref(1)
+const workflowLibraryTotal = ref(0)
+const workflowLibraryHasNext = ref(false)
+const workflowLibraryLoadingMore = ref(false)
+const workflowLibraryFilters = ref<WorkflowLibraryFilters>({
+  q: '',
+  owner: 'all',
+  kind: 'all',
+  status: 'all',
+})
 const subworkflowVersions = ref<WorkflowVersionEntry[]>([])
+const loadedSubworkflowHistories = new Set<string>()
+const loadingSubworkflowHistories = new Set<string>()
 const subworkflowUpgradeTargetVersion = ref<number>()
 const subworkflowUpgradeState = ref<'idle' | 'saving' | 'success' | 'warning' | 'error'>('idle')
 const subworkflowUpgradeMessage = ref('')
@@ -2017,7 +2046,10 @@ function mapCompilationHistory(records: CompilationHistoryRecord[]): Compilation
   }))
 }
 
-async function loadWorkflow(slug = selectedWorkflowSlug.value) {
+async function loadWorkflow(
+  slug = selectedWorkflowSlug.value,
+  refreshLibrary = true,
+) {
   if (
     !slug
     || isWorkflowSwitching.value
@@ -2047,6 +2079,21 @@ async function loadWorkflow(slug = selectedWorkflowSlug.value) {
         )
       : undefined
     if (sequence !== workflowLoadSequence) return false
+
+    const documentSummary: WorkflowLibraryEntry = {
+      slug: document.slug,
+      name: document.name,
+      description: document.description,
+      kind: document.kind,
+      latest_version: document.latest_version,
+      updated_at: document.updated_at,
+      created_by: document.created_by,
+      is_mine: document.is_mine,
+    }
+    workflowDocuments.value = [
+      documentSummary,
+      ...workflowDocuments.value.filter(item => item.slug !== document.slug),
+    ]
 
     const positions = new Map(document.editor_document.nodes?.map((item) => [item.id, item.position]))
     const nextNodes: Node<WorkflowNodeData>[] = (document.workflow_graph.nodes ?? []).map(
@@ -2107,7 +2154,7 @@ async function loadWorkflow(slug = selectedWorkflowSlug.value) {
     await nextTick()
     vueFlowStore.value?.updateNodeInternals(nextNodes.map((node) => node.id))
     workflowSavedSnapshot.value = workflowSaveSnapshot()
-    void loadWorkflowLibrary()
+    if (refreshLibrary) void loadWorkflowLibrary()
     return true
   } catch (error) {
     console.error('Failed to load workflow document', error)
@@ -2927,35 +2974,167 @@ async function createTool() {
   showLayoutFeedback(`已创建工具草稿 ${toolId}`, 'success')
 }
 
-async function loadWorkflowLibrary() {
-  if (workflowDocuments.value.length === 0) workflowLibraryState.value = 'loading'
+function updateSubworkflowVersions(documents: WorkflowLibraryEntry[]) {
+  const snapshots = documents
+    .map(item => item.latest_version_snapshot)
+    .filter((item): item is WorkflowVersionEntry => item?.kind === 'subworkflow')
+  const merged = new Map(
+    [...subworkflowVersions.value, ...snapshots]
+      .map(item => [`${item.slug}:${item.version}`, item]),
+  )
+  subworkflowVersions.value = [...merged.values()]
+    .toSorted((a, b) => a.name.localeCompare(b.name) || b.version - a.version)
+}
+
+async function loadSubworkflowVersionHistory(slug: string) {
+  if (
+    !slug
+    || loadedSubworkflowHistories.has(slug)
+    || loadingSubworkflowHistories.has(slug)
+  ) return
+  loadingSubworkflowHistories.add(slug)
+  try {
+    const history: WorkflowVersionEntry[] = []
+    let page = 1
+    let hasNext = true
+    while (hasNext) {
+      const response = await $fetch<{
+        results: WorkflowVersionEntry[]
+        has_next?: boolean
+      }>(
+        `/api/v1/editor/workflows/${encodeURIComponent(slug)}/versions`,
+        { query: { page, page_size: 100 } },
+      )
+      history.push(...response.results)
+      hasNext = response.has_next === true
+      page += 1
+    }
+    const merged = new Map(
+      [...subworkflowVersions.value, ...history]
+        .filter(item => item.kind === 'subworkflow')
+        .map(item => [`${item.slug}:${item.version}`, item]),
+    )
+    subworkflowVersions.value = [...merged.values()]
+      .toSorted((a, b) => a.name.localeCompare(b.name) || b.version - a.version)
+    loadedSubworkflowHistories.add(slug)
+  } catch (error) {
+    console.error('Failed to load subworkflow version history', error)
+  } finally {
+    loadingSubworkflowHistories.delete(slug)
+  }
+}
+
+let subworkflowSearchSequence = 0
+async function searchPublishedSubworkflows(query: string) {
+  const sequence = ++subworkflowSearchSequence
+  try {
+    const response = await $fetch<WorkflowLibraryPage>('/api/v1/editor/workflows', {
+      query: {
+        page: 1,
+        page_size: 50,
+        kind: 'subworkflow',
+        status: 'published',
+        q: query.trim() || undefined,
+      },
+    })
+    if (sequence === subworkflowSearchSequence) {
+      updateSubworkflowVersions(response.results)
+    }
+  } catch (error) {
+    console.error('Failed to search published subworkflows', error)
+  }
+}
+
+let workflowLibrarySequence = 0
+async function loadWorkflowLibrary(page = 1, append = false) {
+  const sequence = ++workflowLibrarySequence
+  if (!append && workflowDocuments.value.length === 0) {
+    workflowLibraryState.value = 'loading'
+  }
+  workflowLibraryLoadingMore.value = true
   workflowLibraryError.value = ''
   try {
-    const response = await $fetch<{ results: WorkflowLibraryEntry[] }>('/api/v1/editor/workflows')
-    workflowDocuments.value = response.results
-    const subflows = response.results.filter((item) => item.kind === 'subworkflow' && item.latest_version)
-    const versionResponses = await Promise.all(subflows.map((item) =>
-      $fetch<{ results: WorkflowVersionEntry[] }>(
-        `/api/v1/editor/workflows/${encodeURIComponent(item.slug)}/versions`,
-      ),
-    ))
-    subworkflowVersions.value = versionResponses
-      .flatMap((response) => response.results)
-      .filter((item) => item.kind === 'subworkflow')
-      .toSorted((a, b) => a.name.localeCompare(b.name) || b.version - a.version)
+    const response = await $fetch<WorkflowLibraryPage>('/api/v1/editor/workflows', {
+      query: {
+        page,
+        page_size: 50,
+        q: workflowLibraryFilters.value.q || undefined,
+        owner: workflowLibraryFilters.value.owner === 'all' ? undefined : workflowLibraryFilters.value.owner,
+        kind: workflowLibraryFilters.value.kind === 'all' ? undefined : workflowLibraryFilters.value.kind,
+        status: workflowLibraryFilters.value.status === 'all' ? undefined : workflowLibraryFilters.value.status,
+      },
+    })
+    if (sequence !== workflowLibrarySequence) return
+    let documents = append
+      ? [...workflowDocuments.value, ...response.results]
+      : response.results
+    const currentDocument = workflowDocuments.value.find(
+      item => item.slug === selectedWorkflowSlug.value,
+    )
+    if (
+      !append
+      && currentDocument
+      && !documents.some(item => item.slug === currentDocument.slug)
+    ) {
+      documents = [currentDocument, ...documents]
+    }
+    workflowDocuments.value = [
+      ...new Map(documents.map(item => [item.slug, item])).values(),
+    ]
+    updateSubworkflowVersions(response.results)
+    workflowLibraryPage.value = response.page ?? page
+    workflowLibraryTotal.value = response.total ?? workflowDocuments.value.length
+    workflowLibraryHasNext.value = Boolean(response.has_next)
     workflowNavigationStack.value = workflowNavigationStack.value.map(parent => ({
       ...parent,
-      name: response.results.find(item => item.slug === parent.slug)?.name ?? parent.name,
+      name: workflowDocuments.value.find(item => item.slug === parent.slug)?.name ?? parent.name,
     }))
     workflowLibraryState.value = 'ready'
   } catch (error) {
+    if (sequence !== workflowLibrarySequence) return
     console.error('Failed to load workflow library', error)
     if (workflowDocuments.value.length === 0) {
       workflowLibraryState.value = 'error'
       workflowLibraryError.value = '暂时无法读取流程列表。'
     }
+  } finally {
+    if (sequence === workflowLibrarySequence) {
+      workflowLibraryLoadingMore.value = false
+    }
   }
 }
+
+async function loadMoreWorkflows() {
+  if (!workflowLibraryHasNext.value || workflowLibraryLoadingMore.value) return
+  await loadWorkflowLibrary(workflowLibraryPage.value + 1, true)
+}
+
+async function filterWorkflowLibrary(filters: WorkflowLibraryFilters) {
+  workflowLibraryFilters.value = filters
+  await loadWorkflowLibrary(1, false)
+}
+
+watch(
+  () => selectedData.value?.kind === 'subworkflow'
+    ? selectedData.value.subworkflowSlug
+    : undefined,
+  (slug) => {
+    if (slug) void loadSubworkflowVersionHistory(slug)
+  },
+  { immediate: true },
+)
+
+let subworkflowSearchTimer: ReturnType<typeof setTimeout> | undefined
+watch([activeLibrary, searchQuery], ([library, query]) => {
+  if (subworkflowSearchTimer) clearTimeout(subworkflowSearchTimer)
+  if (library !== 'subworkflows') return
+  subworkflowSearchTimer = setTimeout(() => {
+    void searchPublishedSubworkflows(query)
+  }, 200)
+})
+onBeforeUnmount(() => {
+  if (subworkflowSearchTimer) clearTimeout(subworkflowSearchTimer)
+})
 
 function dismissWdlGraphProposal() {
   wdlGraphProposal.value = undefined
@@ -3284,7 +3463,11 @@ onMounted(() => {
   workflowNavigationStack.value = requestedPath
     .filter(slug => slug !== requestedWorkflow)
     .map(slug => ({ slug, name: slug }))
-  void Promise.all([loadWorkflow(requestedWorkflow), loadToolRegistry()]).then(async () => {
+  void loadWorkflowLibrary()
+  void Promise.all([
+    loadWorkflow(requestedWorkflow, false),
+    loadToolRegistry(),
+  ]).then(async () => {
     const requestedWdlVersion = Number(route.query.wdlVersion)
     const requestedWorkflowVersion = Number(route.query.workflowVersion)
     if (Number.isInteger(requestedWdlVersion) && requestedWdlVersion > 0) {
@@ -3454,6 +3637,9 @@ onBeforeRouteLeave(() => {
         :workflow-documents="workflowDocuments"
         :library-state="workflowLibraryState"
         :library-error="workflowLibraryError"
+        :library-total="workflowLibraryTotal"
+        :library-has-next="workflowLibraryHasNext"
+        :library-loading-more="workflowLibraryLoadingMore"
         :is-workflow-switching="isWorkflowSwitching"
         :switching-workflow-slug="switchingWorkflowSlug"
         :save-state="saveState"
@@ -3497,6 +3683,8 @@ onBeforeRouteLeave(() => {
         @create-workflow="createWorkflow"
         @create-request-handled="handleWorkflowCreateRequest"
         @retry-library="loadWorkflowLibrary"
+        @load-more="loadMoreWorkflows"
+        @filters-change="filterWorkflowLibrary"
       />
 
       <HelpWorkspace v-else />
