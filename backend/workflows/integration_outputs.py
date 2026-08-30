@@ -16,8 +16,9 @@ import threading
 import time
 import zlib
 from collections.abc import Callable
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Iterator
 from urllib.parse import quote
 
 from django.conf import settings
@@ -120,6 +121,16 @@ class ResourceSnapshotBudget:
 
     def checkpoint(self) -> None:
         self._remaining_seconds()
+
+    @contextmanager
+    def suspend_deadline(self) -> Iterator[None]:
+        """Exclude an independently bounded external wait from this budget."""
+
+        started = time.monotonic()
+        try:
+            yield
+        finally:
+            self.deadline += max(0.0, time.monotonic() - started)
 
     def directory_manifest(
         self,

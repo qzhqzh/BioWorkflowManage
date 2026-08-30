@@ -283,6 +283,13 @@ ANALYSIS_OBJECT_HEAD_TIMEOUT_SECONDS = max(
     0.1,
     float(os.environ.get("ANALYSIS_OBJECT_HEAD_TIMEOUT_SECONDS", "10")),
 )
+ANALYSIS_OBJECT_HEAD_REQUEST_TIMEOUT_SECONDS = min(
+    20.0,
+    max(
+        0.1,
+        float(os.environ.get("ANALYSIS_OBJECT_HEAD_REQUEST_TIMEOUT_SECONDS", "20")),
+    ),
+)
 ANALYSIS_OBJECT_HEAD_MAX_CONCURRENT = max(
     1,
     int(os.environ.get("ANALYSIS_OBJECT_HEAD_MAX_CONCURRENT", "8")),

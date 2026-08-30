@@ -73,6 +73,7 @@ from .models import (
     WorkflowVersion,
 )
 from .object_inputs import (
+    ObjectHeadBudget,
     ObjectInputError,
     inspect_object_reference,
     object_manifest_items,
@@ -848,6 +849,7 @@ def _coerce_input(
     observed: list[dict[str, Any]],
     object_checks: list[dict[str, Any]],
     snapshot_budget: ResourceSnapshotBudget,
+    object_head_budget: ObjectHeadBudget,
     client_id: str | None,
 ) -> Any:
     optional = wdl_type.endswith("?")
@@ -884,15 +886,17 @@ def _coerce_input(
                     "OBJECT_INPUT_LIMIT_EXCEEDED",
                     "对象输入数量超过部署上限。",
                     category="input",
-                )
+            )
             try:
                 _snapshot_checkpoint(snapshot_budget)
-                execution_path, manifest, check = inspect_object_reference(
-                    value,
-                    input_name=input_name,
-                    semantic_type=semantic_type,
-                    client_id=client_id,
-                )
+                with snapshot_budget.suspend_deadline():
+                    execution_path, manifest, check = inspect_object_reference(
+                        value,
+                        input_name=input_name,
+                        semantic_type=semantic_type,
+                        client_id=client_id,
+                        head_budget=object_head_budget,
+                    )
                 _snapshot_checkpoint(snapshot_budget)
             except ObjectInputError as error:
                 raise IntegrationAPIError(
@@ -946,6 +950,7 @@ def _coerce_input(
                 observed=observed,
                 object_checks=object_checks,
                 snapshot_budget=snapshot_budget,
+                object_head_budget=object_head_budget,
                 client_id=client_id,
             )
             for item in value
@@ -968,6 +973,7 @@ def _coerce_input(
                 observed=observed,
                 object_checks=object_checks,
                 snapshot_budget=snapshot_budget,
+                object_head_budget=object_head_budget,
                 client_id=client_id,
             )
             for index, side in enumerate(("left", "right"))
@@ -1299,42 +1305,50 @@ def _prepare_contract_inputs(
     snapshot_budget = snapshot_budget or ResourceSnapshotBudget()
     observed: list[dict[str, Any]] = []
     object_checks: list[dict[str, Any]] = []
+    object_head_budget = ObjectHeadBudget()
     values: dict[str, Any] = {}
-    for name, port in by_name.items():
-        if name in raw_inputs:
-            raw_value = raw_inputs[name]
-        elif "default" in port:
-            raw_value = port["default"]
-        elif not port.get("required", True) or str(port.get("wdl_type", "")).endswith("?"):
-            continue
-        else:
-            raise IntegrationAPIError(
-                "INPUT_REQUIRED",
-                f"缺少必填输入 {name}。",
-                category="input",
-                details={"input": name},
+    try:
+        for name, port in by_name.items():
+            if name in raw_inputs:
+                raw_value = raw_inputs[name]
+            elif "default" in port:
+                raw_value = port["default"]
+            elif not port.get("required", True) or str(
+                port.get("wdl_type", "")
+            ).endswith("?"):
+                continue
+            else:
+                raise IntegrationAPIError(
+                    "INPUT_REQUIRED",
+                    f"缺少必填输入 {name}。",
+                    category="input",
+                    details={"input": name},
+                )
+            value = _coerce_input(
+                raw_value,
+                wdl_type=str(port.get("wdl_type") or ""),
+                input_name=name,
+                semantic_type=str(port.get("semantic_type") or "core.value.unknown"),
+                manifests=manifests,
+                observed=observed,
+                object_checks=object_checks,
+                snapshot_budget=snapshot_budget,
+                object_head_budget=object_head_budget,
+                client_id=client_id,
             )
-        value = _coerce_input(
-            raw_value,
-            wdl_type=str(port.get("wdl_type") or ""),
-            input_name=name,
-            semantic_type=str(port.get("semantic_type") or "core.value.unknown"),
-            manifests=manifests,
-            observed=observed,
-            object_checks=object_checks,
-            snapshot_budget=snapshot_budget,
-            client_id=client_id,
-        )
-        try:
-            _validate_constraints(port, value)
-        except ValueError as error:
-            raise IntegrationAPIError(
-                "INPUT_CONSTRAINT_INVALID",
-                str(error),
-                category="input",
-            ) from error
-        key = input_keys[name] if input_keys else name
-        values[f"{workflow_name}.{key}"] = value
+            try:
+                _validate_constraints(port, value)
+            except ValueError as error:
+                raise IntegrationAPIError(
+                    "INPUT_CONSTRAINT_INVALID",
+                    str(error),
+                    category="input",
+                ) from error
+            key = input_keys[name] if input_keys else name
+            values[f"{workflow_name}.{key}"] = value
+    finally:
+        with snapshot_budget.suspend_deadline():
+            object_head_budget.close()
     content_checks = [
         *object_checks,
         *_content_checks(

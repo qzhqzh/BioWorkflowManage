@@ -190,7 +190,7 @@ def _mock_object_head(client: _FakeS3Client):
             "VersionId": response.get("VersionId"),
         }
 
-    return patch("workflows.object_inputs._run_object_head_worker", side_effect=inspect)
+    return patch("workflows.object_inputs.ObjectHeadBudget.inspect", side_effect=inspect)
 
 
 @pytest.fixture
@@ -1045,6 +1045,146 @@ def test_s3_inputs_share_auditable_manifest_and_stage_without_credentials(
     with pytest.raises(ObjectInputError) as caught:
         stage_run_object_inputs(run)
     assert caught.value.code == "OBJECT_INPUT_STAGING_CHANGED"
+
+
+@pytest.mark.django_db
+def test_four_object_preflights_use_independent_real_worker_budget(
+    integration_workspace,
+    settings,
+    monkeypatch,
+    tmp_path,
+):
+    from workflows import object_inputs as object_inputs_module
+
+    _, _, _, client = _token_client()
+    profile_dir = Path(settings.ANALYSIS_OBJECT_STORAGE_PROFILE_DIR)
+    _write_object_profile(profile_dir)
+    site_directory = tmp_path / "object-head-site"
+    site_directory.mkdir()
+    startup_marker = tmp_path / "object-head-worker-starts"
+    (site_directory / "sitecustomize.py").write_text(
+        (
+            f"""
+import socket
+import time
+from botocore.client import BaseClient
+
+with open({str(startup_marker)!r}, "a", encoding="utf-8") as marker:
+    marker.write("started\\n")
+"""
+            + """
+time.sleep(0.55)
+original_getaddrinfo = socket.getaddrinfo
+original_make_api_call = BaseClient._make_api_call
+
+def fake_getaddrinfo(host, port, *args, **kwargs):
+    if host == "objects.example.test":
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("8.8.8.8", port))]
+    return original_getaddrinfo(host, port, *args, **kwargs)
+
+def fake_make_api_call(self, operation_name, api_params):
+    if operation_name == "HeadObject":
+        return {
+            "ContentLength": 1,
+            "ETag": api_params.get("IfMatch"),
+            "VersionId": api_params.get("VersionId"),
+        }
+    return original_make_api_call(self, operation_name, api_params)
+
+socket.getaddrinfo = fake_getaddrinfo
+BaseClient._make_api_call = fake_make_api_call
+"""
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    original_environment = object_inputs_module._head_worker_environment
+
+    def worker_environment(timeout):
+        environment = original_environment(timeout)
+        environment["PYTHONPATH"] = str(site_directory)
+        return environment
+
+    monkeypatch.setattr(
+        object_inputs_module,
+        "_head_worker_environment",
+        worker_environment,
+    )
+    tool_inputs = [
+        {
+            "name": f"file{index}",
+            "label": f"File {index}",
+            "wdl_type": "File",
+            "semantic_type": "core.file.unknown",
+            "required": True,
+        }
+        for index in range(1, 5)
+    ]
+    spec = {
+        "schema_version": "1.0.0",
+        "id": "four_object_task",
+        "name": "four_object_task",
+        "display_name": "Four object task",
+        "tool_version": "1.0.0",
+        "description": "Object HEAD budget fixture",
+        "container": {"engine": "docker", "image": "ubuntu:24.04"},
+        "inputs": tool_inputs,
+        "outputs": [
+            {
+                "name": "result",
+                "wdl_type": "File",
+                "semantic_type": "core.file.any",
+                "capture": {"mode": "path", "value": "result.txt"},
+            }
+        ],
+        "command": {
+            "shell": "bash",
+            "strict_mode": True,
+            "template": 'cp "~{file1}" result.txt',
+        },
+        "runtime": {"cpu": 1, "memory_gb": 1, "disk_gb": 1},
+    }
+    tool = ToolVersion.objects.create(
+        tool_id=spec["id"],
+        version=spec["tool_version"],
+        name=spec["display_name"],
+        digest=canonical_digest(spec),
+        tool_spec=spec,
+    )
+    body = {
+        "external_ref": {
+            "client_id": "okb",
+            "external_run_id": "four-object-preflight",
+        },
+        "tool": {
+            "tool_id": tool.tool_id,
+            "version": tool.version,
+            "expected_digest": tool.digest,
+        },
+        "inputs": {
+            item["name"]: _object_reference(
+                b"x",
+                key=f'incoming/{item["name"]}.txt',
+            )
+            for item in tool_inputs
+        },
+    }
+
+    assert settings.ANALYSIS_RESOURCE_MANIFEST_TIMEOUT_SECONDS == 2
+    assert settings.ANALYSIS_OBJECT_HEAD_REQUEST_TIMEOUT_SECONDS == 20
+    started = time.monotonic()
+    response = client.post(
+        "/api/v1/integration/tool-test-runs/preflight",
+        body,
+        format="json",
+    )
+
+    assert response.status_code == 200, response.data
+    assert response.data["ready"] is True
+    assert [item["check"] for item in response.data["checks"]].count(
+        "object_input_head"
+    ) == 4
+    assert startup_marker.read_text(encoding="utf-8") == "started\n"
+    assert time.monotonic() - started < 20
 
 
 @pytest.mark.django_db

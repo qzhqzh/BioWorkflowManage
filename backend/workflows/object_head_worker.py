@@ -12,6 +12,7 @@ from typing import Any
 
 
 MAX_REQUEST_BYTES = 64 * 1024
+MAX_RESPONSE_BYTES = 64 * 1024
 PR_SET_PDEATHSIG = 1
 
 
@@ -51,8 +52,7 @@ def _arm_parent_death_signal(expected_parent_pid: int) -> None:
         os.kill(os.getpid(), signal.SIGKILL)
 
 
-def _request() -> tuple[dict[str, Any], str | None]:
-    raw = sys.stdin.buffer.read(MAX_REQUEST_BYTES + 1)
+def _request(raw: bytes) -> tuple[dict[str, Any], str | None]:
     if len(raw) > MAX_REQUEST_BYTES:
         raise ValueError("object HEAD request is too large")
     payload = json.loads(raw.decode("utf-8"))
@@ -106,6 +106,29 @@ def _timeout() -> dict[str, Any]:
     }
 
 
+def _write(payload: dict[str, Any]) -> None:
+    try:
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        encoded = json.dumps(
+            _unavailable(),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    if len(encoded) > MAX_RESPONSE_BYTES:
+        encoded = json.dumps(
+            _unavailable(),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    sys.stdout.buffer.write(encoded + b"\n")
+    sys.stdout.buffer.flush()
+
+
 def main() -> int:
     options = _arguments()
     _arm_deadline(options.deadline_seconds)
@@ -125,36 +148,34 @@ def main() -> int:
         )
 
         object_error_type = ObjectInputError
-        raw_reference, client_id = _request()
-        reference = _reference(raw_reference, input_name="object")
-        metadata = _inspect_object_reference_metadata(
-            reference,
-            client_id=client_id,
-        )
-        payload = {"ok": True, "metadata": metadata}
+        while raw := sys.stdin.buffer.readline(MAX_REQUEST_BYTES + 2):
+            try:
+                if not raw.endswith(b"\n") or len(raw) > MAX_REQUEST_BYTES + 1:
+                    raise ValueError("object HEAD request is too large")
+                raw_reference, client_id = _request(raw[:-1])
+                reference = _reference(raw_reference, input_name="object")
+                metadata = _inspect_object_reference_metadata(
+                    reference,
+                    client_id=client_id,
+                )
+                payload = {"ok": True, "metadata": metadata}
+            except _ObjectHeadDeadline:
+                raise
+            except ObjectInputError as error:
+                payload = _stable_error(error)
+            except BaseException:
+                payload = _unavailable()
+            _write(payload)
     except _ObjectHeadDeadline:
-        payload = _timeout()
+        _write(_timeout())
     except BaseException as error:
         object_error_type = locals().get("object_error_type")
         if object_error_type is not None and isinstance(error, object_error_type):
-            payload = _stable_error(error)
+            _write(_stable_error(error))
         else:
-            payload = _unavailable()
+            _write(_unavailable())
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
-    try:
-        encoded = json.dumps(
-            payload,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    except (TypeError, ValueError):
-        encoded = json.dumps(
-            _unavailable(),
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    sys.stdout.buffer.write(encoded)
     return 0
 
 

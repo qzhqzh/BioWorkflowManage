@@ -91,8 +91,9 @@ def _head_worker_script(tmp_path: Path, payload: dict | None) -> Path:
         response = json.dumps(payload, separators=(",", ":"))
         source = (
             "import sys\n"
-            "sys.stdin.buffer.read()\n"
-            f"sys.stdout.write({response!r})\n"
+            "sys.stdin.buffer.readline()\n"
+            f"sys.stdout.write({(response + chr(10))!r})\n"
+            "sys.stdout.flush()\n"
         )
     worker.write_text(source, encoding="utf-8")
     return worker

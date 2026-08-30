@@ -5,6 +5,7 @@ import ipaddress
 import json
 import os
 import re
+import select
 import shutil
 import signal
 import socket
@@ -86,6 +87,76 @@ class ObjectInputError(RuntimeError):
         self.retryable = retryable
         self.details = details or {}
         self.http_status = http_status
+
+
+class ObjectHeadBudget:
+    def __init__(self, total_seconds: float | None = None) -> None:
+        configured = (
+            settings.ANALYSIS_OBJECT_HEAD_REQUEST_TIMEOUT_SECONDS
+            if total_seconds is None
+            else total_seconds
+        )
+        self.remaining_seconds = min(20.0, max(0.1, float(configured)))
+        self._worker = None
+
+    def __enter__(self) -> ObjectHeadBudget:
+        return self
+
+    def __exit__(self, _exception_type, _exception, _traceback) -> None:
+        self.close()
+
+    @contextmanager
+    def operation(self) -> Iterator[float]:
+        if self.remaining_seconds <= 0:
+            raise ObjectInputError(
+                "OBJECT_INPUT_HEAD_TIMEOUT",
+                "对象存储预检超过请求总时间上限。",
+                retryable=True,
+                http_status=503,
+            )
+        timeout = min(
+            max(0.1, float(settings.ANALYSIS_OBJECT_HEAD_TIMEOUT_SECONDS)),
+            self.remaining_seconds,
+        )
+        started = time.monotonic()
+        succeeded = False
+        try:
+            yield timeout
+            succeeded = True
+        finally:
+            self.remaining_seconds = max(
+                0.0,
+                self.remaining_seconds - max(0.0, time.monotonic() - started),
+            )
+        if succeeded and self.remaining_seconds <= 0:
+            raise ObjectInputError(
+                "OBJECT_INPUT_HEAD_TIMEOUT",
+                "对象存储预检超过请求总时间上限。",
+                retryable=True,
+                http_status=503,
+            )
+
+    def inspect(
+        self,
+        reference: dict[str, Any],
+        *,
+        client_id: str | None,
+    ) -> dict[str, Any]:
+        with self.operation() as timeout:
+            if self._worker is None:
+                self._worker = _ObjectHeadWorkerSession(
+                    total_timeout=self.remaining_seconds
+                )
+            return self._worker.request(
+                reference,
+                client_id=client_id,
+                timeout=timeout,
+            )
+
+    def close(self) -> None:
+        if self._worker is not None:
+            self._worker.close()
+            self._worker = None
 
 
 @dataclass(frozen=True, repr=False)
@@ -597,43 +668,60 @@ def _validated_head_worker_response(raw: bytes) -> dict[str, Any]:
     )
 
 
-def _run_object_head_worker(
-    reference: dict[str, Any],
-    *,
-    client_id: str | None,
-    timeout: float,
-) -> dict[str, Any]:
-    timeout = max(0.1, timeout)
-    request = json.dumps(
-        {"client_id": client_id, "reference": reference},
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    slot = _HEAD_CALL_SLOTS
-    if not slot.acquire(blocking=False):
-        raise ObjectInputError(
-            "OBJECT_INPUT_HEAD_BUSY",
-            "对象存储预检并发槽暂时不可用。",
-            retryable=True,
-            http_status=503,
-        )
-    release_slot = True
-    process: subprocess.Popen[bytes] | None = None
-    deadline = time.monotonic() + timeout
-    try:
+def _object_head_timeout() -> ObjectInputError:
+    return ObjectInputError(
+        "OBJECT_INPUT_HEAD_TIMEOUT",
+        "对象存储预检超过时间上限。",
+        retryable=True,
+        http_status=503,
+    )
+
+
+class _ObjectHeadWorkerSession:
+    def __init__(self, *, total_timeout: float) -> None:
+        self.total_timeout = min(20.0, max(0.1, total_timeout))
+        self.deadline = 0.0
+        self.process: subprocess.Popen[bytes] | None = None
+        self.slot: threading.BoundedSemaphore | None = None
+        self.buffer = bytearray()
+        self.closed = False
+
+    def __enter__(self) -> _ObjectHeadWorkerSession:
+        return self
+
+    def __exit__(self, _exception_type, _exception, _traceback) -> None:
+        self.close()
+
+    def _start(self) -> None:
+        if self.process is not None:
+            return
+        if self.closed:
+            raise _object_head_unavailable("对象存储预检进程已经关闭。")
+        slot = _HEAD_CALL_SLOTS
+        if not slot.acquire(blocking=False):
+            raise ObjectInputError(
+                "OBJECT_INPUT_HEAD_BUSY",
+                "对象存储预检并发槽暂时不可用。",
+                retryable=True,
+                http_status=503,
+            )
+        self.slot = slot
+        self.deadline = time.monotonic() + self.total_timeout
         command = [
             sys.executable,
             str(_OBJECT_HEAD_WORKER),
             "--deadline-seconds",
-            str(timeout),
+            str(self.total_timeout),
             "--parent-pid",
             str(os.getpid()),
         ]
         try:
-            process = subprocess.Popen(
+            self.process = subprocess.Popen(
                 command,
                 cwd=str(_OBJECT_HEAD_WORKER.parents[1]),
-                env=_head_worker_environment(timeout),
+                env=_head_worker_environment(
+                    float(settings.ANALYSIS_OBJECT_HEAD_TIMEOUT_SECONDS)
+                ),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
@@ -641,43 +729,130 @@ def _run_object_head_worker(
                 start_new_session=True,
             )
         except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as error:
+            self.slot = None
+            slot.release()
             raise _object_head_unavailable(
                 "对象存储预检进程无法启动。"
             ) from error
+
+    def _response_line(self, deadline: float) -> bytes:
+        process = self.process
+        if process is None or process.stdout is None:
+            raise _object_head_unavailable("对象存储预检进程不可用。")
+        while True:
+            newline = self.buffer.find(b"\n")
+            if newline >= 0:
+                if newline > _MAX_OBJECT_HEAD_WORKER_RESPONSE_BYTES:
+                    raise _object_head_unavailable(
+                        "对象存储预检进程返回过多数据。"
+                    )
+                response = bytes(self.buffer[:newline])
+                del self.buffer[: newline + 1]
+                return response
+            if len(self.buffer) > _MAX_OBJECT_HEAD_WORKER_RESPONSE_BYTES:
+                raise _object_head_unavailable("对象存储预检进程返回过多数据。")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _object_head_timeout()
+            try:
+                readable, _, _ = select.select(
+                    [process.stdout.fileno()],
+                    [],
+                    [],
+                    remaining,
+                )
+            except OSError as error:
+                raise _object_head_unavailable(
+                    "对象存储预检进程通信失败。"
+                ) from error
+            if not readable:
+                raise _object_head_timeout()
+            try:
+                chunk = os.read(process.stdout.fileno(), 4096)
+            except OSError as error:
+                raise _object_head_unavailable(
+                    "对象存储预检进程通信失败。"
+                ) from error
+            if not chunk:
+                raise _object_head_unavailable("对象存储预检进程异常退出。")
+            self.buffer.extend(chunk)
+
+    def request(
+        self,
+        reference: dict[str, Any],
+        *,
+        client_id: str | None,
+        timeout: float,
+    ) -> dict[str, Any]:
+        self._start()
+        process = self.process
+        if process is None or process.stdin is None:
+            raise _object_head_unavailable("对象存储预检进程不可用。")
+        if process.poll() is not None:
+            raise _object_head_unavailable("对象存储预检进程异常退出。")
+        request = json.dumps(
+            {"client_id": client_id, "reference": reference},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        deadline = min(
+            self.deadline,
+            time.monotonic() + max(0.001, timeout),
+        )
         try:
-            stdout, _ = process.communicate(
-                input=request,
-                timeout=max(0.001, deadline - time.monotonic()),
-            )
-        except subprocess.TimeoutExpired as error:
-            raise ObjectInputError(
-                "OBJECT_INPUT_HEAD_TIMEOUT",
-                "对象存储预检超过时间上限。",
-                retryable=True,
-                http_status=503,
-            ) from error
-        except (OSError, subprocess.SubprocessError) as error:
+            process.stdin.write(request + b"\n")
+            process.stdin.flush()
+        except OSError as error:
             raise _object_head_unavailable(
                 "对象存储预检进程通信失败。"
             ) from error
-        if process.returncode != 0:
-            raise _object_head_unavailable("对象存储预检进程异常退出。")
-        return _validated_head_worker_response(stdout)
-    finally:
-        if process is not None:
-            if process.poll() is None and not _kill_head_worker(process):
-                reaper = threading.Thread(
-                    target=_reap_head_worker,
-                    args=(process, slot),
-                    name="object-input-head-reaper",
-                    daemon=True,
-                )
-                reaper.start()
-                release_slot = False
-            else:
-                _close_head_worker_streams(process)
-        if release_slot:
-            slot.release()
+        return _validated_head_worker_response(self._response_line(deadline))
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        process = self.process
+        slot = self.slot
+        self.process = None
+        self.slot = None
+        if process is None or slot is None:
+            return
+        if process.stdin is not None:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+        if process.poll() is None:
+            try:
+                process.wait(timeout=0.2)
+            except subprocess.TimeoutExpired:
+                pass
+        if process.poll() is None and not _kill_head_worker(process):
+            reaper = threading.Thread(
+                target=_reap_head_worker,
+                args=(process, slot),
+                name="object-input-head-reaper",
+                daemon=True,
+            )
+            reaper.start()
+            return
+        _close_head_worker_streams(process)
+        slot.release()
+
+
+def _run_object_head_worker(
+    reference: dict[str, Any],
+    *,
+    client_id: str | None,
+    timeout: float,
+) -> dict[str, Any]:
+    with _ObjectHeadWorkerSession(total_timeout=timeout) as worker:
+        return worker.request(
+            reference,
+            client_id=client_id,
+            timeout=timeout,
+        )
 
 
 def _normalized_etag(value: Any) -> str:
@@ -873,14 +1048,17 @@ def inspect_object_reference(
     input_name: str,
     semantic_type: str,
     client_id: str | None,
+    head_budget: ObjectHeadBudget | None = None,
 ) -> tuple[str, dict[str, Any], dict[str, Any]]:
     reference = _reference(value, input_name=input_name)
 
-    response = _run_object_head_worker(
-        reference,
-        client_id=client_id,
-        timeout=float(settings.ANALYSIS_OBJECT_HEAD_TIMEOUT_SECONDS),
-    )
+    if head_budget is None:
+        with ObjectHeadBudget(
+            total_seconds=float(settings.ANALYSIS_OBJECT_HEAD_TIMEOUT_SECONDS)
+        ) as owned_budget:
+            response = owned_budget.inspect(reference, client_id=client_id)
+    else:
+        response = head_budget.inspect(reference, client_id=client_id)
     observed_size = response.get("ContentLength")
     observed_etag = _normalized_etag(response.get("ETag"))
     observed_version = str(response.get("VersionId") or "").strip()

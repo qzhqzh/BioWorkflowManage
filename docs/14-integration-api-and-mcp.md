@@ -182,10 +182,14 @@ profile 文件不得提交到 Git；默认目录 `./secrets/object-storage` 已�
 前缀分别配置成两个全局白名单。HTTP endpoint
 默认拒绝，私网地址必须显式 `allow_private_network=true`，loopback/link-local/site-local/multicast/
 unspecified/reserved 地址始终拒绝；`allowed_cidrs` 可进一步收窄出口。应用会把每次请求固定到本次已审核的
-解析地址，拒绝跳转到其他 origin；HEAD 通过关闭继承 FD 的独立 Worker 进程执行，Worker 同时配置
+解析地址，拒绝跳转到其他 origin；同一请求的 HEAD 复用一个关闭继承 FD 的独立 Worker 进程，Worker 同时配置
 自身硬期限和 Linux parent-death signal，父进程超时后先回收 Worker 再释放并发槽。生产环境仍应在主机防火墙或
 容器网络策略中做第二层出口白名单。profile 只挂载给 backend 与 analysis-worker，不挂载给 miniwdl task 容器，凭据不会
 进入 `AnalysisRun.request_payload`、日志、API 响应或 Webhook。
+
+对象 HEAD 使用独立于受管 NAS 快照的请求预算：单对象上限由
+`ANALYSIS_OBJECT_HEAD_TIMEOUT_SECONDS` 控制，同一请求累计上限由
+`ANALYSIS_OBJECT_HEAD_REQUEST_TIMEOUT_SECONDS` 控制且最多 20 秒，为 Gunicorn 30 秒请求超时保留回收余量。
 
 对象输入使用稳定错误码：引用/profile 无效为 `OBJECT_INPUT_REFERENCE_INVALID` /
 `OBJECT_INPUT_PROFILE_INVALID`，bucket 或 endpoint 越权为 `OBJECT_INPUT_BUCKET_FORBIDDEN` /
