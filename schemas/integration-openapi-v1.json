@@ -66,7 +66,7 @@
         "summary": "预检固定分析产品或 WorkflowVersion 和受管输入，不创建运行",
         "x-required-scope": "analysis:submit",
         "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AnalysisPreflight"}}}},
-        "responses": {"200": {"description": "预检通过"}, "400": {"$ref": "#/components/responses/Error"}, "409": {"$ref": "#/components/responses/Error"}}
+        "responses": {"200": {"description": "预检通过"}, "400": {"$ref": "#/components/responses/Error"}, "404": {"$ref": "#/components/responses/Error"}, "409": {"$ref": "#/components/responses/Error"}}
       }
     },
     "/analysis-runs": {
@@ -83,7 +83,7 @@
         "x-required-scope": "analysis:submit",
         "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}, {"$ref": "#/components/parameters/RequestId"}],
         "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AnalysisSubmission"}}}},
-        "responses": {"201": {"description": "创建运行", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AnalysisRun"}}}}, "200": {"description": "幂等重放"}, "409": {"$ref": "#/components/responses/Error"}}
+        "responses": {"201": {"description": "创建运行", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AnalysisRun"}}}}, "200": {"description": "幂等重放"}, "400": {"$ref": "#/components/responses/Error"}, "404": {"$ref": "#/components/responses/Error"}, "409": {"$ref": "#/components/responses/Error"}}
       }
     },
     "/analysis-runs/by-external-ref": {
@@ -240,8 +240,7 @@
           "source_type": {"const": "workflow_version"},
           "version_id": {"type": "integer", "minimum": 1},
           "expected_source_digest": {"type": "string"}
-        },
-        "additionalProperties": false
+        }
       },
       "AnalysisProductRef": {
         "type": "object",

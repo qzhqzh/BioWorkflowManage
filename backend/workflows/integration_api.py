@@ -61,6 +61,7 @@ from .integration_outputs import (
     public_output_manifest,
 )
 from .models import (
+    AnalysisProduct,
     AnalysisProductVersion,
     AnalysisRun,
     AnalysisRunEvent,
@@ -447,6 +448,20 @@ def _validate_analysis_product_version_ready(
         )
     _validate_workflow_version_ready(item.workflow_version)
     return item
+
+
+def _lock_analysis_product_version_ready(
+    item: AnalysisProductVersion,
+) -> AnalysisProductVersion:
+    """Revalidate a product under the same row lock used by publication/deactivation."""
+    product = AnalysisProduct.objects.select_for_update().get(pk=item.product_id)
+    locked_item = (
+        AnalysisProductVersion.objects.select_for_update()
+        .select_related("workflow_version", "workflow_version__workflow")
+        .get(pk=item.pk)
+    )
+    locked_item.product = product
+    return _validate_analysis_product_version_ready(locked_item)
 
 
 def _fixed_analysis_product(value: Any) -> AnalysisProductVersion:
@@ -1456,8 +1471,13 @@ def _catalog_resources(
     return {"manifests": manifests, "checks": checks}
 
 
-def _workflow_output_contract(version: WorkflowVersion) -> list[dict[str, Any]]:
+def _workflow_output_contract(
+    version: WorkflowVersion,
+    *,
+    interface_contract: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     workflow_name = str(version.workflow_graph.get("id") or version.workflow.slug)
+    contract = interface_contract or version.interface_contract
     return [
         {
             "key": f"{workflow_name}.{item['name']}",
@@ -1467,16 +1487,26 @@ def _workflow_output_contract(version: WorkflowVersion) -> list[dict[str, Any]]:
             "wdl_type": item.get("wdl_type") or "String",
             "required": bool(item.get("required", False)),
         }
-        for item in version.interface_contract.get("outputs", [])
+        for item in contract.get("outputs", [])
     ]
 
 
 def _preflight_workflow(body: dict[str, Any]) -> dict[str, Any]:
     version, product_version = _analysis_source(body)
     workflow_name = str(version.workflow_graph.get("id") or version.workflow.slug)
+    interface_contract = (
+        product_version.interface_contract
+        if product_version is not None
+        else version.interface_contract
+    )
+    input_contract = (
+        interface_contract.get("inputs", [])
+        if product_version is not None
+        else _workflow_interface(version)
+    )
     snapshot_budget = ResourceSnapshotBudget()
     input_values, manifests, content_checks = _prepare_contract_inputs(
-        _workflow_interface(version),
+        input_contract,
         body.get("inputs") or {},
         workflow_name=workflow_name,
         snapshot_budget=snapshot_budget,
@@ -1511,7 +1541,10 @@ def _preflight_workflow(body: dict[str, Any]) -> dict[str, Any]:
         "workflow": _workflow_version_payload(version),
         "input_values": input_values,
         "manifests": manifests,
-        "output_contract": _workflow_output_contract(version),
+        "output_contract": _workflow_output_contract(
+            version,
+            interface_contract=interface_contract,
+        ),
         "checks": [
             {"check": "workflow_snapshot", "ready": True},
             *content_checks,
@@ -1778,15 +1811,28 @@ def integration_analysis_product_version_detail(
     analysis_code: str,
     contract_version: str,
 ):
-    item = get_object_or_404(
+    item = (
         AnalysisProductVersion.objects.select_related(
             "product",
             "workflow_version",
             "workflow_version__workflow",
-        ),
-        product__code=analysis_code,
-        contract_version=contract_version,
+        )
+        .filter(
+            product__code=analysis_code,
+            contract_version=contract_version,
+        )
+        .first()
     )
+    if item is None:
+        return _error_response(
+            request,
+            IntegrationAPIError(
+                "ANALYSIS_PRODUCT_VERSION_NOT_FOUND",
+                "分析产品或 contract_version 不存在。",
+                category="workflow",
+                http_status=status.HTTP_404_NOT_FOUND,
+            ),
+        )
     return Response(_analysis_product_version_payload(item))
 
 
@@ -1939,6 +1985,10 @@ def integration_analysis_runs(request):
             }
         try:
             with transaction.atomic():
+                if product_version is not None:
+                    product_version = _lock_analysis_product_version_ready(
+                        product_version
+                    )
                 run = AnalysisRun.objects.create(
                     run_kind=AnalysisRun.Kind.WORKFLOW,
                     workflow_version=version,
@@ -2156,10 +2206,15 @@ def integration_analysis_run_retry(request, run_id):
         )
         try:
             with transaction.atomic():
+                product_version = original.analysis_product_version
+                if product_version is not None:
+                    product_version = _lock_analysis_product_version_ready(
+                        product_version
+                    )
                 run = AnalysisRun.objects.create(
                     run_kind=original.run_kind,
                     workflow_version=original.workflow_version,
-                    analysis_product_version=original.analysis_product_version,
+                    analysis_product_version=product_version,
                     tool_version=original.tool_version,
                     service_account=account,
                     external_run_id=external["external_run_id"],

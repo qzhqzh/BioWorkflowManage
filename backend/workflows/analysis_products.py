@@ -26,6 +26,47 @@ class AnalysisProductError(ValueError):
         self.code = code
 
 
+def _contract_port_names(value: Any, *, label: str) -> list[str]:
+    if not isinstance(value, list):
+        raise AnalysisProductError(
+            "ANALYSIS_PRODUCT_CONTRACT_INVALID",
+            f"WorkflowVersion {label} 必须是数组。",
+        )
+    names: list[str] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise AnalysisProductError(
+                "ANALYSIS_PRODUCT_CONTRACT_INVALID",
+                f"WorkflowVersion {label}[{index}] 必须是 object。",
+            )
+        name = str(item.get("name") or "").strip()
+        wdl_type = str(item.get("wdl_type") or "").strip()
+        semantic_type = str(item.get("semantic_type") or "").strip()
+        if not name or not wdl_type or not semantic_type:
+            raise AnalysisProductError(
+                "ANALYSIS_PRODUCT_CONTRACT_INVALID",
+                f"WorkflowVersion {label}[{index}] 缺少 name、wdl_type 或 semantic_type。",
+            )
+        if name in names:
+            raise AnalysisProductError(
+                "ANALYSIS_PRODUCT_CONTRACT_INVALID",
+                f"WorkflowVersion {label} 包含重复端口名称：{name}。",
+            )
+        names.append(name)
+    return names
+
+
+def _graph_port_names(workflow_version: WorkflowVersion, *, node_type: str) -> list[str]:
+    nodes = workflow_version.workflow_graph.get("nodes")
+    if not isinstance(nodes, list):
+        return []
+    return [
+        str(node.get("id") or "").strip()
+        for node in nodes
+        if isinstance(node, dict) and node.get("type") == node_type
+    ]
+
+
 def normalize_contract_version(value: Any) -> str:
     contract_version = str(value or "").strip()
     if not CONTRACT_VERSION_PATTERN.fullmatch(contract_version):
@@ -63,23 +104,38 @@ def snapshot_workflow_contract(
         )
     inputs = interface_contract.get("inputs")
     outputs = interface_contract.get("outputs")
-    if not isinstance(inputs, list) or not isinstance(outputs, list) or not outputs:
+    if not isinstance(outputs, list) or not outputs:
         raise AnalysisProductError(
             "ANALYSIS_PRODUCT_CONTRACT_INVALID",
             "WorkflowVersion 必须声明输入与语义化输出契约。",
         )
+    input_names = _contract_port_names(inputs, label="inputs")
+    output_names = _contract_port_names(outputs, label="outputs")
     invalid_outputs = [
-        str(item.get("name") or "<invalid>") if isinstance(item, dict) else "<invalid>"
+        str(item["name"])
         for item in outputs
-        if not isinstance(item, dict)
-        or not str(item.get("semantic_type") or "").strip()
-        or item.get("semantic_type") == "core.output.unknown"
+        if item.get("semantic_type") == "core.output.unknown"
     ]
     if invalid_outputs:
         raise AnalysisProductError(
             "ANALYSIS_PRODUCT_CONTRACT_INVALID",
             "WorkflowVersion 输出缺少 semantic_type："
             + ", ".join(invalid_outputs),
+        )
+    graph_input_names = _graph_port_names(
+        workflow_version,
+        node_type="workflow_input",
+    )
+    graph_output_names = _graph_port_names(
+        workflow_version,
+        node_type="workflow_output",
+    )
+    if set(input_names) != set(graph_input_names) or set(output_names) != set(
+        graph_output_names
+    ):
+        raise AnalysisProductError(
+            "ANALYSIS_PRODUCT_CONTRACT_INVALID",
+            "WorkflowVersion 接口契约端口与 Workflow Graph 不一致。",
         )
 
     snapshot = copy.deepcopy(interface_contract)

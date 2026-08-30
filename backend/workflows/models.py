@@ -30,6 +30,29 @@ class ImmutableSnapshot(models.Model):
         raise ValidationError(f"{type(self).__name__} snapshots cannot be deleted.")
 
 
+class AnalysisProductQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        if "code" in kwargs:
+            raise ValidationError("AnalysisProduct code is immutable.")
+        return super().update(**kwargs)
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        if "code" in fields:
+            raise ValidationError("AnalysisProduct code is immutable.")
+        return super().bulk_update(objs, fields, batch_size=batch_size)
+
+
+class AnalysisProductVersionQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        raise ValidationError("AnalysisProductVersion snapshots cannot be updated.")
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        raise ValidationError("AnalysisProductVersion snapshots cannot be updated.")
+
+    def delete(self):
+        raise ValidationError("AnalysisProductVersion snapshots cannot be deleted.")
+
+
 class WorkflowDocument(models.Model):
     class Kind(models.TextChoices):
         WORKFLOW = "workflow", "Workflow"
@@ -338,6 +361,8 @@ class AnalysisProduct(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    objects = AnalysisProductQuerySet.as_manager()
+
     class Meta:
         ordering = ["code"]
 
@@ -370,6 +395,8 @@ class AnalysisProductVersion(ImmutableSnapshot):
     contract_digest = models.CharField(max_length=80)
     created_by = models.CharField(max_length=256, default="deployment")
     created_at = models.DateTimeField(auto_now_add=True)
+
+    objects = AnalysisProductVersionQuerySet.as_manager()
 
     class Meta:
         ordering = ["product_id", "contract_version"]
