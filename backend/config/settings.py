@@ -346,6 +346,42 @@ ANALYSIS_OBJECT_STAGE_CHUNK_BYTES = min(
         int(os.environ.get("ANALYSIS_OBJECT_STAGE_CHUNK_BYTES", "8388608")),
     ),
 )
+ANALYSIS_OBJECT_STAGE_RETENTION_DAYS = max(
+    0,
+    int(os.environ.get("ANALYSIS_OBJECT_STAGE_RETENTION_DAYS", "30")),
+)
+ANALYSIS_OBJECT_STAGE_GC_HIGH_WATER_PERCENT = min(
+    100,
+    max(
+        1,
+        int(
+            os.environ.get(
+                "ANALYSIS_OBJECT_STAGE_GC_HIGH_WATER_PERCENT",
+                "85",
+            )
+        ),
+    ),
+)
+ANALYSIS_OBJECT_STAGE_GC_LOW_WATER_PERCENT = min(
+    ANALYSIS_OBJECT_STAGE_GC_HIGH_WATER_PERCENT - 1,
+    max(
+        0,
+        int(
+            os.environ.get(
+                "ANALYSIS_OBJECT_STAGE_GC_LOW_WATER_PERCENT",
+                "75",
+            )
+        ),
+    ),
+)
+ANALYSIS_OBJECT_STAGE_GC_MAX_FILES = max(
+    1,
+    int(os.environ.get("ANALYSIS_OBJECT_STAGE_GC_MAX_FILES", "1000")),
+)
+ANALYSIS_OBJECT_STAGE_GC_SCAN_MAX_FILES = max(
+    ANALYSIS_OBJECT_STAGE_GC_MAX_FILES,
+    int(os.environ.get("ANALYSIS_OBJECT_STAGE_GC_SCAN_MAX_FILES", "1000000")),
+)
 ANALYSIS_ARTIFACT_EXPORT_ROOT = Path(
     os.environ.get(
         "ANALYSIS_ARTIFACT_EXPORT_ROOT",

@@ -1,29 +1,42 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import signal
 import threading
 import time
 import uuid
+from datetime import timedelta
+from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import boto3
 import pytest
 from botocore.awsrequest import AWSHTTPConnection
-from django.db import close_old_connections, connection
+from django.core.management import call_command
+from django.db import close_old_connections, connection, transaction
+from django.utils import timezone
 
+from workflows import object_input_gc
 from workflows.analysis_runtime import process_analysis_run
 from workflows.models import (
     AnalysisRun,
     InputStagingCoordinator,
+    InputStagingLease,
     WorkflowDocument,
     WorkflowVersion,
+)
+from workflows.object_input_gc import (
+    ObjectInputCacheGCError,
+    garbage_collect_object_input_cache,
 )
 from workflows.object_inputs import (
     _inspect_object_reference_metadata,
     _run_object_head_worker,
+    lock_input_staging_coordinator_for_manifest,
     object_manifest_items,
     _pinned_connection_class,
     _reference,
@@ -81,6 +94,41 @@ def _profile(**values) -> ObjectStorageProfile:
     }
     defaults.update(values)
     return ObjectStorageProfile(**defaults)
+
+
+def _cached_object(
+    staging_root: Path,
+    *,
+    digest_character: str,
+    content: bytes = b"cached-object",
+    age_days: int = 60,
+) -> tuple[dict, Path]:
+    digest_value = digest_character * 64
+    relative_path = f"sha256/{digest_value[:2]}/{digest_value}.fastq.gz"
+    target = staging_root / relative_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
+    target.chmod(0o444)
+    modified_at = timezone.now() - timedelta(days=age_days)
+    os.utime(target, (modified_at.timestamp(), modified_at.timestamp()))
+    item = {
+        "reference_type": "s3_object",
+        "input": f"read-{digest_character}",
+        "semantic_type": "core.file.unknown",
+        "authorized_client_id": "okb",
+        "input_sequence": 0,
+        "kind": "file",
+        "profile": "test",
+        "bucket": "inputs",
+        "key": "incoming/read.fastq.gz",
+        "version_id": f"version-{digest_character}",
+        "etag": f"etag-{digest_character}",
+        "size": len(content),
+        "sha256": f"sha256:{digest_value}",
+        "verification": "head+conditional-get+sha256",
+        "staging_relative_path": relative_path,
+    }
+    return {"schema_version": 2, "files": [], "objects": [item]}, target
 
 
 def _head_worker_script(tmp_path: Path, payload: dict | None) -> Path:
@@ -576,3 +624,329 @@ def test_staging_claim_cleans_only_inactive_lease_temp_directory(settings, tmp_p
     assert lease is not None
     assert reason == ""
     assert not stale_directory.exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_object_cache_gc_protects_runs_and_leases_and_is_idempotent(
+    settings,
+    tmp_path,
+):
+    staging = tmp_path / "staging"
+    settings.ANALYSIS_INPUT_STAGING_ROOT = staging
+    settings.ANALYSIS_OBJECT_STAGE_RETENTION_DAYS = 30
+    settings.ANALYSIS_OBJECT_STAGE_GC_MAX_FILES = 100
+    settings.ANALYSIS_OBJECT_STAGE_GC_SCAN_MAX_FILES = 100
+    InputStagingCoordinator.objects.get_or_create(pk=1)
+    now = timezone.now()
+
+    active_manifest, active_target = _cached_object(
+        staging,
+        digest_character="a",
+    )
+    expired_manifest, expired_target = _cached_object(
+        staging,
+        digest_character="b",
+    )
+    leased_manifest, leased_target = _cached_object(
+        staging,
+        digest_character="c",
+    )
+    recent_manifest, recent_target = _cached_object(
+        staging,
+        digest_character="d",
+    )
+    _, fresh_target = _cached_object(
+        staging,
+        digest_character="e",
+        age_days=1,
+    )
+
+    active_run = _run("gc-active")
+    AnalysisRun.objects.filter(pk=active_run.pk).update(
+        request_payload={"input_resource_manifest": active_manifest},
+    )
+    expired_run = _run("gc-expired")
+    AnalysisRun.objects.filter(pk=expired_run.pk).update(
+        status=AnalysisRun.Status.SUCCEEDED,
+        request_payload={"input_resource_manifest": expired_manifest},
+        updated_at=now - timedelta(days=60),
+    )
+    leased_run = _run("gc-leased")
+    AnalysisRun.objects.filter(pk=leased_run.pk).update(
+        status=AnalysisRun.Status.SUCCEEDED,
+        request_payload={"input_resource_manifest": leased_manifest},
+        updated_at=now - timedelta(days=60),
+    )
+    lease = InputStagingLease.objects.create(
+        run=leased_run,
+        worker_lease_token=leased_run.lease_token,
+        reserved_bytes=leased_target.stat().st_size,
+        expires_at=now + timedelta(hours=1),
+    )
+    recent_run = _run("gc-recent")
+    AnalysisRun.objects.filter(pk=recent_run.pk).update(
+        status=AnalysisRun.Status.SUCCEEDED,
+        request_payload={"input_resource_manifest": recent_manifest},
+    )
+    lease_directory = staging / ".leases" / str(lease.id)
+    lease_directory.mkdir(parents=True)
+    (lease_directory / "active.part").write_bytes(b"active")
+
+    planned = garbage_collect_object_input_cache(
+        all_eligible=True,
+        actor="pytest",
+    )
+
+    assert planned["mode"] == "dry_run"
+    assert planned["selected_files"] == 1
+    assert planned["candidates"][0]["relative_path"] == str(
+        expired_target.relative_to(staging)
+    )
+    assert planned["skipped_reasons"] == {
+        "active_lease": 1,
+        "active_run": 1,
+        "recent_terminal_run": 1,
+        "retention_period_active": 1,
+    }
+    assert all(
+        target.exists()
+        for target in (
+            active_target,
+            expired_target,
+            leased_target,
+            recent_target,
+            fresh_target,
+        )
+    )
+
+    applied = garbage_collect_object_input_cache(
+        apply=True,
+        all_eligible=True,
+        actor="pytest",
+    )
+
+    assert applied["deleted_files"] == 1
+    assert applied["released_bytes"] == len(b"cached-object")
+    assert applied["empty_directories_removed"] == 1
+    assert not expired_target.exists()
+    assert not expired_target.parent.exists()
+    assert active_target.exists()
+    assert leased_target.exists()
+    assert recent_target.exists()
+    assert fresh_target.exists()
+    assert (lease_directory / "active.part").read_bytes() == b"active"
+
+    repeated = garbage_collect_object_input_cache(
+        apply=True,
+        all_eligible=True,
+        actor="pytest",
+    )
+    assert repeated["deleted_files"] == 0
+    assert repeated["released_bytes"] == 0
+
+
+@pytest.mark.django_db(transaction=True)
+def test_object_cache_cleanup_command_is_dry_run_by_default(settings, tmp_path):
+    staging = tmp_path / "staging"
+    settings.ANALYSIS_INPUT_STAGING_ROOT = staging
+    settings.ANALYSIS_OBJECT_STAGE_RETENTION_DAYS = 30
+    InputStagingCoordinator.objects.get_or_create(pk=1)
+    _, target = _cached_object(staging, digest_character="a")
+    output = StringIO()
+
+    call_command(
+        "cleanup_object_input_cache",
+        "--all-eligible",
+        "--actor",
+        "pytest",
+        stdout=output,
+    )
+
+    rendered = output.getvalue()
+    assert "DRY_RUN no object input cache files were deleted" in rendered
+    assert '"selected_files": 1' in rendered
+    assert '"mode": "dry_run"' in rendered
+    assert target.exists()
+
+
+@pytest.mark.parametrize(
+    ("unsafe_kind", "expected_code"),
+    [
+        ("unknown", "OBJECT_INPUT_CACHE_GC_UNKNOWN_NODE"),
+        ("symlink", "OBJECT_INPUT_CACHE_GC_PATH_UNSAFE"),
+    ],
+)
+@pytest.mark.django_db(transaction=True)
+def test_object_cache_gc_fails_closed_on_unknown_or_symlink_nodes(
+    settings,
+    tmp_path,
+    unsafe_kind,
+    expected_code,
+):
+    staging = tmp_path / "staging"
+    settings.ANALYSIS_INPUT_STAGING_ROOT = staging
+    settings.ANALYSIS_OBJECT_STAGE_RETENTION_DAYS = 30
+    InputStagingCoordinator.objects.get_or_create(pk=1)
+    _, safe_target = _cached_object(staging, digest_character="a")
+    if unsafe_kind == "unknown":
+        (staging / "unexpected").write_text("unknown", encoding="utf-8")
+    else:
+        unsafe_bucket = staging / "sha256" / "ff"
+        unsafe_bucket.mkdir()
+        (unsafe_bucket / f"{'f' * 64}.fastq.gz").symlink_to(safe_target)
+
+    with pytest.raises(ObjectInputCacheGCError) as caught:
+        garbage_collect_object_input_cache(
+            apply=True,
+            all_eligible=True,
+            actor="pytest",
+        )
+
+    assert caught.value.code == expected_code
+    assert safe_target.exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_object_cache_gc_uses_high_and_low_watermarks(settings, tmp_path):
+    staging = tmp_path / "staging"
+    settings.ANALYSIS_INPUT_STAGING_ROOT = staging
+    settings.ANALYSIS_OBJECT_STAGE_RETENTION_DAYS = 30
+    settings.ANALYSIS_OBJECT_STAGE_GC_HIGH_WATER_PERCENT = 80
+    settings.ANALYSIS_OBJECT_STAGE_GC_LOW_WATER_PERCENT = 70
+    InputStagingCoordinator.objects.get_or_create(pk=1)
+    _cached_object(staging, digest_character="a", content=b"a" * 120)
+    _cached_object(staging, digest_character="b", content=b"b" * 120)
+
+    below_high = SimpleNamespace(total=1000, used=799, free=201)
+    with patch("workflows.object_input_gc._disk_usage", return_value=below_high):
+        skipped = garbage_collect_object_input_cache(actor="pytest")
+
+    assert skipped["watermark_triggered"] is False
+    assert skipped["selected_files"] == 0
+    assert skipped["skipped_reasons"] == {"below_high_water": 2}
+
+    above_high = SimpleNamespace(total=1000, used=900, free=100)
+    with patch("workflows.object_input_gc._disk_usage", return_value=above_high):
+        planned = garbage_collect_object_input_cache(actor="pytest")
+
+    assert planned["watermark_triggered"] is True
+    assert planned["selected_files"] == 2
+    assert planned["selected_bytes"] == 240
+    assert planned["projected_used_bytes"] == 660
+    assert planned["low_water_reached"] is True
+
+
+@pytest.mark.django_db(transaction=True)
+def test_object_cache_gc_rejects_file_changes_between_scan_and_apply(
+    settings,
+    tmp_path,
+):
+    staging = tmp_path / "staging"
+    settings.ANALYSIS_INPUT_STAGING_ROOT = staging
+    settings.ANALYSIS_OBJECT_STAGE_RETENTION_DAYS = 30
+    InputStagingCoordinator.objects.get_or_create(pk=1)
+    _, target = _cached_object(staging, digest_character="a")
+    original_validate = object_input_gc._validate_scan_snapshot
+
+    def mutate_then_validate(*args, **kwargs):
+        target.chmod(0o644)
+        target.write_bytes(b"changed-after-scan")
+        target.chmod(0o444)
+        return original_validate(*args, **kwargs)
+
+    with (
+        patch(
+            "workflows.object_input_gc._validate_scan_snapshot",
+            side_effect=mutate_then_validate,
+        ),
+        pytest.raises(ObjectInputCacheGCError) as caught,
+    ):
+        garbage_collect_object_input_cache(
+            apply=True,
+            all_eligible=True,
+            actor="pytest",
+        )
+
+    assert caught.value.code == "OBJECT_INPUT_CACHE_GC_RACE"
+    assert target.read_bytes() == b"changed-after-scan"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_postgresql_cache_gc_waits_for_object_backed_run_creation(
+    settings,
+    tmp_path,
+):
+    if connection.vendor != "postgresql":
+        pytest.skip("PostgreSQL row locking is required for this concurrency test")
+    staging = tmp_path / "staging"
+    settings.ANALYSIS_INPUT_STAGING_ROOT = staging
+    settings.ANALYSIS_OBJECT_STAGE_RETENTION_DAYS = 30
+    InputStagingCoordinator.objects.get_or_create(pk=1)
+    manifest, target = _cached_object(staging, digest_character="a")
+    source_run = _run("gc-run-creation-source")
+    created_uncommitted = threading.Event()
+    allow_commit = threading.Event()
+    creation_results: queue.Queue[tuple[str, object]] = queue.Queue()
+    gc_results: queue.Queue[tuple[str, object]] = queue.Queue()
+
+    def create_object_backed_run():
+        close_old_connections()
+        try:
+            with transaction.atomic():
+                version = WorkflowVersion.objects.get(pk=source_run.workflow_version_id)
+                lock_input_staging_coordinator_for_manifest(manifest)
+                run = AnalysisRun.objects.create(
+                    workflow_version=version,
+                    workflow_name="gc-concurrent-run",
+                    sample_id="gc-concurrent-run",
+                    status=AnalysisRun.Status.QUEUED,
+                    request_payload={"input_resource_manifest": manifest},
+                )
+                created_uncommitted.set()
+                if not allow_commit.wait(timeout=10):
+                    raise AssertionError("timed out waiting to commit run")
+            creation_results.put(("ok", run.pk))
+        except BaseException as error:
+            creation_results.put(("error", error))
+        finally:
+            connection.close()
+
+    def collect_cache():
+        close_old_connections()
+        try:
+            result = garbage_collect_object_input_cache(
+                apply=True,
+                all_eligible=True,
+                actor="pytest",
+            )
+            gc_results.put(("ok", result))
+        except BaseException as error:
+            gc_results.put(("error", error))
+        finally:
+            connection.close()
+
+    creator = threading.Thread(target=create_object_backed_run)
+    collector = threading.Thread(target=collect_cache)
+    creator.start()
+    try:
+        assert created_uncommitted.wait(timeout=5)
+        collector.start()
+        time.sleep(0.2)
+        assert collector.is_alive()
+        assert gc_results.empty()
+        assert target.exists()
+    finally:
+        allow_commit.set()
+        creator.join(timeout=10)
+        if collector.ident is not None:
+            collector.join(timeout=10)
+
+    assert not creator.is_alive()
+    assert not collector.is_alive()
+    creation_status, creation_value = creation_results.get_nowait()
+    gc_status, gc_value = gc_results.get_nowait()
+    assert creation_status == "ok", creation_value
+    assert gc_status == "ok", gc_value
+    assert gc_value["deleted_files"] == 0
+    assert gc_value["skipped_reasons"]["active_run"] == 1
+    assert target.exists()

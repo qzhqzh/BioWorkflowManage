@@ -713,10 +713,36 @@ singleton row 串行分配，Worker 崩溃后 lease 到期自动回收。`ANALYS
 profile 还应把 `ANALYSIS_INPUT_STAGING_EXECUTION_ROOT` 设置为同一个宿主绝对路径。
 单任务字节上限按不同远端对象身份的实际下载量计算；磁盘预留则按尚未命中的不同内容寻址路径计算，
 相同声明摘要不能把多次远端传输折叠出配额。
-内容寻址文件是持久缓存，当前版本不会自动回收；安全 retention/GC 由 #32 跟踪。在该能力合并前，
-部署方必须监控 staging 使用量。需要人工回收时，先确认没有 `queued/preparing/running/cancel_requested`
-任务并停止所有 analysis worker，只清点和处理 `sha256/` 内容树，保留 `.leases/` 交给 lease
-回收逻辑；不得删除 staging 根目录或 Docker volume。下次执行会从远端重新验证并重建缺失内容。
+内容寻址文件由 `cleanup_object_input_cache` 安全回收。命令默认只输出候选和汇总指标，不删除文件；
+只有显式传入 `--apply` 才会执行。默认策略要求文件超过 `ANALYSIS_OBJECT_STAGE_RETENTION_DAYS`
+且暂存文件系统使用率达到 high watermark，再按最旧优先回收到 low watermark；单批删除数受
+`ANALYSIS_OBJECT_STAGE_GC_MAX_FILES` 限制。`--all-eligible` 只绕过容量水位，不绕过保留期与引用保护，
+用于计划内排空或容量恢复。建议由部署方的定时任务先运行 dry-run 并采集 `SUMMARY` JSON，确认候选、
+跳过原因和预计释放字节后再执行 apply：
+
+```bash
+# 默认 dry-run；即使达到水位也不会删除
+docker compose --profile maintenance run --rm object-input-cache-gc
+
+# 按 high/low watermark 正式回收
+docker compose --profile maintenance run --rm object-input-cache-gc \
+  python backend/manage.py cleanup_object_input_cache --apply --actor scheduled-gc
+
+# 计划内排空所有已超过保留期且未受保护的内容
+docker compose --profile maintenance run --rm object-input-cache-gc \
+  python backend/manage.py cleanup_object_input_cache --apply --all-eligible \
+  --actor capacity-recovery
+```
+
+GC 与对象任务创建、暂存槽分配共用 PostgreSQL coordinator 行锁。状态为 `queued`、`preparing`、
+`running` 或 `cancel_requested` 的任务、保留期内终态任务及未过期 staging lease 引用的路径始终受保护。
+扫描和删除使用 dirfd、`O_NOFOLLOW` 与文件身份复核；发现符号链接、未知节点、跨设备、可写/多硬链接
+文件或并发变化时非零退出。失败后先检查输出中的稳定错误码和 `path`，修复异常节点或等待活动写入结束，
+重新执行 dry-run，再 apply；命令幂等，允许从已完成的部分继续。GC 只处理 `sha256/` 内容树及其中
+的空摘要目录，不遍历或删除 `.leases/`，也不删除 staging 根目录、Docker volume 或远端对象。
+容量仍未降到 low watermark 时，先检查 `limit_reached`、仍在保留期/活动引用的跳过项及同文件系统上的
+其他占用；不要通过缩短保留期来删除仍受保护的输入。已回收内容会在下次执行时重新完成远端条件校验、
+SHA-256 校验并按需重建。
 每个暂存 lease 使用独立的 `.leases/<lease-id>` 临时目录；过期 lease 的孤儿普通文件会在下一次
 分配槽位时按数据库活动 lease 白名单清理。内容寻址文件每次执行仍会对对应对象身份做条件 GET
 并完整计算 SHA-256，缓存命中不能绕过对象删除、撤权或“对象身份→摘要”的真实性校验；FASTQ/

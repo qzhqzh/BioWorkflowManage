@@ -1266,6 +1266,17 @@ def object_manifest_items(manifest: Any) -> list[dict[str, Any]]:
     return items
 
 
+def lock_input_staging_coordinator_for_manifest(manifest: Any) -> bool:
+    """Serialize creation of object-backed active runs with staging and GC."""
+
+    if not object_manifest_items(manifest):
+        return False
+    if not transaction.get_connection().in_atomic_block:
+        raise RuntimeError("input staging coordinator lock requires a transaction")
+    InputStagingCoordinator.objects.select_for_update().get(pk=1)
+    return True
+
+
 @contextmanager
 def _hard_timeout(seconds: float) -> Iterator[None]:
     if (
