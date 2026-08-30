@@ -407,7 +407,9 @@ constant-time HMAC 比较，再检查 timestamp（建议 ±300 秒），持久�
 dispatcher 对网络错误和非 2xx 响应执行至少一次投递。间隔按
 `WEBHOOK_BACKOFF_BASE_SECONDS * 2^(attempt-1)` 指数增长，并受
 `WEBHOOK_BACKOFF_MAX_SECONDS` 限制；达到 `WEBHOOK_MAX_ATTEMPTS` 后进入 `dead_letter`。
-worker 租约过期会以同一个 delivery ID 重试，因此接收方必须去重。
+`WEBHOOK_DELIVERY_TIMEOUT_SECONDS` 是覆盖 DNS、连接、TLS、响应 header 和有限响应 body 的
+单次 wall-clock 总时限，不是可被慢速滴流持续续期的 idle timeout。worker 租约过期会以同一个
+delivery ID 重试，因此接收方必须去重。
 
 ```bash
 # 查看 pending/delivering/delivered/dead_letter 数量、到期数和最老 pending 年龄
@@ -422,13 +424,15 @@ docker compose exec backend python backend/manage.py replay_webhook_delivery \
   --delivery-id <uuid> --actor operator@example.com
 ```
 
-每次 attempt 固化时间、解析后的目标 IP、HTTP 状态、有限响应摘要和稳定错误码。重放只把
-delivery 重新排队，不清空历史 attempt，不修改分析运行。原有轮询、事件增量和结果接口始终可用。
+每次 attempt 固化开始/结束时间、HTTP 状态、有限响应摘要和稳定错误码；目标一旦解析成功，
+签名 timestamp 与固定 IP 会在发送前落库，因此发送后进程崩溃也保留审计证据。DNS 在解析前
+失败的 attempt 对应字段为空。重放只把 delivery 重新排队，不清空历史 attempt，不修改分析运行。
+原有轮询、事件增量和结果接口始终可用。
 
 ### 6.4 SSRF 与网络边界
 
 - 默认只允许 HTTPS，不跟随 3xx redirect；
-- 注册和每次投递都解析全部 A/AAAA，任一地址为私网、环回、link-local、组播或保留地址即失败；
+- 注册和每次投递都解析全部 A/AAAA，任一地址为私网、环回、link-local、site-local、组播或保留地址即失败；
 - 连接使用本次已验证的 IP，同时以原 hostname 做 Host/SNI 和证书校验，关闭 DNS 重绑定窗口；
 - 私有化部署确需内网目标时，只能在 `WEBHOOK_PRIVATE_HOST_ALLOWLIST` 精确列出 hostname/IP；
 - 仅本地受控测试才在 `WEBHOOK_ALLOWED_HTTP_HOSTS` 精确允许 HTTP hostname；该白名单不自动放行私网地址。

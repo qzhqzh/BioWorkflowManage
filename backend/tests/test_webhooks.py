@@ -5,17 +5,20 @@ import hashlib
 import hmac
 import json
 import socket
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from io import StringIO
 from pathlib import Path
+from threading import Event, Lock
 from unittest.mock import patch
 
 import pytest
 from django.core.exceptions import ValidationError
 from django.core.management import call_command
 from django.core.management.base import CommandError
-from django.db import transaction
+from django.db import close_old_connections, connection, transaction
 from django.utils import timezone
 from rest_framework.test import APIClient
 from jsonschema import Draft202012Validator
@@ -40,6 +43,7 @@ from workflows.webhooks import (
     WebhookError,
     WebhookHTTPResult,
     WebhookTarget,
+    _finish_delivery,
     canonical_webhook_body,
     claim_next_delivery,
     deliver_webhook,
@@ -252,8 +256,9 @@ def test_delivery_uses_stable_ids_hmac_and_pinned_address(settings):
     )
     captured = {}
 
-    def send(request_target, *, body, headers):
+    def send(request_target, *, body, headers, timeout_seconds=None):
         captured.update(target=request_target, body=body, headers=headers)
+        assert timeout_seconds is not None
         return WebhookHTTPResult(status_code=204, response_excerpt="ok")
 
     with (
@@ -433,6 +438,122 @@ def test_expired_dispatcher_lease_is_retried_with_same_delivery_id(settings):
 
 
 @pytest.mark.django_db
+def test_request_metadata_survives_crash_and_lease_recovery(settings):
+    _settings(settings)
+    account = _account()
+    _endpoint(account)
+    _terminal_event(_run(account))
+    delivery = claim_next_delivery()
+    assert delivery is not None
+    target = WebhookTarget(
+        scheme="https",
+        hostname="hooks.example.test",
+        port=443,
+        request_target="/analysis-events",
+        address="93.184.216.34",
+    )
+
+    with (
+        patch("workflows.webhooks.resolve_webhook_target", return_value=target),
+        patch(
+            "workflows.webhooks._send_webhook_request",
+            return_value=WebhookHTTPResult(204, "accepted"),
+        ) as send,
+        patch(
+            "workflows.webhooks._finish_delivery",
+            side_effect=SystemExit("dispatcher crashed after send"),
+        ),
+        pytest.raises(SystemExit, match="dispatcher crashed"),
+    ):
+        deliver_webhook(delivery)
+    send.assert_called_once()
+
+    attempt = WebhookDeliveryAttempt.objects.get(
+        delivery=delivery,
+        attempt_number=1,
+    )
+    assert attempt.request_timestamp is not None
+    assert attempt.resolved_address == target.address
+    assert attempt.outcome == WebhookDeliveryAttempt.Outcome.STARTED
+
+    WebhookDelivery.objects.filter(pk=delivery.pk).update(
+        lease_expires_at=timezone.now() - timedelta(seconds=1)
+    )
+    recovered = claim_next_delivery()
+    assert recovered is not None
+    assert recovered.id == delivery.id
+    attempt.refresh_from_db()
+    assert attempt.outcome == WebhookDeliveryAttempt.Outcome.LEASE_EXPIRED
+    assert attempt.request_timestamp is not None
+    assert attempt.resolved_address == target.address
+
+
+@pytest.mark.django_db
+def test_total_deadline_covers_dns_and_slow_response(settings):
+    _settings(settings)
+    settings.WEBHOOK_DELIVERY_TIMEOUT_SECONDS = 0.05
+    account = _account()
+    _endpoint(account)
+    _terminal_event(_run(account))
+    _terminal_event(_run(account))
+
+    dns_delivery = claim_next_delivery()
+    assert dns_delivery is not None
+
+    def stalled_dns(*args, **kwargs):
+        time.sleep(1)
+        raise AssertionError("hard deadline did not interrupt DNS")
+
+    started = time.monotonic()
+    with patch(
+        "workflows.webhooks.socket.getaddrinfo",
+        side_effect=stalled_dns,
+    ):
+        assert deliver_webhook(dns_delivery) is True
+    assert time.monotonic() - started < 0.5
+    dns_delivery.refresh_from_db()
+    assert dns_delivery.state == WebhookDelivery.State.PENDING
+    assert dns_delivery.last_error_code == "WEBHOOK_DELIVERY_TIMEOUT"
+    dns_attempt = dns_delivery.attempts.get()
+    assert dns_attempt.request_timestamp is None
+    assert dns_attempt.resolved_address is None
+
+    response_delivery = claim_next_delivery()
+    assert response_delivery is not None
+    target = WebhookTarget(
+        scheme="https",
+        hostname="hooks.example.test",
+        port=443,
+        request_target="/analysis-events",
+        address="93.184.216.34",
+    )
+
+    def slow_response(*args, **kwargs):
+        while True:
+            time.sleep(0.01)
+
+    started = time.monotonic()
+    with (
+        patch("workflows.webhooks.resolve_webhook_target", return_value=target),
+        patch(
+            "workflows.webhooks._send_webhook_request",
+            side_effect=slow_response,
+        ),
+    ):
+        assert deliver_webhook(response_delivery) is True
+    assert time.monotonic() - started < 0.5
+    response_delivery.refresh_from_db()
+    assert response_delivery.state == WebhookDelivery.State.PENDING
+    assert response_delivery.last_error_code == "WEBHOOK_DELIVERY_TIMEOUT"
+    response_attempt = response_delivery.attempts.get()
+    assert response_attempt.request_timestamp is not None
+    assert response_attempt.resolved_address == target.address
+
+    _terminal_event(_run(account))
+    assert claim_next_delivery() is not None
+
+
+@pytest.mark.django_db
 def test_terminal_cancel_and_stale_worker_paths_enqueue_outbox(settings):
     _settings(settings)
     account = _account()
@@ -525,6 +646,13 @@ def test_target_validation_blocks_ssrf_and_allows_explicit_private_hosts(
         with pytest.raises(WebhookError, match="私网"):
             resolve_webhook_target("https://multicast.example.test/hook")
 
+    site_local_record = [
+        (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("fec0::1", 443, 0, 0))
+    ]
+    with patch("workflows.webhooks.socket.getaddrinfo", return_value=site_local_record):
+        with pytest.raises(WebhookError, match="site-local"):
+            resolve_webhook_target("https://site-local.example.test/hook")
+
     with pytest.raises(WebhookError, match="端口"):
         resolve_webhook_target("https://example.test:0/hook")
 
@@ -601,3 +729,88 @@ def test_dispatcher_rejects_invalid_signing_key_before_claiming_delivery(setting
     delivery = WebhookDelivery.objects.get()
     assert delivery.state == WebhookDelivery.State.PENDING
     assert delivery.attempt_count == 0
+
+
+@pytest.mark.django_db(transaction=True)
+def test_postgresql_delivery_claim_and_lease_fencing(settings):
+    if connection.vendor != "postgresql":
+        pytest.skip("PostgreSQL concurrency coverage runs in its dedicated CI job")
+    _settings(settings)
+    account = _account()
+    _endpoint(account)
+    _terminal_event(_run(account))
+    first_holds_lock = Event()
+    release_first = Event()
+    create_lock = Lock()
+    first_create = True
+    original_create = WebhookDeliveryAttempt.objects.create
+
+    def block_first_attempt_create(*args, **kwargs):
+        nonlocal first_create
+        with create_lock:
+            should_block = first_create
+            first_create = False
+        if should_block:
+            first_holds_lock.set()
+            assert release_first.wait(5), "timed out waiting to release first claimant"
+        return original_create(*args, **kwargs)
+
+    def claim_on_independent_connection():
+        close_old_connections()
+        try:
+            delivery = claim_next_delivery()
+            if delivery is None:
+                return None
+            return delivery.id, delivery.lease_token
+        finally:
+            close_old_connections()
+
+    with (
+        patch.object(
+            WebhookDeliveryAttempt.objects,
+            "create",
+            side_effect=block_first_attempt_create,
+        ),
+        ThreadPoolExecutor(max_workers=2) as executor,
+    ):
+        first_future = executor.submit(claim_on_independent_connection)
+        assert first_holds_lock.wait(5), "first claimant did not acquire the row lock"
+        second_future = executor.submit(claim_on_independent_connection)
+        try:
+            second_result = second_future.result(timeout=5)
+        finally:
+            release_first.set()
+        first_result = first_future.result(timeout=5)
+
+    assert first_result is not None
+    assert second_result is None
+    delivery_id, old_lease_token = first_result
+    stale_delivery = WebhookDelivery.objects.select_related("event").get(
+        pk=delivery_id
+    )
+    assert stale_delivery.lease_token == old_lease_token
+    WebhookDelivery.objects.filter(pk=delivery_id).update(
+        lease_expires_at=timezone.now() - timedelta(seconds=1)
+    )
+
+    recovered = claim_next_delivery()
+
+    assert recovered is not None
+    assert recovered.id == delivery_id
+    assert recovered.lease_token != old_lease_token
+    assert (
+        _finish_delivery(
+            stale_delivery,
+            timestamp=int(timezone.now().timestamp()),
+            resolved_address="93.184.216.34",
+            status_code=204,
+            response_excerpt="",
+            error_code="",
+            error="",
+        )
+        is False
+    )
+    recovered.refresh_from_db()
+    assert recovered.state == WebhookDelivery.State.DELIVERING
+    assert recovered.lease_token != old_lease_token
+    assert recovered.attempt_count == 2

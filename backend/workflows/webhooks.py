@@ -7,9 +7,14 @@ import hmac
 import http.client
 import ipaddress
 import json
+import math
+import signal
 import socket
 import ssl
+import threading
+import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
@@ -56,6 +61,52 @@ class WebhookTarget:
 class WebhookHTTPResult:
     status_code: int
     response_excerpt: str
+
+
+def webhook_delivery_deadline_supported() -> bool:
+    return hasattr(signal, "setitimer") and threading.current_thread() is (
+        threading.main_thread()
+    )
+
+
+@contextmanager
+def _webhook_wall_clock_timeout(seconds: float):
+    if not webhook_delivery_deadline_supported():
+        raise WebhookError(
+            "WEBHOOK_DELIVERY_DEADLINE_UNSUPPORTED",
+            "Webhook dispatcher 必须在支持 POSIX wall-clock timer 的主线程运行。",
+        )
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    if previous_timer[0] > 0 or previous_timer[1] > 0:
+        raise WebhookError(
+            "WEBHOOK_DELIVERY_TIMER_CONFLICT",
+            "Webhook dispatcher 检测到已有 wall-clock timer，拒绝覆盖。",
+        )
+    previous_handler = signal.getsignal(signal.SIGALRM)
+
+    def deadline_exceeded(_signum, _frame):
+        raise WebhookError(
+            "WEBHOOK_DELIVERY_TIMEOUT",
+            "Webhook DNS 或网络请求超过总时限。",
+        )
+
+    signal.signal(signal.SIGALRM, deadline_exceeded)
+    signal.setitimer(signal.ITIMER_REAL, max(0.001, float(seconds)))
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
+def _remaining_delivery_seconds(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise WebhookError(
+            "WEBHOOK_DELIVERY_TIMEOUT",
+            "Webhook DNS 或网络请求超过总时限。",
+        )
+    return remaining
 
 
 def _setting_hosts(name: str) -> set[str]:
@@ -283,13 +334,17 @@ def resolve_webhook_target(url: str) -> WebhookTarget:
                 "Webhook hostname 解析出无效地址。",
             ) from error
         if (
-            (not parsed_address.is_global or parsed_address.is_multicast)
+            (
+                not parsed_address.is_global
+                or parsed_address.is_multicast
+                or parsed_address.is_site_local
+            )
             and hostname not in private_allowlist
             and address.casefold() not in private_allowlist
         ):
             raise WebhookError(
                 "WEBHOOK_TARGET_PRIVATE_ADDRESS",
-                "Webhook 目标解析到私网、环回、组播或保留地址。",
+                "Webhook 目标解析到私网、环回、site-local、组播或保留地址。",
             )
     return WebhookTarget(
         scheme=scheme,
@@ -344,8 +399,16 @@ def _send_webhook_request(
     *,
     body: bytes,
     headers: dict[str, str],
+    timeout_seconds: float | None = None,
 ) -> WebhookHTTPResult:
-    timeout = max(0.1, float(settings.WEBHOOK_DELIVERY_TIMEOUT_SECONDS))
+    timeout = max(
+        0.001,
+        float(
+            settings.WEBHOOK_DELIVERY_TIMEOUT_SECONDS
+            if timeout_seconds is None
+            else timeout_seconds
+        ),
+    )
     connection: http.client.HTTPConnection
     if target.scheme == "https":
         connection = _PinnedHTTPSConnection(target, timeout=timeout)
@@ -565,7 +628,7 @@ def claim_next_delivery() -> WebhookDelivery | None:
             seconds=max(
                 5,
                 int(settings.WEBHOOK_DELIVERY_LEASE_SECONDS),
-                int(float(settings.WEBHOOK_DELIVERY_TIMEOUT_SECONDS)) + 5,
+                math.ceil(float(settings.WEBHOOK_DELIVERY_TIMEOUT_SECONDS)) + 5,
             )
         )
         delivery.save(
@@ -585,10 +648,38 @@ def claim_next_delivery() -> WebhookDelivery | None:
         return delivery
 
 
-def _finish_delivery(
+def _record_attempt_request(
     delivery: WebhookDelivery,
     *,
     timestamp: int,
+    resolved_address: str,
+) -> bool:
+    with transaction.atomic():
+        current = (
+            WebhookDelivery.objects.select_for_update(of=("self",))
+            .filter(
+                pk=delivery.pk,
+                state=WebhookDelivery.State.DELIVERING,
+                lease_token=delivery.lease_token,
+            )
+            .first()
+        )
+        if current is None:
+            return False
+        attempt = WebhookDeliveryAttempt.objects.select_for_update().get(
+            delivery=current,
+            attempt_number=current.attempt_count,
+        )
+        attempt.request_timestamp = timestamp
+        attempt.resolved_address = resolved_address
+        attempt.save(update_fields=["request_timestamp", "resolved_address"])
+        return True
+
+
+def _finish_delivery(
+    delivery: WebhookDelivery,
+    *,
+    timestamp: int | None,
     resolved_address: str | None,
     status_code: int | None,
     response_excerpt: str,
@@ -651,15 +742,34 @@ def _finish_delivery(
 
 def deliver_webhook(delivery: WebhookDelivery) -> bool:
     body = canonical_webhook_body(delivery.event.payload)
-    timestamp = int(timezone.now().timestamp())
+    timestamp = None
     target = None
     result = None
     error_code = ""
     error = ""
+    timeout = max(0.001, float(settings.WEBHOOK_DELIVERY_TIMEOUT_SECONDS))
+    deadline = time.monotonic() + timeout
     try:
+        with _webhook_wall_clock_timeout(
+            _remaining_delivery_seconds(deadline)
+        ):
+            target = resolve_webhook_target(delivery.target_url)
+        timestamp = int(timezone.now().timestamp())
         headers = webhook_headers(delivery, body=body, timestamp=timestamp)
-        target = resolve_webhook_target(delivery.target_url)
-        result = _send_webhook_request(target, body=body, headers=headers)
+        if not _record_attempt_request(
+            delivery,
+            timestamp=timestamp,
+            resolved_address=target.address,
+        ):
+            return False
+        remaining = _remaining_delivery_seconds(deadline)
+        with _webhook_wall_clock_timeout(remaining):
+            result = _send_webhook_request(
+                target,
+                body=body,
+                headers=headers,
+                timeout_seconds=remaining,
+            )
         if not 200 <= result.status_code < 300:
             error_code = "WEBHOOK_HTTP_STATUS"
             error = f"Webhook endpoint 返回 HTTP {result.status_code}。"

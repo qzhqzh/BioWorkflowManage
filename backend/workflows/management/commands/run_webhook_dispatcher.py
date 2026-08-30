@@ -6,7 +6,11 @@ from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 from django.db import close_old_connections
 
-from workflows.webhooks import claim_next_delivery, deliver_webhook
+from workflows.webhooks import (
+    claim_next_delivery,
+    deliver_webhook,
+    webhook_delivery_deadline_supported,
+)
 
 
 class Command(BaseCommand):
@@ -28,6 +32,10 @@ class Command(BaseCommand):
         signing_key = str(settings.WEBHOOK_SIGNING_KEY or "").encode("utf-8")
         if len(signing_key) < 32:
             raise CommandError("WEBHOOK_SIGNING_KEY 至少需要 32 个 UTF-8 字节。")
+        if not webhook_delivery_deadline_supported():
+            raise CommandError(
+                "webhook-dispatcher 必须在支持 POSIX wall-clock timer 的主线程运行。"
+            )
         once = bool(options["once"])
         interval = max(0.2, float(options["poll_interval"]))
         self.stdout.write("webhook-dispatcher started")
