@@ -53,15 +53,20 @@ class Command(BaseCommand):
             return
 
         processed = 0
+        processed_run_ids = set()
         released = 0
         failures = 0
         while processed < limit:
             try:
-                retention = claim_next_output_cleanup(run_id=run_id)
+                retention = claim_next_output_cleanup(
+                    run_id=run_id,
+                    exclude_run_ids=processed_run_ids,
+                )
             except ArtifactExportError as error:
                 raise CommandError(f"{error.code}: {error}") from error
             if retention is None:
                 break
+            processed_run_ids.add(retention.run_id)
             finalized, item_released, error = clean_analysis_output(
                 retention,
                 actor=str(options["actor"] or "deployment"),

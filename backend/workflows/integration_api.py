@@ -179,6 +179,7 @@ def _visible_runs(request):
         "workflow_version__workflow",
         "tool_version",
         "retry_of",
+        "output_retention",
     ).filter(service_account__isnull=False)
     account = _service_account(request)
     return queryset.filter(service_account=account) if account else queryset
@@ -1838,6 +1839,20 @@ def _public_value(value: Any) -> Any:
     return value
 
 
+def _integration_output_status(run: AnalysisRun) -> str:
+    retention = getattr(run, "output_retention", None)
+    if retention is not None and (
+        retention.state
+        in {
+            AnalysisOutputRetention.State.CLEANING,
+            AnalysisOutputRetention.State.CLEANED,
+        }
+        or retention.quarantined_at is not None
+    ):
+        return AnalysisRun.OutputStatus.UNAVAILABLE
+    return run.output_status
+
+
 def integration_run_payload(
     run: AnalysisRun,
     *,
@@ -1873,6 +1888,7 @@ def integration_run_payload(
         }
     if attempt is None:
         attempt = int(run.request_payload.get("attempt") or 1)
+    output_status = _integration_output_status(run)
     return {
         "id": str(run.id),
         "external_ref": {
@@ -1890,14 +1906,21 @@ def integration_run_payload(
         "status": run.status,
         "status_version": run.status_version,
         "execution_status": run.status,
-        "output_status": run.output_status,
+        "output_status": output_status,
         "progress": run.progress,
         "current_step": run.current_step,
         "attempt": attempt,
         "retry_of": str(run.retry_of_id) if run.retry_of_id else None,
         "actor": run.actor,
         "error": error,
-        "outputs": public_output_manifest(run) if include_outputs else [],
+        "outputs": (
+            public_output_manifest(
+                run,
+                output_available=output_status != AnalysisRun.OutputStatus.UNAVAILABLE,
+            )
+            if include_outputs
+            else []
+        ),
         "timing": _run_timing_payload(
             run,
             include_task_timing=include_task_timing,
@@ -2443,13 +2466,17 @@ def integration_analysis_run_retry(request, run_id):
 @permission_classes([IntegrationScopePermission])
 def integration_analysis_run_outputs(request, run_id):
     run = get_object_or_404(_visible_runs(request), pk=run_id)
+    output_status = _integration_output_status(run)
     return Response(
         {
             "run_id": str(run.id),
             "execution_status": run.status,
-            "output_status": run.output_status,
+            "output_status": output_status,
             "error": _integration_error(run),
-            "results": public_output_manifest(run),
+            "results": public_output_manifest(
+                run,
+                output_available=output_status != AnalysisRun.OutputStatus.UNAVAILABLE,
+            ),
         }
     )
 
@@ -2604,15 +2631,32 @@ def integration_analysis_run_output_download(request, run_id):
     retention = getattr(run, "output_retention", None)
     if (
         retention is not None
-        and retention.state == AnalysisOutputRetention.State.CLEANED
+        and (
+            retention.state == AnalysisOutputRetention.State.CLEANED
+            or retention.quarantined_at is not None
+        )
     ):
         return _error_response(
             request,
             IntegrationAPIError(
                 "ANALYSIS_OUTPUT_CLEANED",
-                "本地分析输出已按显式保留策略清理；请使用已确认的 Artifact Export。",
+                "本地分析输出已进入清理隔离或完成清理；请使用已确认的 Artifact Export。",
                 category="resource",
                 http_status=status.HTTP_410_GONE,
+            ),
+        )
+    if (
+        retention is not None
+        and retention.state == AnalysisOutputRetention.State.CLEANING
+    ):
+        return _error_response(
+            request,
+            IntegrationAPIError(
+                "ANALYSIS_OUTPUT_CLEANUP_IN_PROGRESS",
+                "本地分析输出正在进入显式清理流程，请稍后查询最终状态。",
+                category="resource",
+                retryable=True,
+                http_status=status.HTTP_409_CONFLICT,
             ),
         )
     key = str(request.query_params.get("key") or "")

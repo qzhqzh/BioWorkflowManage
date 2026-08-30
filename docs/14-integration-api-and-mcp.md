@@ -490,8 +490,10 @@ docker compose --profile maintenance run --rm artifact-cleaner \
   --apply --actor operator@example.com
 ```
 
-清理成功只把 `output_status` 置为 `unavailable`，保留清单、export、回执和审计；下载稳定返回
-`410 ANALYSIS_OUTPUT_CLEANED`。不指定 `--run-id` 的批量执行还必须同时显式提供
+清理领取后 API 对外把 `output_status` 视为 `unavailable`，避免隔离期间继续公开失效下载链接；
+若在隔离前失败则恢复为 `complete`，隔离后失败仍保持 `unavailable`。清理保留清单、export、回执和审计；
+隔离完成后下载稳定返回 `410 ANALYSIS_OUTPUT_CLEANED`，隔离前的短暂清理窗口返回
+`409 ANALYSIS_OUTPUT_CLEANUP_IN_PROGRESS`。不指定 `--run-id` 的批量执行还必须同时显式提供
 `--apply --all-eligible`；任一清理失败时命令非零退出。命令不删除 Docker volume，也不自动删除
 交付目标中的副本。
 

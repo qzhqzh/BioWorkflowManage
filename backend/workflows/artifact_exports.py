@@ -23,7 +23,7 @@ from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError, HTTPClientError
 from django.conf import settings
 from django.db import IntegrityError, transaction
-from django.db.models import Count, Min
+from django.db.models import Count, Exists, Min, OuterRef, Q
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
@@ -656,6 +656,16 @@ def _retention_blockers(
     run = retention.run
     if run.status not in TERMINAL_RUN_STATES:
         blockers.append("run_not_terminal")
+    if (
+        retention.state
+        in {
+            AnalysisOutputRetention.State.PROTECTED,
+            AnalysisOutputRetention.State.FAILED,
+        }
+        and retention.quarantined_at is None
+        and run.output_status != AnalysisRun.OutputStatus.COMPLETE
+    ):
+        blockers.append("local_output_unavailable")
     exports = list(retention.artifact_exports.all())
     if not exports:
         blockers.append("no_artifact_export")
@@ -2155,6 +2165,7 @@ def _claim_expired_output_cleanup(
     now,
     *,
     run_id: uuid.UUID | None = None,
+    exclude_run_ids: set[uuid.UUID] | None = None,
 ) -> AnalysisOutputRetention | None:
     queryset = (
         AnalysisOutputRetention.objects.select_for_update(
@@ -2172,6 +2183,8 @@ def _claim_expired_output_cleanup(
     )
     if run_id is not None:
         queryset = queryset.filter(run_id=run_id)
+    if exclude_run_ids:
+        queryset = queryset.exclude(run_id__in=exclude_run_ids)
     retention = queryset.first()
     if retention is None:
         return None
@@ -2189,6 +2202,7 @@ def _claim_expired_output_cleanup(
 def claim_next_output_cleanup(
     *,
     run_id: uuid.UUID | str | None = None,
+    exclude_run_ids: set[uuid.UUID] | None = None,
 ) -> AnalysisOutputRetention | None:
     normalized = None
     if run_id is not None:
@@ -2201,43 +2215,68 @@ def claim_next_output_cleanup(
             ) from error
     with transaction.atomic():
         now = timezone.now()
-        expired = _claim_expired_output_cleanup(now, run_id=normalized)
+        expired = _claim_expired_output_cleanup(
+            now,
+            run_id=normalized,
+            exclude_run_ids=exclude_run_ids,
+        )
         if expired is not None:
             return expired
+        exports = ArtifactExport.objects.filter(retention_id=OuterRef("pk"))
         queryset = (
             AnalysisOutputRetention.objects.select_for_update(
                 skip_locked=True,
                 of=("self",),
             )
             .select_related("run")
-            .prefetch_related("artifact_exports")
+            .annotate(
+                has_artifact_export=Exists(exports),
+                has_incomplete_export=Exists(
+                    exports.exclude(state=ArtifactExport.State.SUCCEEDED)
+                ),
+                has_unacknowledged_export=Exists(
+                    exports.filter(
+                        requires_ack=True,
+                        acknowledged_at__isnull=True,
+                    )
+                ),
+            )
             .filter(
                 state__in={
                     AnalysisOutputRetention.State.PROTECTED,
                     AnalysisOutputRetention.State.FAILED,
                 },
                 retain_until__lte=now,
+                run__status__in=TERMINAL_RUN_STATES,
+                has_artifact_export=True,
+                has_incomplete_export=False,
+                has_unacknowledged_export=False,
+            )
+            .filter(
+                Q(quarantined_at__isnull=False)
+                | Q(run__output_status=AnalysisRun.OutputStatus.COMPLETE)
             )
             .order_by("retain_until", "created_at")
         )
         if normalized is not None:
             queryset = queryset.filter(run_id=normalized)
-        for retention in queryset[:50]:
-            if _retention_blockers(retention, now=now):
-                continue
-            retention.state = AnalysisOutputRetention.State.CLEANING
-            retention.cleanup_attempt_count += 1
-            retention.cleanup_token = uuid.uuid4()
-            if retention.cleanup_path_token is None:
-                retention.cleanup_path_token = uuid.uuid4()
-            retention.cleanup_expires_at = now + timedelta(
-                seconds=int(settings.ANALYSIS_ARTIFACT_CLEANUP_LEASE_SECONDS)
-            )
-            retention.last_error_code = ""
-            retention.last_error = ""
-            retention.save()
-            return retention
-        return None
+        if exclude_run_ids:
+            queryset = queryset.exclude(run_id__in=exclude_run_ids)
+        retention = queryset.first()
+        if retention is None or _retention_blockers(retention, now=now):
+            return None
+        retention.state = AnalysisOutputRetention.State.CLEANING
+        retention.cleanup_attempt_count += 1
+        retention.cleanup_token = uuid.uuid4()
+        if retention.cleanup_path_token is None:
+            retention.cleanup_path_token = uuid.uuid4()
+        retention.cleanup_expires_at = now + timedelta(
+            seconds=int(settings.ANALYSIS_ARTIFACT_CLEANUP_LEASE_SECONDS)
+        )
+        retention.last_error_code = ""
+        retention.last_error = ""
+        retention.save()
+        return retention
 
 
 def _mapped_run_directory(run: AnalysisRun) -> tuple[Path, str]:
@@ -2642,9 +2681,11 @@ def _finish_output_cleanup(
     actor: str,
 ) -> bool:
     with transaction.atomic():
+        locked_run = AnalysisRun.objects.select_for_update(of=("self",)).get(
+            pk=retention.run_id
+        )
         current = (
             AnalysisOutputRetention.objects.select_for_update(of=("self",))
-            .select_related("run")
             .filter(
                 pk=retention.pk,
                 state=AnalysisOutputRetention.State.CLEANING,
@@ -2654,14 +2695,13 @@ def _finish_output_cleanup(
         )
         if current is None:
             return False
+        current.run = locked_run
         now = timezone.now()
         if error is None:
             current.state = AnalysisOutputRetention.State.CLEANED
             current.cleaned_at = now
             current.last_error_code = ""
             current.last_error = ""
-            current.run.output_status = AnalysisRun.OutputStatus.UNAVAILABLE
-            current.run.save(update_fields=["output_status", "updated_at"])
             level = "info"
             message = "已按显式保留策略清理本地 AnalysisRun 输出。"
             details = {
@@ -2678,6 +2718,12 @@ def _finish_output_cleanup(
                 "error_code": error.code,
                 "actor": actor[:256],
             }
+        current.run.output_status = (
+            AnalysisRun.OutputStatus.UNAVAILABLE
+            if error is None or current.quarantined_at is not None
+            else AnalysisRun.OutputStatus.COMPLETE
+        )
+        current.run.save(update_fields=["output_status", "updated_at"])
         current.cleanup_token = None
         current.cleanup_expires_at = None
         current.save()

@@ -34,10 +34,11 @@ from workflows.artifact_exports import (
     deliver_artifact_export,
     output_cleanup_candidates,
 )
-from workflows.integration_outputs import build_output_manifest
+from workflows.integration_outputs import backfill_output_manifest, build_output_manifest
 from workflows.integration_tokens import issue_service_token
 from workflows.object_inputs import ObjectInputError
 from workflows.models import (
+    AnalysisOutputRetention,
     AnalysisRun,
     ArtifactExport,
     ArtifactExportAttempt,
@@ -610,6 +611,26 @@ def test_cleanup_is_dry_run_by_default_and_requires_ack_and_retention(
     )
     retention = claim_next_output_cleanup(run_id=run.id)
     assert retention is not None
+    run.refresh_from_db()
+    assert run.output_status == AnalysisRun.OutputStatus.COMPLETE
+    in_progress_outputs = client.get(
+        f"/api/v1/integration/analysis-runs/{run.id}/outputs"
+    )
+    assert in_progress_outputs.status_code == 200
+    assert (
+        in_progress_outputs.data["output_status"]
+        == AnalysisRun.OutputStatus.UNAVAILABLE
+    )
+    assert "download_url" not in in_progress_outputs.data["results"][0]
+    in_progress_download = client.get(
+        f"/api/v1/integration/analysis-runs/{run.id}/outputs/download",
+        {"key": "ExportTask.file1"},
+    )
+    assert in_progress_download.status_code == 409
+    assert (
+        in_progress_download.data["error"]["code"]
+        == "ANALYSIS_OUTPUT_CLEANUP_IN_PROGRESS"
+    )
     finalized, released, error = clean_analysis_output(retention, actor="pytest")
     assert finalized is True
     assert error is None
@@ -925,7 +946,68 @@ def test_cleanup_preflight_refuses_special_nodes_before_quarantine(
     assert retention.state == retention.State.FAILED
     assert retention.quarantined_at is None
     assert Path(run.work_directory).is_dir()
+    run.refresh_from_db()
+    assert run.output_status == AnalysisRun.OutputStatus.COMPLETE
     fifo.unlink()
+
+
+@pytest.mark.django_db
+def test_cleanup_failure_after_quarantine_keeps_output_unavailable(
+    artifact_workspace,
+):
+    runs, _, profiles = artifact_workspace
+    account, client = _account()
+    _write_managed_profile(profiles, account)
+    run, _ = _run_with_outputs(account, runs)
+    export, _ = create_artifact_export(
+        run=run,
+        account=account,
+        idempotency_key="cleanup-quarantined-failure",
+        profile_name="customer-results",
+        requires_ack=False,
+        retain_until=None,
+        actor="pytest",
+    )
+    claimed_export = claim_next_artifact_export()
+    assert claimed_export is not None
+    assert deliver_artifact_export(claimed_export) is True
+    export.refresh_from_db()
+    export.retention.retain_until = timezone.now() - timedelta(seconds=1)
+    export.retention.save(update_fields=["retain_until", "updated_at"])
+    retention = claim_next_output_cleanup(run_id=run.id)
+    assert retention is not None
+
+    with patch.object(
+        artifact_exports_module,
+        "_delete_tree_at",
+        side_effect=ArtifactExportError(
+            "ANALYSIS_OUTPUT_CLEANUP_FAILED",
+            "simulated delete failure",
+            retryable=True,
+        ),
+    ):
+        finalized, _, error = clean_analysis_output(retention, actor="pytest")
+
+    assert finalized is True
+    assert error is not None
+    retention.refresh_from_db()
+    run.refresh_from_db()
+    assert retention.state == AnalysisOutputRetention.State.FAILED
+    assert retention.quarantined_at is not None
+    assert run.output_status == AnalysisRun.OutputStatus.UNAVAILABLE
+    assert backfill_output_manifest(run, source="pytest") is False
+    run.refresh_from_db()
+    assert run.output_status == AnalysisRun.OutputStatus.UNAVAILABLE
+    assert not Path(run.work_directory).exists()
+    listed = client.get(f"/api/v1/integration/analysis-runs/{run.id}/outputs")
+    assert listed.status_code == 200
+    assert "download_url" not in listed.data["results"][0]
+    download = client.get(
+        f"/api/v1/integration/analysis-runs/{run.id}/outputs/download",
+        {"key": "ExportTask.file1"},
+    )
+    assert download.status_code == 410
+    assert download.data["error"]["code"] == "ANALYSIS_OUTPUT_CLEANED"
 
 
 @pytest.mark.django_db
@@ -967,6 +1049,116 @@ def test_missing_output_tree_is_never_misreported_as_cleaned(
     assert retention.quarantined_at is None
     assert retention.cleaned_at is None
     assert run.output_status == AnalysisRun.OutputStatus.COMPLETE
+
+
+@pytest.mark.django_db
+def test_cleanup_claim_skips_more_than_fifty_blocked_retention_rows(
+    artifact_workspace,
+):
+    runs, _, profiles = artifact_workspace
+    account, _ = _account()
+    _write_managed_profile(profiles, account)
+    eligible_run, _ = _run_with_outputs(account, runs)
+    export, _ = create_artifact_export(
+        run=eligible_run,
+        account=account,
+        idempotency_key="cleanup-after-blocked-runs",
+        profile_name="customer-results",
+        requires_ack=False,
+        retain_until=None,
+        actor="pytest",
+    )
+    claimed_export = claim_next_artifact_export()
+    assert claimed_export is not None
+    assert deliver_artifact_export(claimed_export) is True
+    export.refresh_from_db()
+    export.retention.retain_until = timezone.now() - timedelta(days=1)
+    export.retention.save(update_fields=["retain_until", "updated_at"])
+
+    blocked_runs = AnalysisRun.objects.bulk_create(
+        [
+            AnalysisRun(
+                run_kind=AnalysisRun.Kind.TOOL_TEST,
+                tool_version=eligible_run.tool_version,
+                service_account=account,
+                external_run_id=f"blocked-cleanup-{index}",
+                workflow_name="BlockedCleanup",
+                sample_id=f"blocked-{index}",
+                status=AnalysisRun.Status.SUCCEEDED,
+                finished_at=timezone.now(),
+            )
+            for index in range(55)
+        ]
+    )
+    AnalysisOutputRetention.objects.bulk_create(
+        [
+            AnalysisOutputRetention(
+                run=blocked_run,
+                retain_until=timezone.now() - timedelta(days=2),
+                created_by="pytest",
+            )
+            for blocked_run in blocked_runs
+        ]
+    )
+
+    claimed_retention = claim_next_output_cleanup()
+
+    assert claimed_retention is not None
+    assert claimed_retention.run_id == eligible_run.id
+
+
+@pytest.mark.django_db
+def test_batch_cleanup_attempts_each_run_once_and_continues_after_failure(
+    artifact_workspace,
+):
+    runs, _, profiles = artifact_workspace
+    account, _ = _account()
+    _write_managed_profile(profiles, account)
+    missing_run, _ = _run_with_outputs(account, runs)
+    valid_run, _ = _run_with_outputs(account, runs)
+    exports = []
+    for index, run in enumerate((missing_run, valid_run), start=1):
+        export, _ = create_artifact_export(
+            run=run,
+            account=account,
+            idempotency_key=f"cleanup-batch-{index}",
+            profile_name="customer-results",
+            requires_ack=False,
+            retain_until=None,
+            actor="pytest",
+        )
+        exports.append(export)
+    for _ in exports:
+        claimed_export = claim_next_artifact_export()
+        assert claimed_export is not None
+        assert deliver_artifact_export(claimed_export) is True
+    for index, export in enumerate(exports, start=1):
+        export.refresh_from_db()
+        export.retention.retain_until = timezone.now() - timedelta(days=3 - index)
+        export.retention.save(update_fields=["retain_until", "updated_at"])
+    shutil.rmtree(missing_run.work_directory)
+
+    stdout = StringIO()
+    stderr = StringIO()
+    with pytest.raises(CommandError, match="1"):
+        call_command(
+            "cleanup_analysis_outputs",
+            "--apply",
+            "--all-eligible",
+            "--limit",
+            "10",
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+    missing_retention = AnalysisOutputRetention.objects.get(run=missing_run)
+    valid_retention = AnalysisOutputRetention.objects.get(run=valid_run)
+    assert missing_retention.state == AnalysisOutputRetention.State.FAILED
+    assert missing_retention.cleanup_attempt_count == 1
+    assert valid_retention.state == AnalysisOutputRetention.State.CLEANED
+    assert stderr.getvalue().count("FAILED run_id=") == 1
+    assert "SUMMARY processed=2 failures=1" in stdout.getvalue()
+    assert not Path(valid_run.work_directory).exists()
 
 
 @pytest.mark.django_db(transaction=True)
