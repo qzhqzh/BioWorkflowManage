@@ -94,9 +94,11 @@ chmod 0640 ./secrets/object-storage/*.json
 按 Service Account 绑定 bucket/key prefix 的 `client_grants`；不要把凭据写入 `.env`、
 任务 JSON 或 WDL。按实际部署验证 endpoint/CIDR 防火墙后，再用一个固定 VersionId/ETag、size 和
 SHA-256 的小对象完成 preflight 与真实运行。
-在 #32 的自动 retention/GC 合并前，还必须为 input staging 配置磁盘监控与人工排空窗口；
-只可在停止所有 analysis worker 且确认没有排队/活跃任务后处理 `sha256/` 持久缓存，保留
-`.leases/` 并且不得删除 Docker volume。
+为 input staging 配置磁盘监控，并将 `maintenance` profile 的 `object-input-cache-gc` 接入部署侧
+定时任务。先运行默认 dry-run 并采集 `SUMMARY` 指标；确认 high/low watermark、保留期、候选与
+跳过原因符合预期后，再使用同一服务覆盖命令并显式传入 `--apply`。GC 会通过 PostgreSQL 行锁与
+任务创建/暂存协调，无需停止 analysis worker；它不会删除 `.leases/`、staging 根目录或 Docker
+volume。具体命令、容量恢复和失败处理见 [`14-integration-api-and-mcp.md`](14-integration-api-and-mcp.md)。
 
 启用 Artifact Export 前创建目标与 profile 目录，并确保 Exporter UID 对目标目录可写：
 
@@ -130,6 +132,7 @@ docker compose ps
 docker compose exec backend python backend/manage.py showmigrations workflows
 docker compose exec backend python backend/manage.py webhook_delivery_stats
 docker compose exec backend python backend/manage.py artifact_export_stats
+docker compose --profile maintenance run --rm object-input-cache-gc
 curl -fsS http://127.0.0.1:${APP_PORT:-8082}/api/v1/ready
 ```
 

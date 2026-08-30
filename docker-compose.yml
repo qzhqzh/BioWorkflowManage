@@ -248,6 +248,41 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  object-input-cache-gc:
+    profiles: ["maintenance"]
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    command: ["python", "backend/manage.py", "cleanup_object_input_cache"]
+    user: "${MINIWDL_UID:-1000}:${MINIWDL_GID:-1000}"
+    read_only: true
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_DB: ${POSTGRES_DB:-bioworkflow}
+      POSTGRES_USER: ${POSTGRES_USER:-bioworkflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?Set DJANGO_SECRET_KEY in .env}
+      ANALYSIS_INPUT_STAGING_ROOT: /analysis/input-staging
+      ANALYSIS_OBJECT_STAGE_MAX_ITEMS: "${ANALYSIS_OBJECT_STAGE_MAX_ITEMS:-64}"
+      ANALYSIS_OBJECT_STAGE_MAX_OBJECT_BYTES: "${ANALYSIS_OBJECT_STAGE_MAX_OBJECT_BYTES:-1099511627776}"
+      ANALYSIS_OBJECT_STAGE_MAX_RUN_BYTES: "${ANALYSIS_OBJECT_STAGE_MAX_RUN_BYTES:-2199023255552}"
+      ANALYSIS_OBJECT_STAGE_RETENTION_DAYS: "${ANALYSIS_OBJECT_STAGE_RETENTION_DAYS:-30}"
+      ANALYSIS_OBJECT_STAGE_GC_HIGH_WATER_PERCENT: "${ANALYSIS_OBJECT_STAGE_GC_HIGH_WATER_PERCENT:-85}"
+      ANALYSIS_OBJECT_STAGE_GC_LOW_WATER_PERCENT: "${ANALYSIS_OBJECT_STAGE_GC_LOW_WATER_PERCENT:-75}"
+      ANALYSIS_OBJECT_STAGE_GC_MAX_FILES: "${ANALYSIS_OBJECT_STAGE_GC_MAX_FILES:-1000}"
+      ANALYSIS_OBJECT_STAGE_GC_SCAN_MAX_FILES: "${ANALYSIS_OBJECT_STAGE_GC_SCAN_MAX_FILES:-1000000}"
+    volumes:
+      - ${ANALYSIS_INPUT_STAGING_HOST_PATH:-./data/input-staging}:/analysis/input-staging
+    depends_on:
+      db:
+        condition: service_healthy
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
   frontend:
     build:
       context: .

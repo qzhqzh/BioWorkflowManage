@@ -81,6 +81,7 @@ from .models import (
     WorkflowVersion,
 )
 from .object_inputs import (
+    lock_input_staging_coordinator_for_manifest,
     ObjectHeadBudget,
     ObjectInputError,
     inspect_object_reference,
@@ -2184,6 +2185,9 @@ def integration_analysis_runs(request):
                     product_version = _lock_analysis_product_version_ready(
                         product_version
                     )
+                lock_input_staging_coordinator_for_manifest(
+                    request_payload.get("input_resource_manifest")
+                )
                 run = AnalysisRun.objects.create(
                     run_kind=AnalysisRun.Kind.WORKFLOW,
                     workflow_version=version,
@@ -2416,6 +2420,9 @@ def integration_analysis_run_retry(request, run_id):
                     product_version = _lock_analysis_product_version_ready(
                         product_version
                     )
+                lock_input_staging_coordinator_for_manifest(
+                    payload.get("input_resource_manifest")
+                )
                 run = AnalysisRun.objects.create(
                     run_kind=original.run_kind,
                     workflow_version=original.workflow_version,
@@ -2879,6 +2886,9 @@ def integration_tool_test_runs(request):
         item = preflight["tool_version"]
         sample_id = f"tool-test-{item.tool_id}"[:128]
         with transaction.atomic():
+            lock_input_staging_coordinator_for_manifest(
+                preflight["manifests"].get("input_resource_manifest")
+            )
             run = AnalysisRun.objects.create(
                 run_kind=AnalysisRun.Kind.TOOL_TEST,
                 tool_version=item,
