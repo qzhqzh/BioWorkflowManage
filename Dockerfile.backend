@@ -1,11 +1,20 @@
 ARG UV_BASE_IMAGE=m.daocloud.io/ghcr.io/astral-sh/uv:0.11.6@sha256:b1e699368d24c57cda93c338a57a8c5a119009ba809305cc8e86986d4a006754
 ARG SPROCKET_BASE_IMAGE=ghcr.io/stjude-rust-labs/sprocket:v0.28.0@sha256:6054fcaab0d512d11737717a2bab7e76f36c1225cf15fc2479f5bfa650b95f0b
 ARG PYTHON_BASE_IMAGE=m.daocloud.io/docker.io/library/python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
+ARG ANALYSIS_NODE_VERSION=dev
+ARG GIT_REVISION=unknown
 
 FROM ${UV_BASE_IMAGE} AS uv
 FROM ${SPROCKET_BASE_IMAGE} AS sprocket
 
 FROM ${PYTHON_BASE_IMAGE}
+
+ARG ANALYSIS_NODE_VERSION
+ARG GIT_REVISION
+LABEL org.opencontainers.image.title="BioWorkflowManage Analysis Node backend" \
+    org.opencontainers.image.version="${ANALYSIS_NODE_VERSION}" \
+    org.opencontainers.image.revision="${GIT_REVISION}" \
+    org.opencontainers.image.source="https://github.com/qzhqzh/BioWorkflowManage"
 
 WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 \

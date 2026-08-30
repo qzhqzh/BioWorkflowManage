@@ -1,0 +1,331 @@
+name: ${ANALYSIS_NODE_PROJECT_NAME:-analysis-node}
+
+x-control-profiles: &control-profiles
+  - headless
+  - console
+  - isolated-runtime
+  - host-runtime
+
+x-backend-service: &backend-service
+  image: ${ANALYSIS_NODE_BACKEND_IMAGE:?Load the signed Analysis Node image bundle first}
+  pull_policy: never
+  env_file:
+    - ${ANALYSIS_NODE_ENV_FILE:-.env}
+  user: "${MINIWDL_UID}:${MINIWDL_GID}"
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+
+services:
+  db:
+    image: ${ANALYSIS_NODE_POSTGRES_IMAGE:?Load the signed Analysis Node image bundle first}
+    pull_policy: never
+    profiles:
+      - headless
+      - console
+      - isolated-runtime
+      - host-runtime
+      - maintenance
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ${ANALYSIS_NODE_POSTGRES_PATH}:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    security_opt:
+      - no-new-privileges:true
+
+  backend:
+    <<: *backend-service
+    profiles: *control-profiles
+    restart: unless-stopped
+    environment:
+      POSTGRES_HOST: db
+      ANALYSIS_RAWDATA_ROOT: /analysis/rawdata
+      ANALYSIS_DATABASE_ROOT: /analysis/databases
+      ANALYSIS_RUN_ROOT: /analysis/runs
+      ANALYSIS_INPUT_STAGING_ROOT: /analysis/input-staging
+      ANALYSIS_ARTIFACT_EXPORT_ROOT: /analysis/exports
+      ANALYSIS_OBJECT_STORAGE_PROFILE_DIR: /run/secrets/bioworkflow/object-storage
+      ANALYSIS_ARTIFACT_EXPORT_PROFILE_DIR: /run/secrets/bioworkflow/artifact-export
+      INTEGRATION_REQUIRE_ANALYSIS_PRODUCT: "1"
+      INTEGRATION_REQUIRE_SIGNED_WORKFLOW_PACKAGE: "1"
+      ANALYSIS_NODE_SMOKE_TASK_IMAGE: ${ANALYSIS_NODE_SMOKE_TASK_IMAGE}
+    volumes:
+      - ${ANALYSIS_RAWDATA_HOST_PATH}:/analysis/rawdata:ro
+      - ${ANALYSIS_DATABASE_HOST_PATH}:/analysis/databases:ro
+      - ${ANALYSIS_RUN_HOST_PATH}:/analysis/runs:ro
+      - ${ANALYSIS_INPUT_STAGING_HOST_PATH}:/analysis/input-staging:ro
+      - ${ANALYSIS_ARTIFACT_EXPORT_HOST_PATH}:/analysis/exports:ro
+      - ${ANALYSIS_OBJECT_STORAGE_SECRETS_HOST_PATH}:/run/secrets/bioworkflow/object-storage:ro
+      - ${ANALYSIS_ARTIFACT_EXPORT_SECRETS_HOST_PATH}:/run/secrets/bioworkflow/artifact-export:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/ready')"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+
+  rawdata-indexer:
+    <<: *backend-service
+    profiles: *control-profiles
+    restart: unless-stopped
+    command: ["python", "backend/manage.py", "run_rawdata_indexer"]
+    environment:
+      POSTGRES_HOST: db
+      ANALYSIS_RAWDATA_ROOT: /analysis/rawdata
+    volumes:
+      - ${ANALYSIS_RAWDATA_HOST_PATH}:/analysis/rawdata:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  webhook-dispatcher:
+    <<: *backend-service
+    profiles: *control-profiles
+    restart: unless-stopped
+    command: ["python", "backend/manage.py", "run_webhook_dispatcher"]
+    environment:
+      POSTGRES_HOST: db
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  artifact-exporter:
+    <<: *backend-service
+    profiles: *control-profiles
+    restart: unless-stopped
+    command: ["python", "backend/manage.py", "run_artifact_exporter"]
+    environment:
+      POSTGRES_HOST: db
+      ANALYSIS_RUN_ROOT: /analysis/runs
+      ANALYSIS_ARTIFACT_EXPORT_ROOT: /analysis/exports
+      ANALYSIS_ARTIFACT_EXPORT_PROFILE_DIR: /run/secrets/bioworkflow/artifact-export
+    volumes:
+      - ${ANALYSIS_RUN_HOST_PATH}:/analysis/runs:ro
+      - ${ANALYSIS_ARTIFACT_EXPORT_HOST_PATH}:/analysis/exports
+      - ${ANALYSIS_ARTIFACT_EXPORT_SECRETS_HOST_PATH}:/run/secrets/bioworkflow/artifact-export:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  frontend:
+    image: ${ANALYSIS_NODE_FRONTEND_IMAGE:?Load the signed Analysis Node image bundle first}
+    pull_policy: never
+    profiles: ["console"]
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:3000/"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+
+  gateway-headless:
+    image: ${ANALYSIS_NODE_GATEWAY_IMAGE:?Load the signed Analysis Node image bundle first}
+    pull_policy: never
+    profiles: ["headless"]
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - NET_BIND_SERVICE
+      - SETGID
+      - SETUID
+    ports:
+      - "${ANALYSIS_NODE_BIND_ADDRESS}:${ANALYSIS_NODE_API_PORT}:80"
+    volumes:
+      - ./nginx-headless.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1/api/v1/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+    security_opt:
+      - no-new-privileges:true
+
+  gateway-console:
+    image: ${ANALYSIS_NODE_GATEWAY_IMAGE:?Load the signed Analysis Node image bundle first}
+    pull_policy: never
+    profiles: ["console"]
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - NET_BIND_SERVICE
+      - SETGID
+      - SETUID
+    ports:
+      - "${ANALYSIS_NODE_BIND_ADDRESS}:${ANALYSIS_NODE_CONSOLE_PORT}:80"
+    volumes:
+      - ./nginx-console.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1/api/v1/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+    security_opt:
+      - no-new-privileges:true
+
+  miniwdl-docker:
+    image: ${ANALYSIS_NODE_DIND_IMAGE:?Load the signed Analysis Node image bundle first}
+    pull_policy: never
+    profiles: ["isolated-runtime"]
+    hostname: miniwdl-docker
+    privileged: true
+    restart: unless-stopped
+    environment:
+      DOCKER_TLS_CERTDIR: /certs
+    volumes:
+      - ${ANALYSIS_NODE_DIND_PATH}:/var/lib/docker
+      - ${ANALYSIS_NODE_DIND_CERT_PATH}:/certs
+      - ${ANALYSIS_RAWDATA_HOST_PATH}:/analysis/rawdata:ro
+      - ${ANALYSIS_DATABASE_HOST_PATH}:/analysis/databases:ro
+      - ${ANALYSIS_RUN_HOST_PATH}:/analysis/runs
+      - ${ANALYSIS_INPUT_STAGING_HOST_PATH}:/analysis/input-staging:ro
+    networks:
+      - miniwdl-control
+      - miniwdl-egress
+    healthcheck:
+      test: ["CMD", "docker", "-H", "unix:///var/run/docker.sock", "info"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  analysis-worker-isolated:
+    <<: *backend-service
+    profiles: ["isolated-runtime"]
+    restart: unless-stopped
+    command: ["python", "backend/manage.py", "run_analysis_worker"]
+    environment:
+      POSTGRES_HOST: db
+      DOCKER_HOST: tcp://miniwdl-docker:2376
+      DOCKER_CERT_PATH: /certs/client
+      DOCKER_TLS_VERIFY: "1"
+      MINIWDL_RUN_ROOT: /analysis
+      ANALYSIS_RAWDATA_ROOT: /analysis/rawdata
+      ANALYSIS_DATABASE_ROOT: /analysis/databases
+      ANALYSIS_RUN_ROOT: /analysis/runs
+      ANALYSIS_INPUT_STAGING_ROOT: /analysis/input-staging
+      ANALYSIS_OBJECT_STORAGE_PROFILE_DIR: /run/secrets/bioworkflow/object-storage
+    volumes:
+      - ${ANALYSIS_RAWDATA_HOST_PATH}:/analysis/rawdata:ro
+      - ${ANALYSIS_DATABASE_HOST_PATH}:/analysis/databases:ro
+      - ${ANALYSIS_RUN_HOST_PATH}:/analysis/runs
+      - ${ANALYSIS_INPUT_STAGING_HOST_PATH}:/analysis/input-staging
+      - ${ANALYSIS_CACHE_HOST_PATH}:/analysis/cache
+      - ${ANALYSIS_NODE_DIND_CERT_PATH}/client:/certs/client:ro
+      - ${ANALYSIS_OBJECT_STORAGE_SECRETS_HOST_PATH}:/run/secrets/bioworkflow/object-storage:ro
+    networks:
+      - default
+      - miniwdl-control
+    depends_on:
+      backend:
+        condition: service_healthy
+      miniwdl-docker:
+        condition: service_healthy
+
+  analysis-worker-host:
+    <<: *backend-service
+    profiles: ["host-runtime"]
+    restart: unless-stopped
+    command: ["python", "backend/manage.py", "run_analysis_worker"]
+    group_add:
+      - "${MINIWDL_DOCKER_GID}"
+    environment:
+      POSTGRES_HOST: db
+      DOCKER_HOST: unix:///var/run/docker.sock
+      MINIWDL_RUN_ROOT: ${ANALYSIS_WORKSPACE_HOST_PATH}
+      MINIWDL__CALL_CACHE__DIR: ${ANALYSIS_CACHE_HOST_PATH}/calls
+      ANALYSIS_RAWDATA_ROOT: ${ANALYSIS_RAWDATA_HOST_PATH}
+      ANALYSIS_DATABASE_ROOT: ${ANALYSIS_DATABASE_HOST_PATH}
+      ANALYSIS_RUN_ROOT: ${ANALYSIS_RUN_HOST_PATH}
+      ANALYSIS_INPUT_STAGING_ROOT: ${ANALYSIS_INPUT_STAGING_HOST_PATH}
+      ANALYSIS_OBJECT_STORAGE_PROFILE_DIR: /run/secrets/bioworkflow/object-storage
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${ANALYSIS_RAWDATA_HOST_PATH}:${ANALYSIS_RAWDATA_HOST_PATH}:ro
+      - ${ANALYSIS_DATABASE_HOST_PATH}:${ANALYSIS_DATABASE_HOST_PATH}:ro
+      - ${ANALYSIS_RUN_HOST_PATH}:${ANALYSIS_RUN_HOST_PATH}
+      - ${ANALYSIS_INPUT_STAGING_HOST_PATH}:${ANALYSIS_INPUT_STAGING_HOST_PATH}
+      - ${ANALYSIS_CACHE_HOST_PATH}:${ANALYSIS_CACHE_HOST_PATH}
+      - ${ANALYSIS_OBJECT_STORAGE_SECRETS_HOST_PATH}:/run/secrets/bioworkflow/object-storage:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  artifact-cleaner:
+    <<: *backend-service
+    profiles: ["maintenance"]
+    command: ["python", "backend/manage.py", "cleanup_analysis_outputs"]
+    environment:
+      POSTGRES_HOST: db
+      ANALYSIS_RUN_ROOT: /analysis/runs
+    volumes:
+      - ${ANALYSIS_RUN_HOST_PATH}:/analysis/runs
+    depends_on:
+      db:
+        condition: service_healthy
+
+  object-input-cache-gc:
+    <<: *backend-service
+    profiles: ["maintenance"]
+    command: ["python", "backend/manage.py", "cleanup_object_input_cache"]
+    environment:
+      POSTGRES_HOST: db
+      ANALYSIS_INPUT_STAGING_ROOT: /analysis/input-staging
+    volumes:
+      - ${ANALYSIS_INPUT_STAGING_HOST_PATH}:/analysis/input-staging
+    depends_on:
+      db:
+        condition: service_healthy
+
+networks:
+  miniwdl-control:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${MINIWDL_CONTROL_SUBNET}
+  miniwdl-egress:
+    ipam:
+      config:
+        - subnet: ${MINIWDL_EGRESS_SUBNET}

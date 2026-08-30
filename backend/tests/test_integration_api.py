@@ -30,6 +30,7 @@ from workflows.analysis_runtime import (
 )
 from workflows.analysis_products import (
     AnalysisProductError,
+    attest_workflow_package,
     publish_analysis_product_version,
 )
 from workflows.integration_api import IntegrationAPIError, _managed_resource
@@ -51,6 +52,7 @@ from workflows.models import (
     SoftwareAsset,
     ToolVersion,
     WorkflowDocument,
+    WorkflowPackageAttestation,
     WorkflowVersion,
 )
 from workflows.object_inputs import ObjectInputError, stage_run_object_inputs
@@ -842,6 +844,138 @@ def test_analysis_product_missing_uses_stable_error_contract():
         assert response.data["error"]["code"] == (
             "ANALYSIS_PRODUCT_VERSION_NOT_FOUND"
         )
+
+
+@pytest.mark.django_db
+def test_product_only_deployment_rejects_direct_workflow_source(
+    settings,
+    integration_workspace,
+):
+    settings.INTEGRATION_REQUIRE_ANALYSIS_PRODUCT = True
+    account, _, _, client = _token_client()
+    version = _workflow_version()
+    product_version = _analysis_product_version(version)
+
+    direct = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        _submission(version),
+        format="json",
+    )
+    assert direct.status_code == 400
+    assert direct.data["error"]["code"] == "ANALYSIS_PRODUCT_REQUIRED"
+    submitted_direct = client.post(
+        "/api/v1/integration/analysis-runs",
+        _submission(version, external_run_id="product-only-direct"),
+        format="json",
+        HTTP_IDEMPOTENCY_KEY="product-only-direct",
+    )
+    assert submitted_direct.status_code == 400
+    assert submitted_direct.data["error"]["code"] == "ANALYSIS_PRODUCT_REQUIRED"
+
+    legacy = AnalysisRun.objects.create(
+        workflow_version=version,
+        service_account=account,
+        external_run_id="legacy-direct-run",
+        idempotency_key="legacy-direct-run",
+        workflow_name="integration_smoke",
+        sample_id="S001",
+        actor="service:okb",
+        status=AnalysisRun.Status.FAILED,
+        source_bundle=version.compiled_bundle,
+        source_digest=version.compiled_digest,
+    )
+    legacy_retry = client.post(
+        f"/api/v1/integration/analysis-runs/{legacy.id}/retry",
+        {
+            "external_ref": {
+                "client_id": "okb",
+                "external_run_id": "legacy-direct-retry",
+            }
+        },
+        format="json",
+        HTTP_IDEMPOTENCY_KEY="legacy-direct-retry",
+    )
+    assert legacy_retry.status_code == 409
+    assert legacy_retry.data["error"]["code"] == "ANALYSIS_PRODUCT_REQUIRED"
+
+    product_body = _submission(version, external_run_id="product-only")
+    product_body.pop("workflow")
+    product_body["analysis_product"] = {
+        "analysis_code": product_version.product.code,
+        "contract_version": product_version.contract_version,
+    }
+    accepted = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        product_body,
+        format="json",
+    )
+    assert accepted.status_code == 200, accepted.data
+    assert accepted.data["analysis_product"]["analysis_code"] == "dna-panel"
+
+
+@pytest.mark.django_db
+def test_signed_workflow_package_is_required_for_product_publish_and_execution(
+    settings,
+    integration_workspace,
+):
+    _, _, _, client = _token_client()
+    version = _workflow_version()
+    existing = _analysis_product_version(version)
+    body = _submission(version, external_run_id="signed-package-gate")
+    body.pop("workflow")
+    body["analysis_product"] = {
+        "analysis_code": existing.product.code,
+        "contract_version": existing.contract_version,
+    }
+    settings.INTEGRATION_REQUIRE_SIGNED_WORKFLOW_PACKAGE = True
+
+    unsigned = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        body,
+        format="json",
+    )
+    assert unsigned.status_code == 409
+    assert unsigned.data["error"]["code"] == (
+        "WORKFLOW_PACKAGE_ATTESTATION_REQUIRED"
+    )
+
+    other_product = AnalysisProduct.objects.create(
+        code="signed-publish-gate",
+        name="Signed publish gate",
+    )
+    with pytest.raises(AnalysisProductError) as caught:
+        publish_analysis_product_version(
+            other_product,
+            contract_version="1.0.0",
+            workflow_version=version,
+            actor="pytest",
+        )
+    assert caught.value.code == "WORKFLOW_PACKAGE_ATTESTATION_REQUIRED"
+
+    attest_workflow_package(
+        version,
+        verification_method=WorkflowPackageAttestation.VerificationMethod.SIGSTORE,
+        source_digest=version.compiled_digest,
+        statement_digest=canonical_digest({"source_digest": version.compiled_digest}),
+        signature_bundle_digest=canonical_digest({"bundle": "pytest"}),
+        signer_identity="https://github.com/example/workflows/release.yml@refs/tags/v1",
+        actor="pytest",
+    )
+    accepted = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        body,
+        format="json",
+    )
+    assert accepted.status_code == 200, accepted.data
+    assert accepted.data["analysis_product"]["analysis_code"] == "dna-panel"
+    published, created = publish_analysis_product_version(
+        other_product,
+        contract_version="1.0.0",
+        workflow_version=version,
+        actor="pytest",
+    )
+    assert created is True
+    assert published.workflow_version == version
 
 
 @pytest.mark.django_db

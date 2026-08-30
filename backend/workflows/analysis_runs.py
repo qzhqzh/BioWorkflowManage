@@ -977,6 +977,10 @@ def _workflow_payload(
         ]
     else:
         blockers = []
+    if settings.INTEGRATION_REQUIRE_ANALYSIS_PRODUCT:
+        blockers.append("当前部署只允许通过 Integration API 投递 Analysis Product。")
+    elif settings.INTEGRATION_REQUIRE_SIGNED_WORKFLOW_PACKAGE:
+        blockers.append("历史 WDL 资产没有工作流包签名证明，当前部署禁止执行。")
     required_reference = profile.get("required_reference")
     if (
         required_reference
@@ -1148,6 +1152,13 @@ def _published_workflow_payload(
 ) -> dict[str, Any]:
     interface = _workflow_interface(version)
     blockers = []
+    if settings.INTEGRATION_REQUIRE_ANALYSIS_PRODUCT:
+        blockers.append("当前部署只允许通过 Integration API 投递 Analysis Product。")
+    if settings.INTEGRATION_REQUIRE_SIGNED_WORKFLOW_PACKAGE:
+        from .analysis_products import workflow_package_attestation_is_current
+
+        if not workflow_package_attestation_is_current(version):
+            blockers.append("该版本缺少与固定编译产物一致的工作流包签名证明。")
     if not version.compiled_bundle or not version.compiled_digest:
         blockers.append("该版本发布时尚未固化编译产物，请重新发布一个新版本。")
     if any(
@@ -1963,6 +1974,13 @@ def analysis_runs(request):
             }
         )
 
+    if settings.INTEGRATION_REQUIRE_ANALYSIS_PRODUCT:
+        return _error(
+            "ANALYSIS_PRODUCT_REQUIRED",
+            "当前部署只允许通过 Integration API 投递 Analysis Product。",
+            status.HTTP_400_BAD_REQUEST,
+        )
+
     snapshot_budget = ResourceSnapshotBudget()
     try:
         workflow_slug = str(request.data.get("workflow") or "")
@@ -2075,6 +2093,11 @@ def analysis_runs(request):
                 status=status.HTTP_201_CREATED,
             )
 
+        if settings.INTEGRATION_REQUIRE_SIGNED_WORKFLOW_PACKAGE:
+            raise AnalysisInputError(
+                "ANALYSIS_WORKFLOW_PACKAGE_REQUIRED",
+                "历史 WDL 资产没有工作流包签名证明，当前部署禁止执行。",
+            )
         asset_slug, requested_asset_revision = _parse_wdl_asset_workflow(workflow_slug)
         profile = WORKFLOW_PROFILES.get(asset_slug)
         if profile is None:

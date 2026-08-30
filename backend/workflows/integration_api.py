@@ -47,6 +47,7 @@ from .analysis_products import (
     AnalysisProductError,
     analysis_product_version_is_current,
     normalize_contract_version,
+    workflow_package_attestation_is_current,
 )
 from .auth_permissions import (
     IntegrationScopePermission,
@@ -300,11 +301,14 @@ def _workflow_version_payload(version: WorkflowVersion) -> dict[str, Any]:
         and outputs
         and all(_output_semantic_ready(item) for item in outputs)
     )
+    package_trusted = workflow_package_attestation_is_current(version)
     blockers = []
     if not ready:
         blockers.append(snapshot_error or "缺少固定编译产物。")
     if not output_contract_ready:
         blockers.append("缺少语义化输出契约。")
+    if settings.INTEGRATION_REQUIRE_SIGNED_WORKFLOW_PACKAGE and not package_trusted:
+        blockers.append("WorkflowVersion 缺少与源码摘要一致的签名包证明。")
     return {
         "id": version.pk,
         "slug": version.workflow.slug,
@@ -316,7 +320,15 @@ def _workflow_version_payload(version: WorkflowVersion) -> dict[str, Any]:
         "compiler_profile": version.compiler_profile,
         "interface": version.interface_contract,
         "graph_summary": _workflow_graph_summary(version),
-        "ready": ready and output_contract_ready,
+        "workflow_package_trusted": package_trusted,
+        "ready": (
+            ready
+            and output_contract_ready
+            and (
+                package_trusted
+                or not settings.INTEGRATION_REQUIRE_SIGNED_WORKFLOW_PACKAGE
+            )
+        ),
         "blockers": blockers,
         "created_at": version.created_at,
     }
@@ -335,6 +347,9 @@ def _analysis_product_version_payload(
 ) -> dict[str, Any]:
     workflow = _workflow_version_payload(item.workflow_version)
     snapshot_current = analysis_product_version_is_current(item)
+    package_trusted = workflow_package_attestation_is_current(
+        item.workflow_version
+    )
     interface_contract = (
         item.interface_contract if isinstance(item.interface_contract, dict) else {}
     )
@@ -358,7 +373,16 @@ def _analysis_product_version_payload(
         "interface": interface_contract,
         "input_contract": interface_contract.get("inputs", []),
         "output_contract": interface_contract.get("outputs", []),
-        "ready": item.product.is_active and snapshot_current and workflow["ready"],
+        "workflow_package_trusted": package_trusted,
+        "ready": (
+            item.product.is_active
+            and snapshot_current
+            and workflow["ready"]
+            and (
+                package_trusted
+                or not settings.INTEGRATION_REQUIRE_SIGNED_WORKFLOW_PACKAGE
+            )
+        ),
         "blockers": blockers,
         "created_at": item.created_at,
     }
@@ -374,6 +398,17 @@ def _validate_workflow_version_ready(version: WorkflowVersion) -> WorkflowVersio
             category="workflow",
             details={"blockers": _workflow_version_payload(version)["blockers"]},
         ) from error
+    if (
+        settings.INTEGRATION_REQUIRE_SIGNED_WORKFLOW_PACKAGE
+        and not workflow_package_attestation_is_current(version)
+    ):
+        raise IntegrationAPIError(
+            "WORKFLOW_PACKAGE_ATTESTATION_REQUIRED",
+            "当前部署只允许执行已验证签名包的 WorkflowVersion。",
+            category="workflow",
+            details={"workflow_version_id": version.pk},
+            http_status=status.HTTP_409_CONFLICT,
+        )
     outputs = version.interface_contract.get("outputs")
     if not isinstance(outputs, list) or not outputs:
         raise IntegrationAPIError(
@@ -412,7 +447,7 @@ def _fixed_workflow(value: Any) -> WorkflowVersion:
             category="workflow",
         ) from None
     version = (
-        WorkflowVersion.objects.select_related("workflow")
+        WorkflowVersion.objects.select_related("workflow", "package_attestation")
         .filter(
             pk=version_id,
             kind=WorkflowDocument.Kind.WORKFLOW,
@@ -464,6 +499,17 @@ def _validate_analysis_product_version_ready(
             details=_analysis_product_reference(item),
             http_status=status.HTTP_409_CONFLICT,
         )
+    if (
+        settings.INTEGRATION_REQUIRE_SIGNED_WORKFLOW_PACKAGE
+        and not workflow_package_attestation_is_current(item.workflow_version)
+    ):
+        raise IntegrationAPIError(
+            "WORKFLOW_PACKAGE_ATTESTATION_REQUIRED",
+            "当前部署只允许执行已验证签名包的 WorkflowVersion。",
+            category="workflow",
+            details=_analysis_product_reference(item),
+            http_status=status.HTTP_409_CONFLICT,
+        )
     _validate_workflow_version_ready(item.workflow_version)
     return item
 
@@ -475,7 +521,10 @@ def _lock_analysis_product_version_ready(
     product = AnalysisProduct.objects.select_for_update().get(pk=item.product_id)
     locked_item = (
         AnalysisProductVersion.objects.select_for_update()
-        .select_related("workflow_version", "workflow_version__workflow")
+        .select_related(
+            "workflow_version",
+            "workflow_version__workflow",
+        )
         .get(pk=item.pk)
     )
     locked_item.product = product
@@ -509,6 +558,7 @@ def _fixed_analysis_product(value: Any) -> AnalysisProductVersion:
             "product",
             "workflow_version",
             "workflow_version__workflow",
+            "workflow_version__package_attestation",
         )
         .filter(
             product__code=analysis_code,
@@ -541,6 +591,12 @@ def _analysis_source(
         item = _fixed_analysis_product(body.get("analysis_product"))
         return item.workflow_version, item
     if has_workflow:
+        if settings.INTEGRATION_REQUIRE_ANALYSIS_PRODUCT:
+            raise IntegrationAPIError(
+                "ANALYSIS_PRODUCT_REQUIRED",
+                "当前部署只接受已发布的 analysis_product。",
+                category="workflow",
+            )
         return _fixed_workflow(body.get("workflow")), None
     raise IntegrationAPIError(
         "ANALYSIS_SOURCE_REQUIRED",
@@ -1986,6 +2042,7 @@ def integration_analysis_products(request):
             "product",
             "workflow_version",
             "workflow_version__workflow",
+            "workflow_version__package_attestation",
         )
         .filter(product__is_active=True)
         .order_by("product__code", "contract_version")
@@ -2008,6 +2065,7 @@ def integration_analysis_product_version_detail(
             "product",
             "workflow_version",
             "workflow_version__workflow",
+            "workflow_version__package_attestation",
         )
         .filter(
             product__code=analysis_code,
@@ -2032,7 +2090,9 @@ def integration_analysis_product_version_detail(
 @api_view(["GET"])
 @permission_classes([IntegrationScopePermission])
 def integration_workflow_versions(request):
-    versions = WorkflowVersion.objects.select_related("workflow").filter(
+    versions = WorkflowVersion.objects.select_related(
+        "workflow", "package_attestation"
+    ).filter(
         kind=WorkflowDocument.Kind.WORKFLOW,
         workflow__kind=WorkflowDocument.Kind.WORKFLOW,
     )
@@ -2044,7 +2104,7 @@ def integration_workflow_versions(request):
 @permission_classes([IntegrationScopePermission])
 def integration_workflow_version_detail(request, version_id: int):
     item = get_object_or_404(
-        WorkflowVersion.objects.select_related("workflow"),
+        WorkflowVersion.objects.select_related("workflow", "package_attestation"),
         pk=version_id,
         kind=WorkflowDocument.Kind.WORKFLOW,
     )
@@ -2342,6 +2402,16 @@ def integration_analysis_run_retry(request, run_id):
             ),
         )
     try:
+        if (
+            settings.INTEGRATION_REQUIRE_ANALYSIS_PRODUCT
+            and original.analysis_product_version_id is None
+        ):
+            raise IntegrationAPIError(
+                "ANALYSIS_PRODUCT_REQUIRED",
+                "当前部署不允许重跑未绑定 analysis_product 的历史任务。",
+                category="workflow",
+                http_status=status.HTTP_409_CONFLICT,
+            )
         body = dict(request.data)
         external = _external_ref(body.get("external_ref"))
         account = _request_service_account(request, external)

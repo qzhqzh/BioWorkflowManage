@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/qzhqzh/BioWorkflowManage/deploy/analysis-node/workflow-package-manifest.schema.json",
+  "title": "Signed Workflow package statement",
+  "type": "object",
+  "required": ["schema_version", "workflow_version_id", "source_digest"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "workflow_version_id": {"type": "integer", "minimum": 1},
+    "source_digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    }
+  },
+  "additionalProperties": false
+}

@@ -100,6 +100,8 @@ Reference、Panel、BED 与 CNV 基线的统一配置见
 WDL 协作、原始数据索引和稳定升级见
 [`docs/17-wdl-rawdata-iteration.md`](docs/17-wdl-rawdata-iteration.md) 与
 [`docs/18-stable-release.md`](docs/18-stable-release.md)。
+第三方服务器上的 Headless/Console 离线组件交付、签名验证、安装诊断与回滚见
+[`docs/19-analysis-node-deployment.md`](docs/19-analysis-node-deployment.md)。
 
 ## Phase 1: Workflow Compiler Foundation
 

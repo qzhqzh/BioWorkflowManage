@@ -1,0 +1,314 @@
+name: Release Analysis Node
+
+on:
+  push:
+    tags:
+      - "analysis-node-v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Semantic version without the v prefix
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+
+concurrency:
+  group: analysis-node-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-sign-package:
+    name: Build, sign, and package linux/amd64
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      REGISTRY: ghcr.io
+      BACKEND_REPOSITORY: ghcr.io/qzhqzh/bioworkflowmanage-backend
+      FRONTEND_REPOSITORY: ghcr.io/qzhqzh/bioworkflowmanage-frontend
+    steps:
+      - name: Checkout release revision
+        uses: actions/checkout@v4
+
+      - name: Resolve and validate version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/analysis-node-v* ]]; then
+            value=${GITHUB_REF_NAME#analysis-node-v}
+          else
+            value=$INPUT_VERSION
+          fi
+          if [[ ! "$value" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]; then
+            echo "Invalid semantic version: $value" >&2
+            exit 64
+          fi
+          echo "value=$value" >> "$GITHUB_OUTPUT"
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies and run package gates
+        run: |
+          uv sync --frozen
+          uvx --from ruff==0.15.14 ruff check backend scripts deploy/analysis-node/lib
+          uv run pytest \
+            backend/tests/test_analysis_node_deploy.py \
+            backend/tests/test_analysis_runs.py::test_browser_rejects_unsigned_published_workflow_when_required \
+            backend/tests/test_analysis_runs.py::test_browser_rejects_legacy_wdl_when_signed_packages_are_required \
+            backend/tests/test_analysis_runs.py::test_worker_rejects_legacy_queued_unsigned_workflow_version \
+            backend/tests/test_analysis_runs.py::test_worker_rejects_legacy_queued_wdl_asset_when_signed_packages_are_required \
+            backend/tests/test_analysis_runs.py::test_worker_rejects_run_snapshot_not_bound_to_signed_workflow_version \
+            backend/tests/test_analysis_runs.py::test_worker_rejects_non_product_workflow_when_product_is_required \
+            backend/tests/test_analysis_runs.py::test_worker_keeps_accepted_product_run_executable_after_deactivation \
+            backend/tests/test_integration_api.py::test_product_only_deployment_rejects_direct_workflow_source
+          uv run python backend/manage.py check
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Sign in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push backend image
+        id: backend
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.backend
+          platforms: linux/amd64
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: ${{ env.BACKEND_REPOSITORY }}:${{ steps.version.outputs.value }}
+          build-args: |
+            ANALYSIS_NODE_VERSION=${{ steps.version.outputs.value }}
+            GIT_REVISION=${{ github.sha }}
+
+      - name: Build and push console image
+        id: frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.frontend
+          platforms: linux/amd64
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: ${{ env.FRONTEND_REPOSITORY }}:${{ steps.version.outputs.value }}
+          build-args: |
+            ANALYSIS_NODE_VERSION=${{ steps.version.outputs.value }}
+            GIT_REVISION=${{ github.sha }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Sign application images and retain verification bundles
+        env:
+          BACKEND_REF: ${{ env.BACKEND_REPOSITORY }}@${{ steps.backend.outputs.digest }}
+          FRONTEND_REF: ${{ env.FRONTEND_REPOSITORY }}@${{ steps.frontend.outputs.digest }}
+        run: |
+          mkdir -p dist/image-signatures
+          cosign sign --yes --bundle dist/image-signatures/backend.sigstore.json "$BACKEND_REF"
+          cosign sign --yes --bundle dist/image-signatures/frontend.sigstore.json "$FRONTEND_REF"
+          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release-analysis-node.yml@${GITHUB_REF}"
+          cosign verify --offline \
+            --bundle dist/image-signatures/backend.sigstore.json \
+            --certificate-identity "$identity" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$BACKEND_REF"
+          cosign verify --offline \
+            --bundle dist/image-signatures/frontend.sigstore.json \
+            --certificate-identity "$identity" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$FRONTEND_REF"
+
+      - name: Build offline bundle and SBOMs
+        env:
+          BACKEND_REF: ${{ env.BACKEND_REPOSITORY }}@${{ steps.backend.outputs.digest }}
+          FRONTEND_REF: ${{ env.FRONTEND_REPOSITORY }}@${{ steps.frontend.outputs.digest }}
+        run: >-
+          uv run python scripts/build_analysis_node_bundle.py
+          --version "${{ steps.version.outputs.value }}"
+          --backend-ref "$BACKEND_REF"
+          --frontend-ref "$FRONTEND_REF"
+          --git-revision "${{ github.sha }}"
+          --signature-dir dist/image-signatures
+          --output-dir dist
+
+      - name: Sign package manifest and final archive
+        id: artifacts
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          package="dist/analysis-node-$VERSION"
+          archive="dist/analysis-node-$VERSION-linux-amd64.tar.gz"
+          cosign sign-blob --yes --bundle "$package/SHA256SUMS.sigstore.json" "$package/SHA256SUMS"
+          tar -C dist -czf "$archive" "analysis-node-$VERSION"
+          (cd dist && sha256sum "$(basename "$archive")" > "$(basename "$archive").sha256")
+          cosign sign-blob --yes --bundle "$archive.sigstore.json" "$archive"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Verify generated signatures and bundle checksums
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          package="dist/analysis-node-$VERSION"
+          archive="dist/analysis-node-$VERSION-linux-amd64.tar.gz"
+          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release-analysis-node.yml@${GITHUB_REF}"
+          cosign verify-blob \
+            --offline \
+            --bundle "$package/SHA256SUMS.sigstore.json" \
+            --certificate-identity "$identity" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$package/SHA256SUMS"
+          cosign verify-blob \
+            --offline \
+            --bundle "$archive.sigstore.json" \
+            --certificate-identity "$identity" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$archive"
+          "$package/bin/analysis-node" \
+            --env-file "$package/.env.example" \
+            --images-env "$package/images.env" \
+            verify-bundle
+
+      - name: Exercise clean offline install, managed-input smoke, and restore
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          archive="$GITHUB_WORKSPACE/dist/analysis-node-$VERSION-linux-amd64.tar.gz"
+          offline_root="$RUNNER_TEMP/analysis-node-offline-$VERSION"
+          package="$offline_root/analysis-node-$VERSION"
+          install_root="$RUNNER_TEMP/analysis-node-install-$VERSION"
+          mkdir -p "$offline_root"
+          tar -xzf "$archive" -C "$offline_root"
+          cp "$package/.env.example" "$package/.env"
+          worker_uid=$(id -u)
+          worker_gid=$(id -g)
+          sed -i \
+            -e "s/^ANALYSIS_NODE_PROJECT_NAME=.*/ANALYSIS_NODE_PROJECT_NAME=analysis-node-release-$GITHUB_RUN_ID/" \
+            -e 's/^ANALYSIS_NODE_API_PORT=.*/ANALYSIS_NODE_API_PORT=18082/' \
+            -e 's/^ANALYSIS_NODE_CONSOLE_PORT=.*/ANALYSIS_NODE_CONSOLE_PORT=18083/' \
+            -e 's/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=release-gate-database-password/' \
+            -e 's/^DJANGO_SECRET_KEY=.*/DJANGO_SECRET_KEY=release-gate-django-secret-with-32-characters/' \
+            -e 's/^WEBHOOK_SIGNING_KEY=.*/WEBHOOK_SIGNING_KEY=release-gate-webhook-secret-with-32-characters/' \
+            -e 's/^ANALYSIS_MIN_AVAILABLE_MEMORY_GB=.*/ANALYSIS_MIN_AVAILABLE_MEMORY_GB=0/' \
+            -e 's/^ANALYSIS_NODE_MIN_FREE_GB=.*/ANALYSIS_NODE_MIN_FREE_GB=0/' \
+            -e "s#^MINIWDL_UID=.*#MINIWDL_UID=$worker_uid#" \
+            -e "s#^MINIWDL_GID=.*#MINIWDL_GID=$worker_gid#" \
+            -e "s#/opt/analysis-node/data#$install_root/data#g" \
+            -e "s#/opt/analysis-node-backups#$install_root/backups#g" \
+            -e "s#/opt/analysis-node/secrets#$install_root/secrets#g" \
+            "$package/.env"
+          chmod 0600 "$package/.env"
+          dockerd_root="$RUNNER_TEMP/analysis-node-offline-docker-$VERSION"
+          dockerd_socket="$dockerd_root/docker.sock"
+          mkdir -p "$dockerd_root"
+          sudo systemctl stop docker.service docker.socket
+          sudo dockerd \
+            --host "unix://$dockerd_socket" \
+            --data-root "$dockerd_root/data" \
+            --exec-root "$dockerd_root/exec" \
+            --pidfile "$dockerd_root/dockerd.pid" \
+            > "$dockerd_root/dockerd.log" 2>&1 &
+          export DOCKER_HOST="unix://$dockerd_socket"
+          echo "DOCKER_HOST=$DOCKER_HOST" >> "$GITHUB_ENV"
+          for _ in {1..60}; do
+            if docker info >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          if ! docker info >/dev/null 2>&1; then
+            cat "$dockerd_root/dockerd.log"
+            exit 1
+          fi
+          test -z "$(docker image ls --all --quiet)"
+          "$package/bin/analysis-node" verify-bundle
+          "$package/bin/analysis-node" init
+          "$package/bin/analysis-node" preflight
+          "$package/bin/analysis-node" load-images
+          "$package/bin/analysis-node" migrate
+          "$package/bin/analysis-node" up
+          "$package/bin/analysis-node" doctor --smoke --timeout 600
+          analysis_compose() {
+            docker compose \
+              --project-directory "$package" \
+              --env-file "$package/.env" \
+              --env-file "$package/images.env" \
+              --file "$package/compose.yml" \
+              --profile headless \
+              --profile isolated-runtime \
+              "$@"
+          }
+          analysis_compose exec -T backend python backend/manage.py shell -c \
+            'from workflows.models import WorkflowDocument; WorkflowDocument.objects.update_or_create(slug="release-restore-sentinel", defaults={"name": "before-backup"})'
+          backup_json=$("$package/bin/analysis-node" --json backup)
+          backup_path=$(jq -r '.checks[] | select(.name == "database-backup") | .message | sub("^备份已创建："; "")' <<< "$backup_json")
+          test -f "$backup_path"
+          analysis_compose exec -T backend python backend/manage.py shell -c \
+            'from workflows.models import WorkflowDocument; updated = WorkflowDocument.objects.filter(slug="release-restore-sentinel").update(name="after-backup"); assert updated == 1'
+          "$package/bin/analysis-node" restore "$backup_path" --confirm-database-restore
+          "$package/bin/analysis-node" up
+          analysis_compose exec -T backend python backend/manage.py shell -c \
+            'from workflows.models import WorkflowDocument; assert WorkflowDocument.objects.filter(slug="release-restore-sentinel", name="before-backup").exists()'
+          "$package/bin/analysis-node" doctor --smoke --timeout 600
+
+      - name: Stop release-gate services without deleting data
+        if: always()
+        continue-on-error: true
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          package="$RUNNER_TEMP/analysis-node-offline-$VERSION/analysis-node-$VERSION"
+          if [[ -x "$package/bin/analysis-node" && -f "$package/.env" ]]; then
+            "$package/bin/analysis-node" down || true
+          fi
+          dockerd_root="$RUNNER_TEMP/analysis-node-offline-docker-$VERSION"
+          if [[ -f "$dockerd_root/dockerd.pid" ]]; then
+            sudo kill "$(cat "$dockerd_root/dockerd.pid")" || true
+          fi
+          unset DOCKER_HOST
+          sudo systemctl start docker.service || true
+
+      - name: Upload delivery artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: analysis-node-${{ steps.version.outputs.value }}-linux-amd64
+          path: |
+            dist/analysis-node-${{ steps.version.outputs.value }}-linux-amd64.tar.gz
+            dist/analysis-node-${{ steps.version.outputs.value }}-linux-amd64.tar.gz.sha256
+            dist/analysis-node-${{ steps.version.outputs.value }}-linux-amd64.tar.gz.sigstore.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Publish GitHub Release for a release tag
+        if: startsWith(github.ref, 'refs/tags/analysis-node-v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.value }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME"
+          "dist/analysis-node-$VERSION-linux-amd64.tar.gz"
+          "dist/analysis-node-$VERSION-linux-amd64.tar.gz.sha256"
+          "dist/analysis-node-$VERSION-linux-amd64.tar.gz.sigstore.json"
+          --verify-tag
+          --generate-notes
+          --title "Analysis Node $VERSION"

@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+script_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+package_directory=$(CDPATH= cd -- "$script_directory/.." && pwd -P)
+
+exec python3 "$package_directory/lib/analysis_node.py" \
+  --package-dir "$package_directory" "$@"

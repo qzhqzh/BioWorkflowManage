@@ -4,6 +4,7 @@ import copy
 import re
 from typing import Any
 
+from django.conf import settings
 from django.db import transaction
 
 from compiler_core import canonical_digest
@@ -13,11 +14,13 @@ from .models import (
     AnalysisProduct,
     AnalysisProductVersion,
     WorkflowDocument,
+    WorkflowPackageAttestation,
     WorkflowVersion,
 )
 
 
 CONTRACT_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
+SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class AnalysisProductError(ValueError):
@@ -142,6 +145,105 @@ def snapshot_workflow_contract(
     return source_digest, snapshot, canonical_digest(snapshot)
 
 
+def workflow_package_attestation_is_current(
+    workflow_version: WorkflowVersion,
+) -> bool:
+    attestation = WorkflowPackageAttestation.objects.filter(
+        workflow_version_id=workflow_version.pk
+    ).first()
+    if attestation is None:
+        return False
+    return (
+        attestation.source_digest == workflow_version.compiled_digest
+        and bool(SHA256_PATTERN.fullmatch(attestation.source_digest))
+        and bool(SHA256_PATTERN.fullmatch(attestation.statement_digest))
+        and (
+            attestation.verification_method
+            == WorkflowPackageAttestation.VerificationMethod.BUNDLED
+            or bool(
+                SHA256_PATTERN.fullmatch(attestation.signature_bundle_digest)
+            )
+        )
+        and bool(attestation.signer_identity.strip())
+    )
+
+
+def attest_workflow_package(
+    workflow_version: WorkflowVersion,
+    *,
+    verification_method: str,
+    source_digest: str,
+    statement_digest: str,
+    signature_bundle_digest: str,
+    signer_identity: str,
+    actor: str,
+) -> tuple[WorkflowPackageAttestation, bool]:
+    try:
+        _, current_source_digest = _compile_published_workflow(workflow_version)
+    except Exception as error:
+        raise AnalysisProductError(
+            "WORKFLOW_PACKAGE_NOT_RUNNABLE",
+            str(error),
+        ) from error
+    method_values = {
+        item.value for item in WorkflowPackageAttestation.VerificationMethod
+    }
+    if verification_method not in method_values:
+        raise AnalysisProductError(
+            "WORKFLOW_PACKAGE_VERIFICATION_METHOD_INVALID",
+            "工作流包验证方式无效。",
+        )
+    digest_values = [source_digest, statement_digest]
+    if verification_method == WorkflowPackageAttestation.VerificationMethod.SIGSTORE:
+        digest_values.append(signature_bundle_digest)
+    if not all(SHA256_PATTERN.fullmatch(item) for item in digest_values):
+        raise AnalysisProductError(
+            "WORKFLOW_PACKAGE_DIGEST_INVALID",
+            "工作流包证明中的 digest 必须是 sha256。",
+        )
+    if source_digest != current_source_digest:
+        raise AnalysisProductError(
+            "WORKFLOW_PACKAGE_SOURCE_CHANGED",
+            "工作流包证明与 WorkflowVersion 固定源码摘要不一致。",
+        )
+    normalized_identity = str(signer_identity or "").strip()
+    if not normalized_identity or len(normalized_identity) > 512:
+        raise AnalysisProductError(
+            "WORKFLOW_PACKAGE_SIGNER_INVALID",
+            "工作流包签名身份不能为空且不能超过 512 字符。",
+        )
+    normalized_actor = (str(actor or "deployment").strip() or "deployment")[:256]
+
+    with transaction.atomic():
+        WorkflowVersion.objects.select_for_update().get(pk=workflow_version.pk)
+        existing = WorkflowPackageAttestation.objects.filter(
+            workflow_version=workflow_version
+        ).first()
+        expected = {
+            "verification_method": verification_method,
+            "source_digest": source_digest,
+            "statement_digest": statement_digest,
+            "signature_bundle_digest": signature_bundle_digest,
+            "signer_identity": normalized_identity,
+            "verified_by": normalized_actor,
+        }
+        if existing is not None:
+            evidence = {
+                key: value for key, value in expected.items() if key != "verified_by"
+            }
+            if all(getattr(existing, key) == value for key, value in evidence.items()):
+                return existing, False
+            raise AnalysisProductError(
+                "WORKFLOW_PACKAGE_ATTESTATION_CONFLICT",
+                "该 WorkflowVersion 已绑定其他不可变工作流包证明。",
+            )
+        item = WorkflowPackageAttestation.objects.create(
+            workflow_version=workflow_version,
+            **expected,
+        )
+    return item, True
+
+
 def publish_analysis_product_version(
     product: AnalysisProduct,
     *,
@@ -153,6 +255,14 @@ def publish_analysis_product_version(
     source_digest, interface_contract, contract_digest = snapshot_workflow_contract(
         workflow_version
     )
+    if (
+        settings.INTEGRATION_REQUIRE_SIGNED_WORKFLOW_PACKAGE
+        and not workflow_package_attestation_is_current(workflow_version)
+    ):
+        raise AnalysisProductError(
+            "WORKFLOW_PACKAGE_ATTESTATION_REQUIRED",
+            "当前部署只允许发布已验证签名包的 WorkflowVersion。",
+        )
 
     with transaction.atomic():
         locked_product = AnalysisProduct.objects.select_for_update().get(pk=product.pk)

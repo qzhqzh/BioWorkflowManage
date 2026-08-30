@@ -40,6 +40,27 @@ jobs:
       - name: Validate generated WDL syntax
         run: uv run python scripts/miniwdl_runtime.py check
 
+      - name: Validate Analysis Node product Compose profiles
+        env:
+          ANALYSIS_NODE_ENV_FILE: .env.example
+        run: |
+          docker compose \
+            --project-directory deploy/analysis-node \
+            --env-file deploy/analysis-node/.env.example \
+            --env-file deploy/analysis-node/images.env.example \
+            -f deploy/analysis-node/compose.yml \
+            --profile headless \
+            --profile isolated-runtime \
+            config --quiet
+          docker compose \
+            --project-directory deploy/analysis-node \
+            --env-file deploy/analysis-node/.env.example \
+            --env-file deploy/analysis-node/images.env.example \
+            -f deploy/analysis-node/compose.yml \
+            --profile console \
+            --profile host-runtime \
+            config --quiet
+
   miniwdl-runtime-smoke:
     name: miniwdl isolated runtime smoke
     runs-on: ubuntu-latest
@@ -87,7 +108,7 @@ jobs:
         run: uv sync --frozen
 
       - name: Lint backend
-        run: uvx --from ruff==0.15.14 ruff check backend scripts/miniwdl_runtime.py
+        run: uvx --from ruff==0.15.14 ruff check backend scripts deploy/analysis-node/lib
 
       - name: Run backend tests
         run: uv run pytest backend/tests
@@ -142,6 +163,7 @@ jobs:
           backend/tests/test_object_inputs.py::test_postgresql_cache_gc_waits_for_object_backed_run_creation
           backend/tests/test_artifact_exports.py::test_postgresql_artifact_export_claim_and_lease_fencing
           backend/tests/test_artifact_exports.py::test_cleanup_claim_skips_more_than_fifty_blocked_retention_rows
+          backend/tests/test_integration_api.py::test_analysis_product_preflight_and_submission_pin_contract
 
   frontend:
     name: Frontend quality gates
@@ -174,6 +196,113 @@ jobs:
 
       - name: Build frontend
         run: bun run build
+
+  analysis-node-headless:
+    name: Analysis Node headless API smoke
+    runs-on: ubuntu-latest
+    needs: [contracts-and-golden, backend]
+    timeout-minutes: 25
+    env:
+      POSTGRES_PASSWORD: "ci-database-password"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare isolated delivery configuration
+        run: |
+          cp deploy/analysis-node/.env.example deploy/analysis-node/.env
+          cp deploy/analysis-node/images.env.example deploy/analysis-node/images.env
+          ci_root="$RUNNER_TEMP/analysis-node-ci"
+          worker_uid=$(id -u)
+          worker_gid=$(id -g)
+          sed -i \
+            -e 's/^ANALYSIS_NODE_VERSION=.*/ANALYSIS_NODE_VERSION=0.0.0-ci/' \
+            -e 's/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=ci-database-password/' \
+            -e 's/^DJANGO_SECRET_KEY=.*/DJANGO_SECRET_KEY=ci-django-secret-key-with-32-characters/' \
+            -e 's/^WEBHOOK_SIGNING_KEY=.*/WEBHOOK_SIGNING_KEY=ci-webhook-signing-key-with-32-characters/' \
+            -e 's/^ANALYSIS_MIN_AVAILABLE_MEMORY_GB=.*/ANALYSIS_MIN_AVAILABLE_MEMORY_GB=0/' \
+            -e "s#^MINIWDL_UID=.*#MINIWDL_UID=$worker_uid#" \
+            -e "s#^MINIWDL_GID=.*#MINIWDL_GID=$worker_gid#" \
+            -e "s#/opt/analysis-node/data#$ci_root/data#g" \
+            -e "s#/opt/analysis-node-backups#$ci_root/backups#g" \
+            -e "s#/opt/analysis-node/secrets#$ci_root/secrets#g" \
+            deploy/analysis-node/.env
+          chmod 0600 deploy/analysis-node/.env
+          sed -i 's/:1.0.0$/:0.0.0-ci/' deploy/analysis-node/images.env
+          deploy/analysis-node/bin/analysis-node init
+
+      - name: Build and stage fixed local images
+        run: |
+          pull_image() {
+            local image=$1
+            for attempt in 1 2 3; do
+              if docker pull "$image"; then
+                return 0
+              fi
+              sleep $((attempt * 5))
+            done
+            return 1
+          }
+          docker build \
+            --file Dockerfile.backend \
+            --build-arg ANALYSIS_NODE_VERSION=0.0.0-ci \
+            --build-arg GIT_REVISION="$GITHUB_SHA" \
+            --tag bioworkflowmanage/backend:0.0.0-ci .
+          pull_image m.daocloud.io/docker.io/library/postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+          pull_image m.daocloud.io/docker.io/library/nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
+          pull_image m.daocloud.io/docker.io/library/docker:27.5.1-dind@sha256:aa3df78ecf320f5fafdce71c659f1629e96e9de0968305fe1de670e0ca9176ce
+          pull_image m.daocloud.io/docker.io/library/python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
+          docker tag m.daocloud.io/docker.io/library/postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193 bioworkflowmanage/postgres:0.0.0-ci
+          docker tag m.daocloud.io/docker.io/library/nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10 bioworkflowmanage/gateway:0.0.0-ci
+          docker tag m.daocloud.io/docker.io/library/docker:27.5.1-dind@sha256:aa3df78ecf320f5fafdce71c659f1629e96e9de0968305fe1de670e0ca9176ce bioworkflowmanage/dind:0.0.0-ci
+          docker tag m.daocloud.io/docker.io/library/python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de bioworkflowmanage/smoke-task:0.0.0-ci
+
+      - name: Start source-built Headless Analysis Node
+        run: |
+          docker compose \
+            --project-directory deploy/analysis-node \
+            --env-file deploy/analysis-node/.env \
+            --env-file deploy/analysis-node/images.env \
+            -f deploy/analysis-node/compose.yml \
+            --profile headless \
+            --profile isolated-runtime \
+            run --rm backend python backend/manage.py migrate --noinput
+          docker compose \
+            --project-directory deploy/analysis-node \
+            --env-file deploy/analysis-node/.env \
+            --env-file deploy/analysis-node/images.env \
+            -f deploy/analysis-node/compose.yml \
+            --profile headless \
+            --profile isolated-runtime \
+            up -d --wait
+          docker image save bioworkflowmanage/smoke-task:0.0.0-ci | \
+            docker compose \
+              --project-directory deploy/analysis-node \
+              --env-file deploy/analysis-node/.env \
+              --env-file deploy/analysis-node/images.env \
+              -f deploy/analysis-node/compose.yml \
+              --profile headless \
+              --profile isolated-runtime \
+              exec -T miniwdl-docker docker load
+
+      - name: Submit and complete a real Analysis Product through the API
+        run: deploy/analysis-node/bin/analysis-node smoke --timeout 600
+
+      - name: Show product service logs on failure
+        if: failure()
+        run: >-
+          docker compose
+          --project-directory deploy/analysis-node
+          --env-file deploy/analysis-node/.env
+          --env-file deploy/analysis-node/images.env
+          -f deploy/analysis-node/compose.yml
+          --profile headless
+          --profile isolated-runtime
+          logs --no-color
+
+      - name: Stop Analysis Node without deleting data
+        if: always()
+        run: deploy/analysis-node/bin/analysis-node down
 
   end-to-end:
     name: Docker Compose browser smoke tests

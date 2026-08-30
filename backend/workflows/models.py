@@ -58,6 +58,17 @@ class AnalysisProductVersionQuerySet(models.QuerySet):
         raise ValidationError("AnalysisProductVersion snapshots cannot be deleted.")
 
 
+class WorkflowPackageAttestationQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        raise ValidationError("WorkflowPackageAttestation snapshots cannot be updated.")
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        raise ValidationError("WorkflowPackageAttestation snapshots cannot be updated.")
+
+    def delete(self):
+        raise ValidationError("WorkflowPackageAttestation snapshots cannot be deleted.")
+
+
 class IntegrationOutboxEventQuerySet(models.QuerySet):
     def update(self, **kwargs):
         raise ValidationError("IntegrationOutboxEvent snapshots cannot be updated.")
@@ -363,6 +374,52 @@ class WorkflowVersion(ImmutableSnapshot):
                 fields=["workflow", "version"],
                 name="unique_workflow_version",
             )
+        ]
+
+
+class WorkflowPackageAttestation(ImmutableSnapshot):
+    """Immutable evidence binding a verified package to one WorkflowVersion."""
+
+    class VerificationMethod(models.TextChoices):
+        SIGSTORE = "sigstore", "Sigstore"
+        BUNDLED = "bundled", "Signed application bundle"
+
+    workflow_version = models.OneToOneField(
+        WorkflowVersion,
+        on_delete=models.PROTECT,
+        related_name="package_attestation",
+    )
+    verification_method = models.CharField(
+        max_length=16,
+        choices=VerificationMethod.choices,
+    )
+    source_digest = models.CharField(max_length=80)
+    statement_digest = models.CharField(max_length=80)
+    signature_bundle_digest = models.CharField(max_length=80, blank=True)
+    signer_identity = models.CharField(max_length=512)
+    verified_by = models.CharField(max_length=256)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    objects = WorkflowPackageAttestationQuerySet.as_manager()
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    ~models.Q(source_digest="")
+                    & ~models.Q(statement_digest="")
+                    & ~models.Q(signer_identity="")
+                ),
+                name="workflow_package_attestation_has_evidence",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(verification_method="bundled")
+                    | ~models.Q(signature_bundle_digest="")
+                ),
+                name="workflow_package_sigstore_has_bundle",
+            ),
         ]
 
 

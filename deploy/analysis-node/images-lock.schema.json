@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/qzhqzh/BioWorkflowManage/deploy/analysis-node/images-lock.schema.json",
+  "title": "BioWorkflowManage Analysis Node image lock",
+  "type": "object",
+  "required": ["schema_version", "product_version", "platform", "images"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "product_version": {"type": "string", "minLength": 1},
+    "platform": {"const": "linux/amd64"},
+    "images": {
+      "type": "object",
+      "required": ["backend", "frontend", "postgres", "gateway", "dind", "smoke-task"],
+      "additionalProperties": false,
+      "patternProperties": {
+        "^(backend|frontend|postgres|gateway|dind|smoke-task)$": {
+          "type": "object",
+          "required": ["local_ref", "source_ref", "image_id"],
+          "properties": {
+            "local_ref": {"type": "string", "minLength": 1},
+            "source_ref": {"type": "string", "pattern": "@sha256:[0-9a-f]{64}$"},
+            "image_id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+          },
+          "additionalProperties": false
+        }
+      }
+    }
+  },
+  "additionalProperties": false
+}
