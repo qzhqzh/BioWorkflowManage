@@ -524,6 +524,34 @@ def test_analysis_node_bundle_builder_requires_digest_pinned_sources():
         )
 
 
+def test_reference_connector_source_compose_is_host_reachable():
+    source = PROJECT_ROOT / "examples" / "reference_connector"
+    direct_config = json.loads(
+        (source / "config.example.json").read_text(encoding="utf-8")
+    )
+    config = json.loads(
+        (source / "config.compose.example.json").read_text(encoding="utf-8")
+    )
+    offline_config = json.loads(
+        (source / "config.offline.example.json").read_text(encoding="utf-8")
+    )
+    compose = (source / "compose.example.yml").read_text(encoding="utf-8")
+
+    assert direct_config["listen"]["host"] == "127.0.0.1"
+    assert direct_config["state"] == {
+        "database": "state/connector.sqlite3",
+        "result_directory": "results",
+    }
+    assert config["listen"]["host"] == "0.0.0.0"
+    assert config["state"]["database"].startswith("/var/lib/reference-connector/")
+    assert offline_config["listen"]["host"] == "127.0.0.1"
+    assert offline_config["state"]["database"].startswith(
+        "/var/lib/reference-connector/"
+    )
+    assert '"127.0.0.1:8090:8090"' in compose
+    assert "./config.compose.json:/etc/reference-connector/config.json:ro" in compose
+
+
 def test_analysis_node_bundle_builder_renders_versioned_offline_contract(
     monkeypatch,
     tmp_path,
@@ -583,6 +611,23 @@ def test_analysis_node_bundle_builder_renders_versioned_offline_contract(
         package / ".env.example"
     ).read_text(encoding="utf-8")
     assert not (package / ".env").exists()
+    assert (package / "reference-connector" / "Dockerfile").is_file()
+    assert (
+        package / "reference-connector" / "reference_connector" / "__main__.py"
+    ).is_file()
+    assert (
+        package / "reference-connector" / "INTEGRATION-GUIDE.md"
+    ).is_file()
+    assert "../examples/reference_connector/" not in (
+        package / "20-reference-connector.md"
+    ).read_text(encoding="utf-8")
+    assert "../examples/reference_connector/" not in (
+        package / "reference-connector" / "INTEGRATION-GUIDE.md"
+    ).read_text(encoding="utf-8")
+    assert not any(
+        path.name in {".env", "config.json", "connector.sqlite3"}
+        for path in (package / "reference-connector").rglob("*")
+    )
     assert all(
         b"must-not-ship" not in path.read_bytes()
         for path in package.rglob("*")

@@ -1,0 +1,45 @@
+{
+  "schema_version": "1.0.0",
+  "listen": {
+    "host": "127.0.0.1",
+    "port": 8090,
+    "max_request_bytes": 1048576
+  },
+  "analysis_api": {
+    "base_url": "http://127.0.0.1:8082/api/v1/integration",
+    "timeout_seconds": 15,
+    "recovery_attempts": 2,
+    "max_download_bytes": 67108864
+  },
+  "state": {
+    "database": "state/connector.sqlite3",
+    "result_directory": "results"
+  },
+  "mapping": {
+    "schema_version": "1.0.0",
+    "client_id": "mes-reference",
+    "analysis_product": {
+      "analysis_code": "analysis-node-smoke",
+      "contract_version": "1.0.0"
+    },
+    "fields": {
+      "external_run_id": "order.execution_id",
+      "external_analysis_id": "order.analysis_id",
+      "sample_id": "sample.code"
+    },
+    "inputs": {
+      "probe": {
+        "path": "files.probe",
+        "kind": "managed_file",
+        "root_alias": "rawdata"
+      }
+    },
+    "metadata": {
+      "purpose": {
+        "path": "metadata.purpose",
+        "required": true
+      }
+    },
+    "database": {}
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "order": {
+    "execution_id": "MES-ANALYSIS-NODE-SMOKE-001",
+    "analysis_id": "ANALYSIS-NODE-SMOKE-001"
+  },
+  "sample": {
+    "code": "analysis-node-smoke"
+  },
+  "files": {
+    "probe": ".reference-connector-smoke/probe.txt"
+  },
+  "metadata": {
+    "purpose": "reference-connector-clean-node-smoke"
+  }
+}

@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "BioWorkflowManage Integration API",
-    "version": "1.4.0",
+    "version": "1.5.0",
     "description": "第三方 MES、运营平台、报告系统与 AI Agent 使用的固定分析产品、Task 测试、异步结果导出及资产查询接口。所有写操作均受 Service Token scope、可移植输入引用、幂等键和审计约束。"
   },
   "servers": [{"url": "/api/v1/integration"}],
@@ -66,7 +66,7 @@
         "summary": "预检固定分析产品或 WorkflowVersion 和可移植输入，不创建运行",
         "x-required-scope": "analysis:submit",
         "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AnalysisPreflight"}}}},
-        "responses": {"200": {"description": "预检通过"}, "400": {"$ref": "#/components/responses/Error"}, "403": {"$ref": "#/components/responses/Error"}, "404": {"$ref": "#/components/responses/Error"}, "409": {"$ref": "#/components/responses/Error"}, "413": {"$ref": "#/components/responses/Error"}, "503": {"$ref": "#/components/responses/Error"}}
+        "responses": {"200": {"description": "预检通过", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AnalysisPreflightResult"}}}}, "400": {"$ref": "#/components/responses/Error"}, "403": {"$ref": "#/components/responses/Error"}, "404": {"$ref": "#/components/responses/Error"}, "409": {"$ref": "#/components/responses/Error"}, "413": {"$ref": "#/components/responses/Error"}, "503": {"$ref": "#/components/responses/Error"}}
       }
     },
     "/analysis-runs": {
@@ -83,7 +83,7 @@
         "x-required-scope": "analysis:submit",
         "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}, {"$ref": "#/components/parameters/RequestId"}],
         "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AnalysisSubmission"}}}},
-        "responses": {"201": {"description": "创建运行", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AnalysisRun"}}}}, "200": {"description": "幂等重放"}, "400": {"$ref": "#/components/responses/Error"}, "403": {"$ref": "#/components/responses/Error"}, "404": {"$ref": "#/components/responses/Error"}, "409": {"$ref": "#/components/responses/Error"}, "413": {"$ref": "#/components/responses/Error"}, "503": {"$ref": "#/components/responses/Error"}}
+        "responses": {"201": {"description": "创建运行", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AnalysisRun"}}}}, "200": {"description": "幂等重放", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AnalysisRun"}}}}, "400": {"$ref": "#/components/responses/Error"}, "403": {"$ref": "#/components/responses/Error"}, "404": {"$ref": "#/components/responses/Error"}, "409": {"$ref": "#/components/responses/Error"}, "413": {"$ref": "#/components/responses/Error"}, "503": {"$ref": "#/components/responses/Error"}}
       }
     },
     "/analysis-runs/by-external-ref": {
@@ -92,7 +92,7 @@
         "summary": "响应丢失后按 external_run_id 找回运行",
         "x-required-scope": "analysis:read",
         "parameters": [{"name": "external_run_id", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 128}}],
-        "responses": {"200": {"description": "运行"}, "404": {"$ref": "#/components/responses/Error"}}
+        "responses": {"200": {"description": "运行", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AnalysisRun"}}}}, "404": {"$ref": "#/components/responses/Error"}}
       }
     },
     "/analysis-runs/batch-status": {
@@ -147,7 +147,7 @@
         "summary": "读取语义化输出清单",
         "x-required-scope": "analysis:read",
         "parameters": [{"$ref": "#/components/parameters/RunId"}],
-        "responses": {"200": {"description": "按单项公开的输出清单；incomplete 清单中的已验证 File 仍可下载"}}
+        "responses": {"200": {"description": "按单项公开的输出清单；incomplete 清单中的已验证 File 仍可下载", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AnalysisOutputList"}}}}}
       }
     },
     "/analysis-runs/{run_id}/outputs/download": {
@@ -445,6 +445,21 @@
           "metadata": {"type": "object", "additionalProperties": true}
         }
       },
+      "AnalysisPreflightResult": {
+        "type": "object",
+        "required": ["ready", "submission_allowed", "waiting_for", "workflow", "analysis_product", "checks", "resource_manifest", "output_contract", "metadata"],
+        "properties": {
+          "ready": {"type": "boolean"},
+          "submission_allowed": {"type": "boolean"},
+          "waiting_for": {"type": "array", "items": {"type": "string"}},
+          "workflow": {"type": "object"},
+          "analysis_product": {"oneOf": [{"type": "object"}, {"type": "null"}]},
+          "checks": {"type": "array", "items": {"type": "object"}},
+          "resource_manifest": {"type": "object"},
+          "output_contract": {"type": "array", "items": {"type": "object"}},
+          "metadata": {"type": "object"}
+        }
+      },
       "ToolTestPreflight": {
         "type": "object",
         "required": ["tool", "inputs"],
@@ -465,9 +480,10 @@
       },
       "AnalysisRun": {
         "type": "object",
-        "required": ["id", "external_ref", "status", "status_version", "execution_status", "output_status"],
+        "required": ["id", "request_digest", "external_ref", "status", "status_version", "execution_status", "output_status"],
         "properties": {
           "id": {"type": "string", "format": "uuid"},
+          "request_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
           "external_ref": {"$ref": "#/components/schemas/ExternalRef"},
           "analysis_product": {"oneOf": [{"$ref": "#/components/schemas/AnalysisProductRunRef"}, {"type": "null"}]},
           "status": {"type": "string", "enum": ["queued", "preparing", "running", "cancel_requested", "succeeded", "failed", "canceled"]},
@@ -486,6 +502,41 @@
         "properties": {
           "view": {"type": "string", "const": "summary"},
           "results": {"type": "array", "maxItems": 200, "items": {"$ref": "#/components/schemas/AnalysisRun"}}
+        }
+      },
+      "AnalysisOutputItem": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["key", "name", "semantic_type", "wdl_type", "required", "kind"],
+        "properties": {
+          "key": {"type": "string"},
+          "name": {"type": "string"},
+          "label": {"type": "string"},
+          "semantic_type": {"type": "string"},
+          "wdl_type": {"type": "string"},
+          "required": {"type": "boolean"},
+          "kind": {"type": "string", "enum": ["file", "directory", "value", "unverifiable"]},
+          "reason": {"type": "string"},
+          "filename": {"type": "string"},
+          "size": {"type": "integer", "minimum": 0},
+          "content_type": {"type": "string"},
+          "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+          "entry_count": {"type": "integer", "minimum": 0},
+          "digest": {"type": "string"},
+          "value": {},
+          "download_url": {"type": "string"}
+        }
+      },
+      "AnalysisOutputList": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["run_id", "execution_status", "output_status", "error", "results"],
+        "properties": {
+          "run_id": {"type": "string", "format": "uuid"},
+          "execution_status": {"type": "string", "enum": ["queued", "preparing", "running", "cancel_requested", "succeeded", "failed", "canceled"]},
+          "output_status": {"type": "string", "enum": ["pending", "complete", "incomplete", "unavailable"]},
+          "error": {"oneOf": [{"$ref": "#/components/schemas/Error"}, {"type": "null"}]},
+          "results": {"type": "array", "items": {"$ref": "#/components/schemas/AnalysisOutputItem"}}
         }
       },
       "ArtifactExportRequest": {

@@ -1948,6 +1948,7 @@ def integration_run_payload(
     output_status = _integration_output_status(run)
     return {
         "id": str(run.id),
+        "request_digest": run.request_digest,
         "external_ref": {
             "client_id": run.service_account.client_id,
             "external_run_id": run.external_run_id,

@@ -256,3 +256,9 @@ WorkflowVersion，不能覆盖既有证明。
 
 完整请求、幂等、状态机、Webhook、结果清单和 MCP 契约见
 [第三方分析投递 API 与 MCP](14-integration-api-and-mcp.md)。
+
+离线交付包同时包含可选的 `reference-connector/`：它提供零第三方运行时依赖的 Python Connector、
+独立容器配置、Python/Java 调用示例、curl/Postman 资产和契约兼容性说明。需要把客户 MES 字段映射、
+超时找回、事件去重与结果摘要回执落到可运行组件时，按
+[Reference Connector 与 MES 兼容性套件](20-reference-connector.md)部署；客户私有映射仍保留在
+Connector，不进入 Analysis Node 核心。
