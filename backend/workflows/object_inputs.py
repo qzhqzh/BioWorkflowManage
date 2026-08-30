@@ -1735,6 +1735,18 @@ def stage_run_object_inputs(run: AnalysisRun, *, checkpoint=None) -> int:
                         temporary_directory=temporary_directory,
                         checkpoint=checkpoint,
                     )
+            for item in items:
+                _refresh_staging_lease(lease, run)
+                remaining = run_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ObjectInputError(
+                        "OBJECT_INPUT_STAGE_TIMEOUT",
+                        "任务对象输入暂存超过总时间上限。",
+                        retryable=True,
+                    )
+                with _hard_timeout(
+                    min(float(settings.ANALYSIS_OBJECT_STAGE_TIMEOUT_SECONDS), remaining)
+                ):
                     evidence = _validate_staged_semantic(item, checkpoint=checkpoint)
                     if evidence is not None:
                         sequence = item.get("input_sequence")

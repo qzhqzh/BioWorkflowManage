@@ -1203,6 +1203,7 @@ def test_s3_reference_with_surrogate_key_returns_stable_validation_error(
     [
         ("invalid-gzip", "FASTQ_GZIP_INVALID"),
         ("mismatched-pair", "FASTQ_PAIR_MISMATCH"),
+        ("reused-identity", "FASTQ_MATE_INVALID"),
     ],
 )
 def test_s3_stage_validates_remote_fastq_content(
@@ -1214,19 +1215,28 @@ def test_s3_stage_validates_remote_fastq_content(
     _, _, _, client = _token_client()
     version = _workflow_version()
     read1 = b"not-a-gzip-stream" if case == "invalid-gzip" else _fastq_bytes(1)
-    read2 = _fastq_bytes(
-        2,
-        read_id="different-read" if case == "mismatched-pair" else "read-001",
+    read2 = (
+        read1
+        if case == "reused-identity"
+        else _fastq_bytes(
+            2,
+            read_id="different-read" if case == "mismatched-pair" else "read-001",
+        )
+    )
+    read2_key = (
+        "incoming/S001_R1.fastq.gz"
+        if case == "reused-identity"
+        else "incoming/S001_R2.fastq.gz"
     )
     objects = {
         "incoming/S001_R1.fastq.gz": read1,
-        "incoming/S001_R2.fastq.gz": read2,
+        read2_key: read2,
     }
     _write_object_profile(Path(settings.ANALYSIS_OBJECT_STORAGE_PROFILE_DIR))
     body = _submission(version, external_run_id=f"remote-fastq-{case}")
     body["inputs"] = {
         "read1": _object_reference(read1, key="incoming/S001_R1.fastq.gz"),
-        "read2": _object_reference(read2, key="incoming/S001_R2.fastq.gz"),
+        "read2": _object_reference(read2, key=read2_key),
     }
     fake_client = _FakeS3Client(objects)
     with (
@@ -1253,6 +1263,8 @@ def test_s3_stage_validates_remote_fastq_content(
         stage_run_object_inputs(run)
 
     assert caught.value.code == expected_code
+    if case == "reused-identity":
+        assert len(fake_client.get_calls) == 1
 
 
 @pytest.mark.django_db
