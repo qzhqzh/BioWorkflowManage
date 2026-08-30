@@ -36,6 +36,11 @@ from .analysis_runtime import (
     _failure_metadata,
     _verify_run_resource_manifests,
 )
+from .analysis_products import (
+    AnalysisProductError,
+    analysis_product_version_is_current,
+    normalize_contract_version,
+)
 from .auth_permissions import (
     IntegrationScopePermission,
     ServicePrincipal,
@@ -56,6 +61,7 @@ from .integration_outputs import (
     public_output_manifest,
 )
 from .models import (
+    AnalysisProductVersion,
     AnalysisRun,
     AnalysisRunEvent,
     ServiceAccount,
@@ -150,6 +156,8 @@ def _actor(request) -> str:
 def _visible_runs(request):
     queryset = AnalysisRun.objects.select_related(
         "service_account",
+        "analysis_product_version",
+        "analysis_product_version__product",
         "workflow_version",
         "workflow_version__workflow",
         "tool_version",
@@ -295,6 +303,80 @@ def _workflow_version_payload(version: WorkflowVersion) -> dict[str, Any]:
     }
 
 
+def _analysis_product_reference(item: AnalysisProductVersion) -> dict[str, Any]:
+    return {
+        "analysis_code": item.product.code,
+        "contract_version": item.contract_version,
+        "contract_digest": item.contract_digest,
+    }
+
+
+def _analysis_product_version_payload(
+    item: AnalysisProductVersion,
+) -> dict[str, Any]:
+    workflow = _workflow_version_payload(item.workflow_version)
+    snapshot_current = analysis_product_version_is_current(item)
+    interface_contract = (
+        item.interface_contract if isinstance(item.interface_contract, dict) else {}
+    )
+    blockers = list(workflow["blockers"])
+    if not item.product.is_active:
+        blockers.insert(0, "分析产品已停用。")
+    if not snapshot_current:
+        blockers.append("分析产品契约与固定 WorkflowVersion 快照不一致。")
+    return {
+        **_analysis_product_reference(item),
+        "name": item.product.name,
+        "description": item.product.description,
+        "active": item.product.is_active,
+        "workflow": {
+            "source_type": "workflow_version",
+            "version_id": item.workflow_version_id,
+            "slug": item.workflow_version.workflow.slug,
+            "version": item.workflow_version.version,
+            "source_digest": item.source_digest,
+        },
+        "interface": interface_contract,
+        "input_contract": interface_contract.get("inputs", []),
+        "output_contract": interface_contract.get("outputs", []),
+        "ready": item.product.is_active and snapshot_current and workflow["ready"],
+        "blockers": blockers,
+        "created_at": item.created_at,
+    }
+
+
+def _validate_workflow_version_ready(version: WorkflowVersion) -> WorkflowVersion:
+    try:
+        _compile_published_workflow(version)
+    except Exception as error:
+        raise IntegrationAPIError(
+            "WORKFLOW_VERSION_NOT_RUNNABLE",
+            str(error),
+            category="workflow",
+            details={"blockers": _workflow_version_payload(version)["blockers"]},
+        ) from error
+    outputs = version.interface_contract.get("outputs")
+    if not isinstance(outputs, list) or not outputs:
+        raise IntegrationAPIError(
+            "OUTPUT_CONTRACT_MISSING",
+            "WorkflowVersion 没有声明语义化输出契约。",
+            category="workflow",
+        )
+    invalid_outputs = [
+        item.get("name") if isinstance(item, dict) else "<invalid>"
+        for item in outputs
+        if not _output_semantic_ready(item)
+    ]
+    if invalid_outputs:
+        raise IntegrationAPIError(
+            "OUTPUT_CONTRACT_INVALID",
+            "WorkflowVersion 输出缺少 semantic_type。",
+            category="workflow",
+            details={"outputs": invalid_outputs},
+        )
+    return version
+
+
 def _fixed_workflow(value: Any) -> WorkflowVersion:
     if not isinstance(value, dict) or value.get("source_type") != "workflow_version":
         raise IntegrationAPIError(
@@ -341,35 +423,97 @@ def _fixed_workflow(value: Any) -> WorkflowVersion:
             details={"expected": expected, "actual": version.compiled_digest},
             http_status=status.HTTP_409_CONFLICT,
         )
-    try:
-        _compile_published_workflow(version)
-    except Exception as error:
+    return _validate_workflow_version_ready(version)
+
+
+def _validate_analysis_product_version_ready(
+    item: AnalysisProductVersion,
+) -> AnalysisProductVersion:
+    if not item.product.is_active:
         raise IntegrationAPIError(
-            "WORKFLOW_VERSION_NOT_RUNNABLE",
+            "ANALYSIS_PRODUCT_INACTIVE",
+            "分析产品已停用，不能创建新任务。",
+            category="workflow",
+            details=_analysis_product_reference(item),
+            http_status=status.HTTP_409_CONFLICT,
+        )
+    if not analysis_product_version_is_current(item):
+        raise IntegrationAPIError(
+            "ANALYSIS_PRODUCT_SNAPSHOT_CHANGED",
+            "分析产品契约与固定 WorkflowVersion 快照不一致。",
+            category="workflow",
+            details=_analysis_product_reference(item),
+            http_status=status.HTTP_409_CONFLICT,
+        )
+    _validate_workflow_version_ready(item.workflow_version)
+    return item
+
+
+def _fixed_analysis_product(value: Any) -> AnalysisProductVersion:
+    if not isinstance(value, dict):
+        raise IntegrationAPIError(
+            "ANALYSIS_PRODUCT_REQUIRED",
+            "analysis_product 必须是 JSON object。",
+            category="workflow",
+        )
+    analysis_code = str(value.get("analysis_code") or "").strip().lower()
+    if not analysis_code or len(analysis_code) > 128:
+        raise IntegrationAPIError(
+            "ANALYSIS_PRODUCT_CODE_REQUIRED",
+            "必须指定 analysis_product.analysis_code。",
+            category="workflow",
+        )
+    try:
+        contract_version = normalize_contract_version(value.get("contract_version"))
+    except AnalysisProductError as error:
+        raise IntegrationAPIError(
+            error.code,
             str(error),
             category="workflow",
-            details={"blockers": _workflow_version_payload(version)["blockers"]},
         ) from error
-    outputs = version.interface_contract.get("outputs")
-    if not isinstance(outputs, list) or not outputs:
+    item = (
+        AnalysisProductVersion.objects.select_related(
+            "product",
+            "workflow_version",
+            "workflow_version__workflow",
+        )
+        .filter(
+            product__code=analysis_code,
+            contract_version=contract_version,
+        )
+        .first()
+    )
+    if item is None:
         raise IntegrationAPIError(
-            "OUTPUT_CONTRACT_MISSING",
-            "WorkflowVersion 没有声明语义化输出契约。",
+            "ANALYSIS_PRODUCT_VERSION_NOT_FOUND",
+            "分析产品或 contract_version 不存在。",
+            category="workflow",
+            http_status=status.HTTP_404_NOT_FOUND,
+        )
+    return _validate_analysis_product_version_ready(item)
+
+
+def _analysis_source(
+    body: dict[str, Any],
+) -> tuple[WorkflowVersion, AnalysisProductVersion | None]:
+    has_workflow = "workflow" in body
+    has_product = "analysis_product" in body
+    if has_workflow and has_product:
+        raise IntegrationAPIError(
+            "ANALYSIS_SOURCE_CONFLICT",
+            "workflow 与 analysis_product 只能指定一个。",
             category="workflow",
         )
-    invalid_outputs = [
-        item.get("name") if isinstance(item, dict) else "<invalid>"
-        for item in outputs
-        if not _output_semantic_ready(item)
-    ]
-    if invalid_outputs:
-        raise IntegrationAPIError(
-            "OUTPUT_CONTRACT_INVALID",
-            "WorkflowVersion 输出缺少 semantic_type。",
-            category="workflow",
-            details={"outputs": invalid_outputs},
-        )
-    return version
+    if has_product:
+        item = _fixed_analysis_product(body.get("analysis_product"))
+        return item.workflow_version, item
+    if has_workflow:
+        return _fixed_workflow(body.get("workflow")), None
+    raise IntegrationAPIError(
+        "ANALYSIS_SOURCE_REQUIRED",
+        "必须指定固定 workflow 或 analysis_product。",
+        category="workflow",
+    )
 
 
 def _split_pair_type(value: str) -> tuple[str, str] | None:
@@ -1328,7 +1472,7 @@ def _workflow_output_contract(version: WorkflowVersion) -> list[dict[str, Any]]:
 
 
 def _preflight_workflow(body: dict[str, Any]) -> dict[str, Any]:
-    version = _fixed_workflow(body.get("workflow"))
+    version, product_version = _analysis_source(body)
     workflow_name = str(version.workflow_graph.get("id") or version.workflow.slug)
     snapshot_budget = ResourceSnapshotBudget()
     input_values, manifests, content_checks = _prepare_contract_inputs(
@@ -1358,6 +1502,12 @@ def _preflight_workflow(body: dict[str, Any]) -> dict[str, Any]:
     resource_ready = available is None or available >= minimum_gb * 1024**3
     return {
         "workflow_version": version,
+        "analysis_product_version": product_version,
+        "analysis_product": (
+            _analysis_product_version_payload(product_version)
+            if product_version is not None
+            else None
+        ),
         "workflow": _workflow_version_payload(version),
         "input_values": input_values,
         "manifests": manifests,
@@ -1529,6 +1679,11 @@ def integration_run_payload(
             "external_run_id": run.external_run_id,
             "external_analysis_id": run.external_analysis_id,
         },
+        "analysis_product": (
+            _analysis_product_reference(run.analysis_product_version)
+            if run.analysis_product_version_id
+            else None
+        ),
         "run_kind": run.run_kind,
         "workflow": source,
         "status": run.status,
@@ -1562,6 +1717,8 @@ def _find_idempotent_run(
     matches = list(
         AnalysisRun.objects.select_related(
             "service_account",
+            "analysis_product_version",
+            "analysis_product_version__product",
             "workflow_version",
             "workflow_version__workflow",
             "tool_version",
@@ -1593,6 +1750,44 @@ def _idempotent_response(request, run: AnalysisRun, digest: str) -> Response:
     response = Response(integration_run_payload(run), status=status.HTTP_200_OK)
     response["Idempotency-Replayed"] = "true"
     return response
+
+
+@require_service_scopes("workflow:read")
+@api_view(["GET"])
+@permission_classes([IntegrationScopePermission])
+def integration_analysis_products(request):
+    versions = (
+        AnalysisProductVersion.objects.select_related(
+            "product",
+            "workflow_version",
+            "workflow_version__workflow",
+        )
+        .filter(product__is_active=True)
+        .order_by("product__code", "contract_version")
+    )
+    return Response(
+        {"results": [_analysis_product_version_payload(item) for item in versions[:200]]}
+    )
+
+
+@require_service_scopes("workflow:read")
+@api_view(["GET"])
+@permission_classes([IntegrationScopePermission])
+def integration_analysis_product_version_detail(
+    request,
+    analysis_code: str,
+    contract_version: str,
+):
+    item = get_object_or_404(
+        AnalysisProductVersion.objects.select_related(
+            "product",
+            "workflow_version",
+            "workflow_version__workflow",
+        ),
+        product__code=analysis_code,
+        contract_version=contract_version,
+    )
+    return Response(_analysis_product_version_payload(item))
 
 
 @require_service_scopes("workflow:read")
@@ -1637,6 +1832,7 @@ def integration_preflight(request):
                 if not item.get("ready") and not item.get("blocking", True)
             ],
             "workflow": result["workflow"],
+            "analysis_product": result["analysis_product"],
             "checks": result["checks"],
             "resource_manifest": result["manifests"],
             "output_contract": result["output_contract"],
@@ -1721,6 +1917,7 @@ def integration_analysis_runs(request):
             return _idempotent_response(request, existing, digest)
         preflight = _preflight_workflow(body)
         version = preflight["workflow_version"]
+        product_version = preflight["analysis_product_version"]
         source_bundle, source_digest = _compile_published_workflow(version)
         request_payload = {
             "kind": "integration_workflow",
@@ -1734,11 +1931,18 @@ def integration_analysis_runs(request):
             "integration_output_contract": preflight["output_contract"],
             **preflight["manifests"],
         }
+        if product_version is not None:
+            request_payload["analysis_product"] = {
+                **_analysis_product_reference(product_version),
+                "workflow_version_id": version.pk,
+                "source_digest": source_digest,
+            }
         try:
             with transaction.atomic():
                 run = AnalysisRun.objects.create(
                     run_kind=AnalysisRun.Kind.WORKFLOW,
                     workflow_version=version,
+                    analysis_product_version=product_version,
                     service_account=account,
                     external_run_id=external["external_run_id"],
                     external_analysis_id=external["external_analysis_id"],
@@ -1915,6 +2119,10 @@ def integration_analysis_run_retry(request, run_id):
         )
         if existing is not None:
             return _idempotent_response(request, existing, digest)
+        if original.analysis_product_version_id:
+            _validate_analysis_product_version_ready(
+                original.analysis_product_version
+            )
         try:
             _verify_run_resource_manifests(
                 original,
@@ -1951,6 +2159,7 @@ def integration_analysis_run_retry(request, run_id):
                 run = AnalysisRun.objects.create(
                     run_kind=original.run_kind,
                     workflow_version=original.workflow_version,
+                    analysis_product_version=original.analysis_product_version,
                     tool_version=original.tool_version,
                     service_account=account,
                     external_run_id=external["external_run_id"],

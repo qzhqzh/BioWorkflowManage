@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "BioWorkflowManage Integration API",
-    "version": "1.0.0",
-    "description": "第三方报告系统与 AI Agent 使用的固定版本分析、Task 测试及资产查询接口。所有写操作均受 Service Token scope、受管路径、幂等键和审计约束。"
+    "version": "1.1.0",
+    "description": "第三方 MES、运营平台、报告系统与 AI Agent 使用的固定分析产品、Task 测试及资产查询接口。所有写操作均受 Service Token scope、受管路径、幂等键和审计约束。"
   },
   "servers": [{"url": "/api/v1/integration"}],
   "security": [{"serviceToken": []}],
@@ -14,6 +14,33 @@
         "summary": "读取 Integration API OpenAPI 3.1 契约",
         "security": [],
         "responses": {"200": {"description": "OpenAPI 3.1 document"}}
+      }
+    },
+    "/analysis-products": {
+      "get": {
+        "operationId": "listAnalysisProducts",
+        "summary": "列出可供外部系统固定引用的分析产品契约",
+        "x-required-scope": "workflow:read",
+        "responses": {
+          "200": {"description": "激活的 Analysis Product 版本列表", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AnalysisProductList"}}}},
+          "401": {"$ref": "#/components/responses/Error"},
+          "403": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/analysis-products/{analysis_code}/versions/{contract_version}": {
+      "get": {
+        "operationId": "getAnalysisProductVersion",
+        "summary": "读取一个固定分析产品契约",
+        "x-required-scope": "workflow:read",
+        "parameters": [
+          {"name": "analysis_code", "in": "path", "required": true, "schema": {"type": "string", "maxLength": 128}},
+          {"name": "contract_version", "in": "path", "required": true, "schema": {"type": "string", "maxLength": 64}}
+        ],
+        "responses": {
+          "200": {"description": "Analysis Product 固定契约", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AnalysisProductVersion"}}}},
+          "404": {"$ref": "#/components/responses/Error"}
+        }
       }
     },
     "/workflow-versions": {
@@ -36,7 +63,7 @@
     "/analysis-runs/preflight": {
       "post": {
         "operationId": "preflightAnalysisRun",
-        "summary": "预检固定 WorkflowVersion 和受管输入，不创建运行",
+        "summary": "预检固定分析产品或 WorkflowVersion 和受管输入，不创建运行",
         "x-required-scope": "analysis:submit",
         "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AnalysisPreflight"}}}},
         "responses": {"200": {"description": "预检通过"}, "400": {"$ref": "#/components/responses/Error"}, "409": {"$ref": "#/components/responses/Error"}}
@@ -52,7 +79,7 @@
       },
       "post": {
         "operationId": "submitAnalysisRun",
-        "summary": "幂等投递固定 WorkflowVersion",
+        "summary": "幂等投递固定分析产品或 WorkflowVersion",
         "x-required-scope": "analysis:submit",
         "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}, {"$ref": "#/components/parameters/RequestId"}],
         "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AnalysisSubmission"}}}},
@@ -206,20 +233,71 @@
         },
         "additionalProperties": false
       },
+      "WorkflowVersionRef": {
+        "type": "object",
+        "required": ["source_type", "version_id", "expected_source_digest"],
+        "properties": {
+          "source_type": {"const": "workflow_version"},
+          "version_id": {"type": "integer", "minimum": 1},
+          "expected_source_digest": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "AnalysisProductRef": {
+        "type": "object",
+        "required": ["analysis_code", "contract_version"],
+        "properties": {
+          "analysis_code": {"type": "string", "maxLength": 128},
+          "contract_version": {"type": "string", "maxLength": 64, "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$"}
+        },
+        "additionalProperties": false
+      },
+      "AnalysisProductVersion": {
+        "type": "object",
+        "required": ["analysis_code", "contract_version", "contract_digest", "workflow", "interface", "ready"],
+        "properties": {
+          "analysis_code": {"type": "string"},
+          "contract_version": {"type": "string"},
+          "contract_digest": {"type": "string"},
+          "name": {"type": "string"},
+          "description": {"type": "string"},
+          "active": {"type": "boolean"},
+          "workflow": {"type": "object"},
+          "interface": {"type": "object"},
+          "input_contract": {"type": "array", "items": {"type": "object"}},
+          "output_contract": {"type": "array", "items": {"type": "object"}},
+          "ready": {"type": "boolean"},
+          "blockers": {"type": "array", "items": {"type": "string"}}
+        }
+      },
+      "AnalysisProductList": {
+        "type": "object",
+        "required": ["results"],
+        "properties": {
+          "results": {"type": "array", "maxItems": 200, "items": {"$ref": "#/components/schemas/AnalysisProductVersion"}}
+        }
+      },
+      "AnalysisProductRunRef": {
+        "type": "object",
+        "required": ["analysis_code", "contract_version", "contract_digest"],
+        "properties": {
+          "analysis_code": {"type": "string", "maxLength": 128},
+          "contract_version": {"type": "string", "maxLength": 64},
+          "contract_digest": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
       "AnalysisSubmission": {
         "type": "object",
-        "required": ["external_ref", "workflow", "subject", "inputs"],
+        "required": ["external_ref", "subject", "inputs"],
+        "oneOf": [
+          {"required": ["analysis_product"], "not": {"required": ["workflow"]}},
+          {"required": ["workflow"], "not": {"required": ["analysis_product"]}}
+        ],
         "properties": {
           "external_ref": {"$ref": "#/components/schemas/ExternalRef"},
-          "workflow": {
-            "type": "object",
-            "required": ["source_type", "version_id", "expected_source_digest"],
-            "properties": {
-              "source_type": {"const": "workflow_version"},
-              "version_id": {"type": "integer", "minimum": 1},
-              "expected_source_digest": {"type": "string"}
-            }
-          },
+          "workflow": {"$ref": "#/components/schemas/WorkflowVersionRef"},
+          "analysis_product": {"$ref": "#/components/schemas/AnalysisProductRef"},
           "subject": {"type": "object", "required": ["sample_id"], "properties": {"sample_id": {"type": "string", "maxLength": 128}}},
           "inputs": {"type": "object", "additionalProperties": true},
           "database": {"$ref": "#/components/schemas/DatabaseSelection"},
@@ -228,17 +306,14 @@
       },
       "AnalysisPreflight": {
         "type": "object",
-        "required": ["workflow", "inputs"],
+        "required": ["inputs"],
+        "oneOf": [
+          {"required": ["analysis_product"], "not": {"required": ["workflow"]}},
+          {"required": ["workflow"], "not": {"required": ["analysis_product"]}}
+        ],
         "properties": {
-          "workflow": {
-            "type": "object",
-            "required": ["source_type", "version_id", "expected_source_digest"],
-            "properties": {
-              "source_type": {"const": "workflow_version"},
-              "version_id": {"type": "integer", "minimum": 1},
-              "expected_source_digest": {"type": "string"}
-            }
-          },
+          "workflow": {"$ref": "#/components/schemas/WorkflowVersionRef"},
+          "analysis_product": {"$ref": "#/components/schemas/AnalysisProductRef"},
           "inputs": {"type": "object", "additionalProperties": true},
           "database": {"$ref": "#/components/schemas/DatabaseSelection"},
           "metadata": {"type": "object", "additionalProperties": true}
@@ -268,6 +343,7 @@
         "properties": {
           "id": {"type": "string", "format": "uuid"},
           "external_ref": {"$ref": "#/components/schemas/ExternalRef"},
+          "analysis_product": {"oneOf": [{"$ref": "#/components/schemas/AnalysisProductRunRef"}, {"type": "null"}]},
           "status": {"type": "string", "enum": ["queued", "preparing", "running", "cancel_requested", "succeeded", "failed", "canceled"]},
           "status_version": {"type": "integer", "minimum": 1},
           "execution_status": {"type": "string"},

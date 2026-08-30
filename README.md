@@ -41,8 +41,8 @@ BioWorkflowManage 是面向生物信息学流程工程化的可视化 Workflow �
 - ToolSpec、Workflow Graph、DAG 与类型校验；
 - Graph -> Compiler IR -> WDL 1.0 和 miniwdl 校验；
 - 独立 miniwdl 隔离执行环境、真实容器 smoke 和数据案例预检；
-- Service Account、幂等第三方投递、受管输入、取消/重跑和语义化输出；
-- 通过受限 MCP 查询流程/软件并独立测试固定 WorkflowVersion 或 ToolVersion；
+- Service Account、稳定分析产品目录、幂等第三方投递、受管输入、取消/重跑和语义化输出；
+- 通过受限 MCP 查询分析产品/流程/软件并独立测试固定 WorkflowVersion 或 ToolVersion；
 - 工具、流程、WDL 与子流程的不可变版本；
 - 子流程以固定 `slug + version + digest` 的黑盒节点复用，并编译为 WDL
   `import/call`；

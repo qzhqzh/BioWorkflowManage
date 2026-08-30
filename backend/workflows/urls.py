@@ -50,6 +50,14 @@ urlpatterns = [
     path("auth/logout", auth_views.logout_view),
     path("integration/openapi", integration_api.integration_openapi),
     path(
+        "integration/analysis-products",
+        integration_api.integration_analysis_products,
+    ),
+    path(
+        "integration/analysis-products/<slug:analysis_code>/versions/<str:contract_version>",
+        integration_api.integration_analysis_product_version_detail,
+    ),
+    path(
         "integration/workflow-versions",
         integration_api.integration_workflow_versions,
     ),

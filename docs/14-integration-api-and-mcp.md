@@ -60,7 +60,48 @@ docker compose exec backend python backend/manage.py manage_service_account \
 不要默认给 AI Agent 取消、重跑权限。Service Account 的 scope 发生变化时，该账户的所有
 Token 会立即按新 scope 生效。
 
-## 3. 固定版本投递
+## 3. 稳定分析产品与固定版本投递
+
+MES、运营平台等业务调用方优先使用稳定的 `analysis_code + contract_version`，不直接依赖
+内部 WorkflowVersion 数字 ID。管理员把一个外部契约固定发布到不可变 WorkflowVersion：
+
+```bash
+docker compose exec backend python backend/manage.py manage_analysis_product \
+  --code dna-panel \
+  --name "DNA Panel Analysis" \
+  --contract-version 1.0.0 \
+  --workflow-version-id 123 \
+  --actor zhuqin
+```
+
+相同产品契约重复执行命令会安全复用；相同 `analysis_code + contract_version` 不能改绑其他
+WorkflowVersion。需要阻止新任务时使用 `--deactivate`，已存在的运行与证据不受影响。
+
+外部调用方读取产品目录和固定契约：
+
+```bash
+curl -sS -H "Authorization: Bearer $BIOWORKFLOW_TOKEN" \
+  http://localhost:8082/api/v1/integration/analysis-products
+
+curl -sS -H "Authorization: Bearer $BIOWORKFLOW_TOKEN" \
+  http://localhost:8082/api/v1/integration/analysis-products/dna-panel/versions/1.0.0
+```
+
+投递时使用：
+
+```json
+{
+  "analysis_product": {
+    "analysis_code": "dna-panel",
+    "contract_version": "1.0.0"
+  }
+}
+```
+
+平台在接收任务时解析并固化实际 WorkflowVersion、source digest、contract digest 与接口契约；
+不会动态选择“最新版”。
+
+原有固定 WorkflowVersion 请求继续作为兼容接口。管理工具或尚未迁移的调用方可以先读取：
 
 先读取可运行的固定版本：
 
@@ -69,7 +110,7 @@ curl -sS -H "Authorization: Bearer $BIOWORKFLOW_TOKEN" \
   http://localhost:8082/api/v1/integration/workflow-versions
 ```
 
-只选择 `ready=true` 的版本，并同时保存 `id` 与 `source_digest`。投递不接受“最新版本”；
+只选择 `ready=true` 的版本，并同时保存 `id` 与 `source_digest`。兼容投递不接受“最新版本”；
 每次请求都必须携带固定 `version_id` 和 `expected_source_digest`。
 
 Integration API 不直接执行任意历史 WDL 草稿。需要对外投递的历史 WDL 应先发布为
@@ -119,10 +160,9 @@ curl -sS -X POST \
 
 ```json
 {
-  "workflow": {
-    "source_type": "workflow_version",
-    "version_id": 123,
-    "expected_source_digest": "sha256:..."
+  "analysis_product": {
+    "analysis_code": "dna-panel",
+    "contract_version": "1.0.0"
   },
   "inputs": {
     "read1": {"root_alias": "rawdata", "relative_path": "project/S001_R1.fastq.gz"},
@@ -162,10 +202,9 @@ curl -sS -X POST \
     "external_run_id": "019-okb-execution-uuid",
     "external_analysis_id": "019-okb-analysis-uuid"
   },
-  "workflow": {
-    "source_type": "workflow_version",
-    "version_id": 123,
-    "expected_source_digest": "sha256:..."
+  "analysis_product": {
+    "analysis_code": "dna-panel",
+    "contract_version": "1.0.0"
   },
   "subject": {"sample_id": "S001"},
   "inputs": {
@@ -223,6 +262,9 @@ miniwdl Swarm service；运行目录、日志和已经形成的证据不会被�
 | `SERVICE_SCOPE_REQUIRED` | authorization | 否，调整 scope |
 | `IDEMPOTENCY_CONFLICT` | validation | 否，找回原任务或使用新外部 ID |
 | `WORKFLOW_VERSION_CHANGED` | workflow | 否，重新读取固定版本 |
+| `ANALYSIS_PRODUCT_VERSION_NOT_FOUND` | workflow | 否，重新读取产品目录 |
+| `ANALYSIS_PRODUCT_INACTIVE` | workflow | 否，联系平台管理员或选择其他已发布契约 |
+| `ANALYSIS_PRODUCT_SNAPSHOT_CHANGED` | workflow | 否，停止投递并审计产品发布数据 |
 | `MANAGED_RESOURCE_*` / `ANALYSIS_RESOURCE_CHANGED` | input/resource | 否，修复资源后新建任务 |
 | `ANALYSIS_INFRASTRUCTURE_ERROR` | infrastructure | 是，确认执行环境健康后重跑 |
 | `ANALYSIS_WORKER_LEASE_LOST` | infrastructure | 是，确认旧实例已终止后重跑 |
@@ -309,8 +351,8 @@ uv run python backend/manage_mcp.py
 
 已开放能力：
 
-- 查询固定 WorkflowVersion、ToolVersion 和软件知识库；
-- 对固定 WorkflowVersion 做受管输入预检和幂等小数据测试；
+- 查询稳定分析产品、固定 WorkflowVersion、ToolVersion 和软件知识库；
+- 对稳定分析产品或固定 WorkflowVersion 做受管输入预检和幂等小数据测试；
 - 对不可变 ToolVersion 做独立 Task 预检和小数据测试；
 - 查询运行、按外部 ID 找回、增量读取事件和语义输出；
 - 仅在 scope 明确授权时取消或重跑。
@@ -320,7 +362,8 @@ uv run python backend/manage_mcp.py
 
 ## 7. 升级与验证
 
-迁移到包含 `0021_serviceaccount_servicetoken_and_more` 的版本前先停止两种 Worker，避免
+迁移到包含 `0021_serviceaccount_servicetoken_and_more` 至
+`0028_analysisproduct_analysisproductversion_and_more` 的版本前先停止两种 Worker，避免
 代码与数据库 Schema 短暂不一致：
 
 ```bash
