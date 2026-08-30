@@ -30,6 +30,29 @@ class ImmutableSnapshot(models.Model):
         raise ValidationError(f"{type(self).__name__} snapshots cannot be deleted.")
 
 
+class AnalysisProductQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        if "code" in kwargs:
+            raise ValidationError("AnalysisProduct code is immutable.")
+        return super().update(**kwargs)
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        if "code" in fields:
+            raise ValidationError("AnalysisProduct code is immutable.")
+        return super().bulk_update(objs, fields, batch_size=batch_size)
+
+
+class AnalysisProductVersionQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        raise ValidationError("AnalysisProductVersion snapshots cannot be updated.")
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        raise ValidationError("AnalysisProductVersion snapshots cannot be updated.")
+
+    def delete(self):
+        raise ValidationError("AnalysisProductVersion snapshots cannot be deleted.")
+
+
 class WorkflowDocument(models.Model):
     class Kind(models.TextChoices):
         WORKFLOW = "workflow", "Workflow"
@@ -324,6 +347,70 @@ class WorkflowVersion(ImmutableSnapshot):
                 fields=["workflow", "version"],
                 name="unique_workflow_version",
             )
+        ]
+
+
+class AnalysisProduct(models.Model):
+    """Stable external analysis identity independent of internal Workflow IDs."""
+
+    code = models.SlugField(max_length=128, unique=True)
+    name = models.CharField(max_length=256)
+    description = models.TextField(blank=True)
+    is_active = models.BooleanField(default=True)
+    created_by = models.CharField(max_length=256, default="deployment")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    objects = AnalysisProductQuerySet.as_manager()
+
+    class Meta:
+        ordering = ["code"]
+
+    def save(self, *args, **kwargs):
+        normalized_code = str(self.code or "").strip().lower()
+        if self.pk:
+            current_code = type(self).objects.only("code").get(pk=self.pk).code
+            if current_code != normalized_code:
+                raise ValidationError("AnalysisProduct code is immutable.")
+        self.code = normalized_code
+        return super().save(*args, **kwargs)
+
+
+class AnalysisProductVersion(ImmutableSnapshot):
+    """Immutable public contract bound to one executable WorkflowVersion."""
+
+    product = models.ForeignKey(
+        AnalysisProduct,
+        on_delete=models.PROTECT,
+        related_name="versions",
+    )
+    contract_version = models.CharField(max_length=64)
+    workflow_version = models.ForeignKey(
+        WorkflowVersion,
+        on_delete=models.PROTECT,
+        related_name="analysis_product_versions",
+    )
+    source_digest = models.CharField(max_length=80)
+    interface_contract = models.JSONField(default=dict)
+    contract_digest = models.CharField(max_length=80)
+    created_by = models.CharField(max_length=256, default="deployment")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    objects = AnalysisProductVersionQuerySet.as_manager()
+
+    class Meta:
+        ordering = ["product_id", "contract_version"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["product", "contract_version"],
+                name="unique_analysis_product_contract_version",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~models.Q(source_digest="") & ~models.Q(contract_digest="")
+                ),
+                name="analysis_product_version_has_digests",
+            ),
         ]
 
 
@@ -1132,6 +1219,13 @@ class AnalysisRun(models.Model):
         null=True,
         blank=True,
     )
+    analysis_product_version = models.ForeignKey(
+        AnalysisProductVersion,
+        on_delete=models.PROTECT,
+        related_name="analysis_runs",
+        null=True,
+        blank=True,
+    )
     tool_version = models.ForeignKey(
         ToolVersion,
         on_delete=models.PROTECT,
@@ -1252,6 +1346,13 @@ class AnalysisRun(models.Model):
                     & ~models.Q(idempotency_key="")
                 ),
                 name="unique_service_idempotency_key",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(run_kind="workflow")
+                    | models.Q(analysis_product_version__isnull=True)
+                ),
+                name="tool_test_has_no_analysis_product",
             ),
         ]
 

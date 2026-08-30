@@ -11,17 +11,24 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from django.core.exceptions import ValidationError
 from django.core.management import call_command
+from django.core.management.base import CommandError
 from django.utils import timezone
 from rest_framework.test import APIClient
 
 from compiler_core import canonical_digest, compile_workflow
 from manage_mcp import TOOLS, handle, tool_call
+from workflows import integration_api as integration_api_module
 from workflows.analysis_runtime import (
     _finalize_cancelled_run,
     _verify_run_resource_manifests,
     claim_next_run,
     process_analysis_run,
+)
+from workflows.analysis_products import (
+    AnalysisProductError,
+    publish_analysis_product_version,
 )
 from workflows.integration_api import IntegrationAPIError, _managed_resource
 from workflows.integration_outputs import (
@@ -33,6 +40,8 @@ from workflows.integration_outputs import (
 )
 from workflows.integration_tokens import issue_service_token
 from workflows.models import (
+    AnalysisProduct,
+    AnalysisProductVersion,
     AnalysisRun,
     ServiceAccount,
     ServiceToken,
@@ -244,6 +253,25 @@ def _workflow_version() -> WorkflowVersion:
     )
 
 
+def _analysis_product_version(
+    workflow_version: WorkflowVersion,
+) -> AnalysisProductVersion:
+    product = AnalysisProduct.objects.create(
+        code="dna-panel",
+        name="DNA Panel",
+        description="Stable external analysis contract",
+        created_by="pytest",
+    )
+    item, created = publish_analysis_product_version(
+        product,
+        contract_version="1.0.0",
+        workflow_version=workflow_version,
+        actor="pytest",
+    )
+    assert created is True
+    return item
+
+
 def _submission(version: WorkflowVersion, *, external_run_id="okb-run-1"):
     return {
         "external_ref": {
@@ -263,6 +291,436 @@ def _submission(version: WorkflowVersion, *, external_run_id="okb-run-1"):
         },
         "metadata": {"product_code": "PANEL001"},
     }
+
+
+@pytest.mark.django_db
+def test_manage_analysis_product_publishes_immutable_catalog_contract():
+    _, _, _, client = _token_client(scopes=["workflow:read"])
+    version = _workflow_version()
+    output = StringIO()
+
+    call_command(
+        "manage_analysis_product",
+        code="dna-panel",
+        name="DNA Panel",
+        description="Stable contract",
+        contract_version="1.0.0",
+        workflow_version_id=version.pk,
+        actor="pytest",
+        stdout=output,
+    )
+
+    item = AnalysisProductVersion.objects.select_related("product").get()
+    assert item.product.code == "dna-panel"
+    assert item.workflow_version == version
+    assert item.source_digest == version.compiled_digest
+    assert item.interface_contract == version.interface_contract
+    assert "PUBLISHED dna-panel@1.0.0" in output.getvalue()
+
+    reused_output = StringIO()
+    call_command(
+        "manage_analysis_product",
+        code="dna-panel",
+        contract_version="1.0.0",
+        workflow_version_id=version.pk,
+        actor="pytest",
+        stdout=reused_output,
+    )
+    assert AnalysisProductVersion.objects.count() == 1
+    assert "REUSED dna-panel@1.0.0" in reused_output.getvalue()
+
+    catalog = client.get("/api/v1/integration/analysis-products")
+    assert catalog.status_code == 200
+    assert len(catalog.data["results"]) == 1
+    assert catalog.data["results"][0]["analysis_code"] == "dna-panel"
+    assert catalog.data["results"][0]["contract_version"] == "1.0.0"
+    assert catalog.data["results"][0]["ready"] is True
+    detail = client.get(
+        "/api/v1/integration/analysis-products/dna-panel/versions/1.0.0"
+    )
+    assert detail.status_code == 200
+    assert detail.data["contract_digest"] == item.contract_digest
+    assert detail.data["workflow"]["version_id"] == version.pk
+
+    product = item.product
+    with pytest.raises(ValidationError, match="code is immutable"):
+        AnalysisProduct.objects.filter(pk=product.pk).update(code="renamed-product")
+    product.code = "renamed-product"
+    with pytest.raises(ValidationError, match="code is immutable"):
+        product.save()
+
+    with pytest.raises(ValidationError, match="cannot be updated"):
+        AnalysisProductVersion.objects.filter(pk=item.pk).update(
+            source_digest="sha256:" + "0" * 64
+        )
+    with pytest.raises(ValidationError, match="cannot be updated"):
+        AnalysisProductVersion.objects.bulk_update(
+            [item],
+            ["contract_version"],
+        )
+    with pytest.raises(ValidationError, match="cannot be deleted"):
+        AnalysisProductVersion.objects.filter(pk=item.pk).delete()
+    item.contract_version = "2.0.0"
+    with pytest.raises(ValidationError, match="snapshots are immutable"):
+        item.save()
+
+    second = WorkflowVersion.objects.create(
+        workflow=version.workflow,
+        version=2,
+        name=version.name,
+        description=version.description,
+        kind=version.kind,
+        semantic_digest=version.semantic_digest,
+        workflow_graph=version.workflow_graph,
+        editor_document=version.editor_document,
+        tool_specs=version.tool_specs,
+        compiled_bundle=version.compiled_bundle,
+        compiled_digest=version.compiled_digest,
+        compiler_profile=version.compiler_profile,
+        interface_contract=version.interface_contract,
+        subworkflow_references=version.subworkflow_references,
+    )
+    with pytest.raises(CommandError, match="ANALYSIS_PRODUCT_VERSION_CONFLICT"):
+        call_command(
+            "manage_analysis_product",
+            code="dna-panel",
+            contract_version="1.0.0",
+            workflow_version_id=second.pk,
+            actor="pytest",
+        )
+    with pytest.raises(CommandError, match="未找到可发布"):
+        call_command(
+            "manage_analysis_product",
+            code="orphan-product",
+            contract_version="1.0.0",
+            workflow_version_id=999999,
+            actor="pytest",
+        )
+    assert not AnalysisProduct.objects.filter(code="orphan-product").exists()
+
+
+@pytest.mark.django_db
+def test_analysis_product_publish_rejects_malformed_or_mismatched_contracts():
+    version = _workflow_version()
+    product = AnalysisProduct.objects.create(code="dna-panel", name="DNA Panel")
+    valid = version.interface_contract
+    malformed_input = {**valid, "inputs": [None]}
+    duplicate_inputs = {
+        **valid,
+        "inputs": [
+            valid["inputs"][0],
+            {**valid["inputs"][1], "name": valid["inputs"][0]["name"]},
+        ],
+    }
+    empty_inputs = {**valid, "inputs": []}
+    missing_output_name = {
+        **valid,
+        "outputs": [{key: value for key, value in valid["outputs"][0].items() if key != "name"}],
+    }
+
+    for contract in (
+        malformed_input,
+        duplicate_inputs,
+        empty_inputs,
+        missing_output_name,
+    ):
+        WorkflowVersion.objects.filter(pk=version.pk).update(
+            interface_contract=contract
+        )
+        version.refresh_from_db()
+        with pytest.raises(AnalysisProductError) as caught:
+            publish_analysis_product_version(
+                product,
+                contract_version="1.0.0",
+                workflow_version=version,
+                actor="pytest",
+            )
+        assert caught.value.code == "ANALYSIS_PRODUCT_CONTRACT_INVALID"
+        assert not AnalysisProductVersion.objects.exists()
+
+
+@pytest.mark.django_db
+def test_analysis_product_preflight_and_submission_pin_contract(
+    integration_workspace,
+):
+    account, _, _, client = _token_client()
+    version = _workflow_version()
+    product_version = _analysis_product_version(version)
+    body = _submission(version)
+    del body["workflow"]
+    body["analysis_product"] = {
+        "analysis_code": "dna-panel",
+        "contract_version": "1.0.0",
+    }
+
+    preflight = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        body,
+        format="json",
+    )
+    assert preflight.status_code == 200, preflight.data
+    assert preflight.data["analysis_product"]["contract_digest"] == (
+        product_version.contract_digest
+    )
+    assert preflight.data["workflow"]["id"] == version.pk
+
+    created = client.post(
+        "/api/v1/integration/analysis-runs",
+        body,
+        format="json",
+        HTTP_IDEMPOTENCY_KEY="product-run-1",
+    )
+    assert created.status_code == 201, created.data
+    assert created.data["analysis_product"] == {
+        "analysis_code": "dna-panel",
+        "contract_version": "1.0.0",
+        "contract_digest": product_version.contract_digest,
+    }
+    run = AnalysisRun.objects.get(pk=created.data["id"])
+    assert run.service_account == account
+    assert run.analysis_product_version == product_version
+    assert run.workflow_version == version
+    assert run.source_digest == version.compiled_digest
+    assert run.request_payload["analysis_product"] == {
+        "analysis_code": "dna-panel",
+        "contract_version": "1.0.0",
+        "contract_digest": product_version.contract_digest,
+        "workflow_version_id": version.pk,
+        "source_digest": version.compiled_digest,
+    }
+
+    run.status = AnalysisRun.Status.FAILED
+    run.save(update_fields=["status", "updated_at"])
+    retried = client.post(
+        f"/api/v1/integration/analysis-runs/{run.id}/retry",
+        {
+            "external_ref": {
+                "client_id": "okb",
+                "external_run_id": "product-run-retry",
+            }
+        },
+        format="json",
+        HTTP_IDEMPOTENCY_KEY="product-run-retry",
+    )
+    assert retried.status_code == 201, retried.data
+    retry = AnalysisRun.objects.get(pk=retried.data["id"])
+    assert retry.analysis_product_version == product_version
+    assert retried.data["analysis_product"]["contract_digest"] == (
+        product_version.contract_digest
+    )
+
+    conflict = _submission(version, external_run_id="product-conflict")
+    conflict["analysis_product"] = body["analysis_product"]
+    response = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        conflict,
+        format="json",
+    )
+    assert response.status_code == 400
+    assert response.data["error"]["code"] == "ANALYSIS_SOURCE_CONFLICT"
+
+    product_version.product.is_active = False
+    product_version.product.save(update_fields=["is_active", "updated_at"])
+    blocked_retry = client.post(
+        f"/api/v1/integration/analysis-runs/{run.id}/retry",
+        {
+            "external_ref": {
+                "client_id": "okb",
+                "external_run_id": "product-run-retry-inactive",
+            }
+        },
+        format="json",
+        HTTP_IDEMPOTENCY_KEY="product-run-retry-inactive",
+    )
+    assert blocked_retry.status_code == 409
+    assert blocked_retry.data["error"]["code"] == "ANALYSIS_PRODUCT_INACTIVE"
+    conflict["workflow"] = None
+    response = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        conflict,
+        format="json",
+    )
+    assert response.status_code == 400
+    assert response.data["error"]["code"] == "ANALYSIS_SOURCE_CONFLICT"
+
+
+@pytest.mark.django_db
+def test_analysis_product_rejects_inactive_or_changed_snapshot(
+    integration_workspace,
+):
+    _, _, _, client = _token_client()
+    version = _workflow_version()
+    product_version = _analysis_product_version(version)
+    body = _submission(version)
+    body.pop("workflow")
+    body["analysis_product"] = {
+        "analysis_code": "dna-panel",
+        "contract_version": "1.0.0",
+    }
+
+    product_version.product.is_active = False
+    product_version.product.save(update_fields=["is_active", "updated_at"])
+    inactive = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        body,
+        format="json",
+    )
+    assert inactive.status_code == 409
+    assert inactive.data["error"]["code"] == "ANALYSIS_PRODUCT_INACTIVE"
+    assert client.get("/api/v1/integration/analysis-products").data["results"] == []
+
+    product_version.product.is_active = True
+    product_version.product.save(update_fields=["is_active", "updated_at"])
+    changed_contract = {
+        **version.interface_contract,
+        "outputs": [
+            {
+                **version.interface_contract["outputs"][0],
+                "semantic_type": "report.changed",
+            }
+        ],
+    }
+    WorkflowVersion.objects.filter(pk=version.pk).update(
+        interface_contract=changed_contract
+    )
+    changed = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        body,
+        format="json",
+    )
+    assert changed.status_code == 409
+    assert changed.data["error"]["code"] == "ANALYSIS_PRODUCT_SNAPSHOT_CHANGED"
+
+
+@pytest.mark.django_db
+def test_analysis_product_deactivation_during_submission_blocks_run(
+    integration_workspace,
+):
+    _, _, _, client = _token_client()
+    version = _workflow_version()
+    product_version = _analysis_product_version(version)
+    body = _submission(version, external_run_id="product-race")
+    body.pop("workflow")
+    body["analysis_product"] = {
+        "analysis_code": "dna-panel",
+        "contract_version": "1.0.0",
+    }
+    real_preflight = integration_api_module._preflight_workflow
+
+    def deactivate_after_preflight(request_body):
+        result = real_preflight(request_body)
+        AnalysisProduct.objects.filter(pk=product_version.product_id).update(
+            is_active=False
+        )
+        return result
+
+    with patch.object(
+        integration_api_module,
+        "_preflight_workflow",
+        side_effect=deactivate_after_preflight,
+    ):
+        response = client.post(
+            "/api/v1/integration/analysis-runs",
+            body,
+            format="json",
+            HTTP_IDEMPOTENCY_KEY="product-race",
+        )
+
+    assert response.status_code == 409
+    assert response.data["error"]["code"] == "ANALYSIS_PRODUCT_INACTIVE"
+    assert not AnalysisRun.objects.filter(external_run_id="product-race").exists()
+
+
+@pytest.mark.django_db
+def test_analysis_product_deactivation_during_retry_blocks_run(
+    integration_workspace,
+):
+    _, _, _, client = _token_client()
+    version = _workflow_version()
+    product_version = _analysis_product_version(version)
+    body = _submission(version, external_run_id="product-retry-source")
+    body.pop("workflow")
+    body["analysis_product"] = {
+        "analysis_code": "dna-panel",
+        "contract_version": "1.0.0",
+    }
+    created = client.post(
+        "/api/v1/integration/analysis-runs",
+        body,
+        format="json",
+        HTTP_IDEMPOTENCY_KEY="product-retry-source",
+    )
+    assert created.status_code == 201, created.data
+    original = AnalysisRun.objects.get(pk=created.data["id"])
+    original.status = AnalysisRun.Status.FAILED
+    original.save(update_fields=["status", "updated_at"])
+
+    def deactivate_during_manifest_check(*args, **kwargs):
+        AnalysisProduct.objects.filter(pk=product_version.product_id).update(
+            is_active=False
+        )
+
+    with patch.object(
+        integration_api_module,
+        "_verify_run_resource_manifests",
+        side_effect=deactivate_during_manifest_check,
+    ):
+        response = client.post(
+            f"/api/v1/integration/analysis-runs/{original.id}/retry",
+            {
+                "external_ref": {
+                    "client_id": "okb",
+                    "external_run_id": "product-retry-race",
+                }
+            },
+            format="json",
+            HTTP_IDEMPOTENCY_KEY="product-retry-race",
+        )
+
+    assert response.status_code == 409
+    assert response.data["error"]["code"] == "ANALYSIS_PRODUCT_INACTIVE"
+    assert not AnalysisRun.objects.filter(
+        external_run_id="product-retry-race"
+    ).exists()
+
+
+@pytest.mark.django_db
+def test_analysis_product_missing_uses_stable_error_contract():
+    _, _, _, client = _token_client()
+    version = _workflow_version()
+    missing_detail = client.get(
+        "/api/v1/integration/analysis-products/missing/versions/1.0.0",
+        HTTP_X_REQUEST_ID="missing-product-detail",
+    )
+    assert missing_detail.status_code == 404
+    assert missing_detail.data["error"]["code"] == (
+        "ANALYSIS_PRODUCT_VERSION_NOT_FOUND"
+    )
+    assert missing_detail.data["error"]["request_id"] == "missing-product-detail"
+    assert missing_detail["X-Request-ID"] == "missing-product-detail"
+
+    body = _submission(version, external_run_id="missing-product-run")
+    body.pop("workflow")
+    body["analysis_product"] = {
+        "analysis_code": "missing",
+        "contract_version": "1.0.0",
+    }
+    preflight = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        body,
+        format="json",
+    )
+    submitted = client.post(
+        "/api/v1/integration/analysis-runs",
+        body,
+        format="json",
+        HTTP_IDEMPOTENCY_KEY="missing-product-run",
+    )
+    for response in (preflight, submitted):
+        assert response.status_code == 404
+        assert response.data["error"]["code"] == (
+            "ANALYSIS_PRODUCT_VERSION_NOT_FOUND"
+        )
 
 
 @pytest.mark.django_db
@@ -1510,6 +1968,46 @@ def test_mcp_submit_tools_preserve_idempotency_and_database_selection():
     assert headers == {"Idempotency-Key": "run-1"}
 
 
+def test_mcp_analysis_product_discovery_and_submission():
+    calls = []
+
+    class FakeClient:
+        def request(self, method, path, *, body=None, headers=None):
+            calls.append((method, path, body, headers))
+            return {"ok": True}
+
+    client = FakeClient()
+    assert tool_call(client, "list_analysis_products", {}) == {"ok": True}
+    assert tool_call(
+        client,
+        "get_analysis_product",
+        {"analysis_code": "dna-panel", "contract_version": "1.0.0"},
+    ) == {"ok": True}
+    assert tool_call(
+        client,
+        "submit_workflow",
+        {
+            "external_ref": {"client_id": "okb", "external_run_id": "run-1"},
+            "idempotency_key": "run-1",
+            "analysis_product": {
+                "analysis_code": "dna-panel",
+                "contract_version": "1.0.0",
+            },
+            "subject": {"sample_id": "S001"},
+            "inputs": {},
+        },
+    ) == {"ok": True}
+
+    assert calls[0][0:2] == ("GET", "/api/v1/integration/analysis-products")
+    assert calls[1][0:2] == (
+        "GET",
+        "/api/v1/integration/analysis-products/dna-panel/versions/1.0.0",
+    )
+    assert calls[2][0:2] == ("POST", "/api/v1/integration/analysis-runs")
+    assert calls[2][2]["analysis_product"]["analysis_code"] == "dna-panel"
+    assert calls[2][3] == {"Idempotency-Key": "run-1"}
+
+
 @pytest.mark.django_db
 def test_openapi_contract_covers_every_integration_route():
     payload = json.loads(
@@ -1520,6 +2018,8 @@ def test_openapi_contract_covers_every_integration_route():
     paths = payload["paths"]
     assert {
         "/openapi",
+        "/analysis-products",
+        "/analysis-products/{analysis_code}/versions/{contract_version}",
         "/workflow-versions",
         "/workflow-versions/{version_id}",
         "/analysis-runs/preflight",
@@ -1537,6 +2037,10 @@ def test_openapi_contract_covers_every_integration_route():
         "/tools",
         "/software",
     } <= set(paths)
+    workflow_ref = payload["components"]["schemas"]["WorkflowVersionRef"]
+    assert workflow_ref.get("additionalProperties", True) is not False
+    assert "404" in paths["/analysis-runs/preflight"]["post"]["responses"]
+    assert "404" in paths["/analysis-runs"]["post"]["responses"]
     served = APIClient().get("/api/v1/integration/openapi")
     assert served.status_code == 200
     assert served.data["info"]["version"] == payload["info"]["version"]

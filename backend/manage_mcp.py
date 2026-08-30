@@ -30,6 +30,21 @@ STRING = {"type": "string"}
 OBJECT = {"type": "object", "additionalProperties": True}
 TOOLS = [
     {
+        "name": "list_analysis_products",
+        "description": "列出外部系统可使用的稳定分析产品代码、契约版本和输入输出契约。",
+        "inputSchema": object_schema({}),
+        "annotations": {"readOnlyHint": True, "idempotentHint": True},
+    },
+    {
+        "name": "get_analysis_product",
+        "description": "按 analysis_code 与 contract_version 读取固定分析产品契约。",
+        "inputSchema": object_schema(
+            {"analysis_code": STRING, "contract_version": STRING},
+            ["analysis_code", "contract_version"],
+        ),
+        "annotations": {"readOnlyHint": True, "idempotentHint": True},
+    },
+    {
         "name": "list_workflow_versions",
         "description": "列出可供外部系统固定引用的已发布 WorkflowVersion 及输入输出契约。",
         "inputSchema": object_schema({}),
@@ -55,32 +70,34 @@ TOOLS = [
     },
     {
         "name": "preflight_workflow",
-        "description": "用受管输入检查固定 WorkflowVersion、FASTQ/FASTA、资源和语义输出契约，不创建任务。",
+        "description": "用受管输入检查固定分析产品或 WorkflowVersion、资源和语义输出契约，不创建任务。",
         "inputSchema": object_schema(
             {
                 "workflow": OBJECT,
+                "analysis_product": OBJECT,
                 "inputs": OBJECT,
                 "database": OBJECT,
                 "metadata": OBJECT,
             },
-            ["workflow", "inputs"],
+            ["inputs"],
         ),
         "annotations": {"readOnlyHint": True, "idempotentHint": True},
     },
     {
         "name": "submit_workflow",
-        "description": "幂等投递固定 WorkflowVersion；必须提供唯一 external_run_id 和 idempotency_key。",
+        "description": "幂等投递固定分析产品或 WorkflowVersion；必须提供唯一 external_run_id 和 idempotency_key。",
         "inputSchema": object_schema(
             {
                 "external_ref": OBJECT,
                 "idempotency_key": STRING,
                 "workflow": OBJECT,
+                "analysis_product": OBJECT,
                 "subject": OBJECT,
                 "inputs": OBJECT,
                 "database": OBJECT,
                 "metadata": OBJECT,
             },
-            ["external_ref", "idempotency_key", "workflow", "subject", "inputs"],
+            ["external_ref", "idempotency_key", "subject", "inputs"],
         ),
         "annotations": {"readOnlyHint": False, "idempotentHint": True},
     },
@@ -197,6 +214,15 @@ class APIClient:
 
 
 def tool_call(client: APIClient, name: str, arguments: dict[str, Any]) -> Any:
+    if name == "list_analysis_products":
+        return client.request("GET", "/api/v1/integration/analysis-products")
+    if name == "get_analysis_product":
+        analysis_code = urllib.parse.quote(arguments["analysis_code"], safe="")
+        contract_version = urllib.parse.quote(arguments["contract_version"], safe="")
+        return client.request(
+            "GET",
+            f"/api/v1/integration/analysis-products/{analysis_code}/versions/{contract_version}",
+        )
     if name == "list_workflow_versions":
         return client.request("GET", "/api/v1/integration/workflow-versions")
     if name == "get_workflow_version":
