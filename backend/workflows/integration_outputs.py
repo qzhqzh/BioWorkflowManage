@@ -1002,6 +1002,21 @@ def _snapshot_output_file(
                 or snapshot_after.st_mode & 0o222
             ):
                 raise ValueError("输出快照目标无效。")
+            named_snapshot_descriptor = os.open(
+                ".verified-outputs",
+                directory_flags,
+                dir_fd=run_root_descriptor,
+            )
+            try:
+                named_snapshot_stat = os.fstat(named_snapshot_descriptor)
+                pinned_snapshot_stat = os.fstat(snapshot_directory_descriptor)
+                if (
+                    named_snapshot_stat.st_dev != pinned_snapshot_stat.st_dev
+                    or named_snapshot_stat.st_ino != pinned_snapshot_stat.st_ino
+                ):
+                    raise ValueError("输出快照目录在发布期间发生变化。")
+            finally:
+                os.close(named_snapshot_descriptor)
             snapshot = {
                 "path": str(snapshot_path),
                 "sha256": sha256,

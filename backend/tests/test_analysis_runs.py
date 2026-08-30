@@ -2457,6 +2457,60 @@ def test_output_snapshot_rejects_ancestor_symlink_replacement(
     assert list(snapshot_root.iterdir()) == []
 
 
+def test_output_snapshot_rejects_snapshot_directory_replacement(
+    analysis_workspace, monkeypatch
+):
+    asset, revision = _asset("snapshot-store-race", "SnapshotStoreRace")
+    _, _, runs, _ = analysis_workspace
+    run_directory = runs / "snapshot-store-race"
+    run_directory.mkdir(parents=True)
+    output = run_directory / "result.txt"
+    output.write_text("trusted\n", encoding="utf-8")
+    run = AnalysisRun.objects.create(
+        asset=asset,
+        revision=revision,
+        workflow_name="SnapshotStoreRace",
+        sample_id="STORE-RACE",
+        status=AnalysisRun.Status.SUCCEEDED,
+        work_directory=str(run_directory),
+        outputs={"outputs": {"SnapshotStoreRace.file": str(output)}},
+    )
+    snapshot_root = run_directory / ".verified-outputs"
+    moved_snapshot_root = run_directory / ".verified-outputs-moved"
+    original_open = os.open
+    snapshot_open_count = 0
+
+    def open_after_snapshot_directory_replacement(path, *args, **kwargs):
+        nonlocal snapshot_open_count
+        if path == ".verified-outputs" and kwargs.get("dir_fd") is not None:
+            snapshot_open_count += 1
+            if snapshot_open_count == 2:
+                snapshot_root.rename(moved_snapshot_root)
+                snapshot_root.mkdir()
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "workflows.integration_outputs.os.open",
+        open_after_snapshot_directory_replacement,
+    )
+
+    manifest, output_status, error = build_output_manifest(run, run.outputs)
+
+    assert snapshot_open_count == 2
+    assert output_status == AnalysisRun.OutputStatus.INCOMPLETE
+    assert error["code"] == "OUTPUT_INTEGRITY_UNVERIFIABLE"
+    assert manifest["unverifiable_outputs"] == [
+        {
+            "key": "SnapshotStoreRace.file",
+            "reason": "file_digest_failed",
+        }
+    ]
+    assert list(snapshot_root.iterdir()) == []
+    assert not [
+        item for item in moved_snapshot_root.iterdir() if not item.name.startswith(".")
+    ]
+
+
 def test_output_traversal_budget_counts_null_array_items(
     analysis_workspace, settings
 ):
