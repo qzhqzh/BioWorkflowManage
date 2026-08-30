@@ -1419,6 +1419,238 @@ class InputStagingLease(models.Model):
         ]
 
 
+class AnalysisOutputRetention(models.Model):
+    """Explicit, operator-driven lifecycle for one run's local output tree."""
+
+    class State(models.TextChoices):
+        PROTECTED = "protected", "Protected"
+        CLEANING = "cleaning", "Cleaning"
+        CLEANED = "cleaned", "Cleaned"
+        FAILED = "failed", "Cleanup failed"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    run = models.OneToOneField(
+        AnalysisRun,
+        on_delete=models.CASCADE,
+        related_name="output_retention",
+    )
+    retain_until = models.DateTimeField(db_index=True)
+    state = models.CharField(
+        max_length=16,
+        choices=State.choices,
+        default=State.PROTECTED,
+        db_index=True,
+    )
+    cleanup_attempt_count = models.PositiveIntegerField(default=0)
+    cleanup_token = models.UUIDField(null=True, blank=True, editable=False)
+    cleanup_path_token = models.UUIDField(null=True, blank=True, editable=False)
+    cleanup_expires_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    quarantined_at = models.DateTimeField(null=True, blank=True)
+    cleaned_at = models.DateTimeField(null=True, blank=True)
+    last_error_code = models.CharField(max_length=64, blank=True)
+    last_error = models.TextField(blank=True)
+    created_by = models.CharField(max_length=256)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["retain_until", "created_at", "id"]
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        state="cleaning",
+                        cleanup_token__isnull=False,
+                        cleanup_expires_at__isnull=False,
+                    )
+                    | (
+                        ~models.Q(state="cleaning")
+                        & models.Q(
+                            cleanup_token__isnull=True,
+                            cleanup_expires_at__isnull=True,
+                        )
+                    )
+                ),
+                name="output_retention_cleanup_lease_matches_state",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~models.Q(state="cleaned")
+                    | models.Q(cleaned_at__isnull=False)
+                ),
+                name="output_retention_cleaned_has_timestamp",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~models.Q(state="cleaned")
+                    | models.Q(quarantined_at__isnull=False)
+                ),
+                name="output_retention_cleaned_was_quarantined",
+            ),
+        ]
+
+
+class ArtifactExport(models.Model):
+    """Asynchronous, idempotent delivery of one immutable output manifest."""
+
+    class State(models.TextChoices):
+        PENDING = "pending", "Pending"
+        EXPORTING = "exporting", "Exporting"
+        SUCCEEDED = "succeeded", "Succeeded"
+        DEAD_LETTER = "dead_letter", "Dead letter"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    run = models.ForeignKey(
+        AnalysisRun,
+        on_delete=models.PROTECT,
+        related_name="artifact_exports",
+    )
+    service_account = models.ForeignKey(
+        ServiceAccount,
+        on_delete=models.PROTECT,
+        related_name="artifact_exports",
+    )
+    retention = models.ForeignKey(
+        AnalysisOutputRetention,
+        on_delete=models.PROTECT,
+        related_name="artifact_exports",
+    )
+    idempotency_key = models.CharField(max_length=128)
+    request_digest = models.CharField(max_length=80)
+    source_manifest_digest = models.CharField(max_length=80)
+    target_profile = models.CharField(max_length=64)
+    target_snapshot = models.JSONField(default=dict)
+    state = models.CharField(
+        max_length=16,
+        choices=State.choices,
+        default=State.PENDING,
+        db_index=True,
+    )
+    manifest = models.JSONField(default=dict)
+    manifest_digest = models.CharField(max_length=80, blank=True)
+    manifest_completed_at = models.DateTimeField(null=True, blank=True)
+    manifest_location = models.JSONField(default=dict)
+    requires_ack = models.BooleanField(default=True)
+    acknowledged_at = models.DateTimeField(null=True, blank=True)
+    acknowledged_by = models.CharField(max_length=256, blank=True)
+    acknowledgement = models.JSONField(default=dict)
+    attempt_count = models.PositiveIntegerField(default=0)
+    replay_count = models.PositiveIntegerField(default=0)
+    next_attempt_at = models.DateTimeField(default=timezone.now, db_index=True)
+    lease_token = models.UUIDField(null=True, blank=True, editable=False)
+    lease_expires_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    last_error_code = models.CharField(max_length=64, blank=True)
+    last_error = models.TextField(blank=True)
+    last_error_retryable = models.BooleanField(default=False)
+    last_replayed_at = models.DateTimeField(null=True, blank=True)
+    last_replayed_by = models.CharField(max_length=256, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["next_attempt_at", "created_at", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["service_account", "idempotency_key"],
+                name="unique_service_artifact_export_idempotency",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        state="exporting",
+                        lease_token__isnull=False,
+                        lease_expires_at__isnull=False,
+                    )
+                    | (
+                        ~models.Q(state="exporting")
+                        & models.Q(
+                            lease_token__isnull=True,
+                            lease_expires_at__isnull=True,
+                        )
+                    )
+                ),
+                name="artifact_export_lease_matches_state",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~models.Q(state="succeeded")
+                    | models.Q(completed_at__isnull=False)
+                ),
+                name="artifact_export_success_has_completed_at",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~models.Q(state="succeeded")
+                    | models.Q(manifest_completed_at__isnull=False)
+                ),
+                name="artifact_export_success_has_manifest_time",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~models.Q(state="succeeded")
+                    | ~models.Q(manifest_digest="")
+                ),
+                name="artifact_export_success_has_manifest_digest",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(acknowledged_at__isnull=True)
+                    | models.Q(state="succeeded")
+                ),
+                name="artifact_export_ack_requires_success",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["state", "next_attempt_at"],
+                name="artifact_export_due_idx",
+            ),
+            models.Index(
+                fields=["state", "lease_expires_at"],
+                name="artifact_export_lease_idx",
+            ),
+        ]
+
+
+class ArtifactExportAttempt(models.Model):
+    class Outcome(models.TextChoices):
+        STARTED = "started", "Started"
+        SUCCEEDED = "succeeded", "Succeeded"
+        RETRY = "retry", "Retry scheduled"
+        DEAD_LETTER = "dead_letter", "Dead letter"
+        LEASE_EXPIRED = "lease_expired", "Lease expired"
+
+    export = models.ForeignKey(
+        ArtifactExport,
+        on_delete=models.PROTECT,
+        related_name="attempts",
+    )
+    attempt_number = models.PositiveIntegerField()
+    replay_number = models.PositiveIntegerField(default=0)
+    outcome = models.CharField(
+        max_length=16,
+        choices=Outcome.choices,
+        default=Outcome.STARTED,
+    )
+    files_total = models.PositiveIntegerField(default=0)
+    files_exported = models.PositiveIntegerField(default=0)
+    bytes_exported = models.PositiveBigIntegerField(default=0)
+    error_code = models.CharField(max_length=64, blank=True)
+    error = models.TextField(blank=True)
+    started_at = models.DateTimeField(auto_now_add=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["export_id", "attempt_number"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["export", "attempt_number"],
+                name="unique_artifact_export_attempt",
+            )
+        ]
+
+
 class WebhookEndpoint(models.Model):
     """Outbound terminal-event subscription owned by one Service Account."""
 
@@ -1449,7 +1681,7 @@ class WebhookEndpoint(models.Model):
 
 
 class IntegrationOutboxEvent(ImmutableSnapshot):
-    """Immutable event snapshot committed with an AnalysisRun terminal state."""
+    """Immutable integration event snapshot committed with its source state."""
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     service_account = models.ForeignKey(
@@ -1464,6 +1696,7 @@ class IntegrationOutboxEvent(ImmutableSnapshot):
     )
     event_type = models.CharField(max_length=64)
     status_version = models.PositiveIntegerField()
+    deduplication_key = models.CharField(max_length=128)
     payload = models.JSONField()
     occurred_at = models.DateTimeField()
     created_at = models.DateTimeField(auto_now_add=True)
@@ -1474,9 +1707,13 @@ class IntegrationOutboxEvent(ImmutableSnapshot):
         ordering = ["created_at", "id"]
         constraints = [
             models.UniqueConstraint(
-                fields=["run", "event_type", "status_version"],
-                name="unique_run_outbox_status_event",
-            )
+                fields=["run", "event_type", "deduplication_key"],
+                name="unique_run_outbox_deduplication_key",
+            ),
+            models.CheckConstraint(
+                condition=~models.Q(deduplication_key=""),
+                name="outbox_deduplication_key_not_empty",
+            ),
         ]
         indexes = [
             models.Index(

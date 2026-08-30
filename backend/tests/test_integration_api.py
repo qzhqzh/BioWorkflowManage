@@ -2738,6 +2738,9 @@ def test_openapi_contract_covers_every_integration_route():
         "/analysis-runs/{run_id}/retry",
         "/analysis-runs/{run_id}/outputs",
         "/analysis-runs/{run_id}/outputs/download",
+        "/analysis-runs/{run_id}/artifact-exports",
+        "/artifact-exports/{export_id}",
+        "/artifact-exports/{export_id}/acknowledge",
         "/tool-test-runs/preflight",
         "/tool-test-runs",
         "/tools",
@@ -2776,6 +2779,17 @@ def test_openapi_contract_covers_every_integration_route():
         payload["webhooks"]["analysisRunTerminal"]["post"]["requestBody"]
         ["content"]["application/json"]["schema"]["$ref"]
         == "#/components/schemas/AnalysisRunTerminalEvent"
+    )
+    assert (
+        payload["webhooks"]["artifactExportCompleted"]["post"]["requestBody"]
+        ["content"]["application/json"]["schema"]["$ref"]
+        == "#/components/schemas/ArtifactExportCompletedEvent"
+    )
+    export_request = payload["components"]["schemas"]["ArtifactExportRequest"]
+    assert export_request["additionalProperties"] is False
+    assert export_request["properties"]["target"]["additionalProperties"] is False
+    assert payload["components"]["parameters"]["ExportId"]["schema"]["format"] == (
+        "uuid"
     )
     served = APIClient().get("/api/v1/integration/openapi")
     assert served.status_code == 200

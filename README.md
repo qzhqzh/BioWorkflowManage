@@ -41,8 +41,8 @@ BioWorkflowManage 是面向生物信息学流程工程化的可视化 Workflow �
 - ToolSpec、Workflow Graph、DAG 与类型校验；
 - Graph -> Compiler IR -> WDL 1.0 和 miniwdl 校验；
 - 独立 miniwdl 隔离执行环境、真实容器 smoke 和数据案例预检；
-- Service Account、稳定分析产品目录、幂等第三方投递、受管路径与 S3/MinIO 不可变输入、取消/重跑、语义化输出和
-  持久 Outbox 签名 Webhook；
+- Service Account、稳定分析产品目录、幂等第三方投递、受管路径与 S3/MinIO 不可变输入、取消/重跑、语义化输出、
+  S3/MinIO/受管目录异步结果交付与确认，以及持久 Outbox 签名 Webhook；
 - 通过受限 MCP 查询分析产品/流程/软件并独立测试固定 WorkflowVersion 或 ToolVersion；
 - 工具、流程、WDL 与子流程的不可变版本；
 - 子流程以固定 `slug + version + digest` 的黑盒节点复用，并编译为 WDL
@@ -61,7 +61,9 @@ BioWorkflowManage 是面向生物信息学流程工程化的可视化 Workflow �
 
 认证登录、WDL 工具包管理和运行分析页面已经落地；运行分析由独立
 `analysis-worker` 领取队列任务并记录进度、事件、取消、重跑和输出证据；独立
-`webhook-dispatcher` 从事务 Outbox 投递终态通知，网络失败不会反向修改分析状态。成本与
+`artifact-exporter` 以租约和 SHA-256 清单交付结果，`webhook-dispatcher` 从事务 Outbox 投递
+终态与交付完成通知；交付或通知失败不会反向修改分析状态。输出清理由显式 dry-run 优先的
+maintenance 命令控制，不自动删除 Docker volume。成本与
 集群资源配额属于后续执行引擎阶段。
 
 ## miniwdl 校验与真实运行

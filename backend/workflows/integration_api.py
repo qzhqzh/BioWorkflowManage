@@ -37,6 +37,12 @@ from .analysis_runtime import (
     _failure_metadata,
     _verify_run_resource_manifests,
 )
+from .artifact_exports import (
+    ArtifactExportError,
+    acknowledge_artifact_export,
+    artifact_export_payload,
+    create_artifact_export,
+)
 from .analysis_products import (
     AnalysisProductError,
     analysis_product_version_is_current,
@@ -66,6 +72,8 @@ from .models import (
     AnalysisProductVersion,
     AnalysisRun,
     AnalysisRunEvent,
+    AnalysisOutputRetention,
+    ArtifactExport,
     ServiceAccount,
     SoftwareAsset,
     ToolVersion,
@@ -1811,6 +1819,8 @@ def _public_text(value: Any) -> str:
             "ANALYSIS_INPUT_STAGING_ROOT",
             "ANALYSIS_INPUT_STAGING_EXECUTION_ROOT",
             "ANALYSIS_OBJECT_STORAGE_PROFILE_DIR",
+            "ANALYSIS_ARTIFACT_EXPORT_ROOT",
+            "ANALYSIS_ARTIFACT_EXPORT_PROFILE_DIR",
         )
     }
     for root in sorted((item for item in roots if item), key=len, reverse=True):
@@ -2444,11 +2454,167 @@ def integration_analysis_run_outputs(request, run_id):
     )
 
 
+def _artifact_export_error_response(request, error: ArtifactExportError) -> Response:
+    if error.http_status == status.HTTP_403_FORBIDDEN:
+        category = "authorization"
+    elif error.http_status >= status.HTTP_500_INTERNAL_SERVER_ERROR:
+        category = "infrastructure"
+    elif error.http_status == status.HTTP_400_BAD_REQUEST:
+        category = "validation"
+    else:
+        category = "resource"
+    return _error_response(
+        request,
+        IntegrationAPIError(
+            error.code,
+            str(error),
+            category=category,
+            retryable=error.retryable,
+            details=error.details,
+            http_status=error.http_status,
+        ),
+    )
+
+
+def _visible_artifact_exports(request):
+    queryset = ArtifactExport.objects.select_related(
+        "run",
+        "service_account",
+        "retention",
+    ).prefetch_related("retention__artifact_exports")
+    account = _service_account(request)
+    return queryset.filter(service_account=account) if account else queryset
+
+
+@require_service_scopes_by_method(
+    GET=("analysis:read",),
+    POST=("analysis:export",),
+)
+@api_view(["GET", "POST"])
+@permission_classes([IntegrationScopePermission])
+def integration_analysis_run_artifact_exports(request, run_id):
+    run = get_object_or_404(_visible_runs(request), pk=run_id)
+    if request.method == "GET":
+        exports = _visible_artifact_exports(request).filter(run=run).order_by(
+            "created_at",
+            "id",
+        )[:200]
+        return Response(
+            {
+                "view": "summary",
+                "run_id": str(run.id),
+                "results": [
+                    artifact_export_payload(item, include_manifest=False)
+                    for item in exports
+                ],
+            }
+        )
+
+    try:
+        body = request.data
+        if not isinstance(body, dict) or set(body) - {
+            "target",
+            "requires_ack",
+            "retain_until",
+        }:
+            raise ArtifactExportError(
+                "ARTIFACT_EXPORT_REQUEST_INVALID",
+                "Artifact Export 请求包含未知字段。",
+            )
+        target = body.get("target")
+        if not isinstance(target, dict) or set(target) != {"profile"}:
+            raise ArtifactExportError(
+                "ARTIFACT_EXPORT_TARGET_INVALID",
+                "target 只能引用部署侧 Artifact Export profile。",
+            )
+        profile_name = str(target.get("profile") or "").strip()
+        requires_ack = body.get("requires_ack", True)
+        if not isinstance(requires_ack, bool):
+            raise ArtifactExportError(
+                "ARTIFACT_EXPORT_REQUEST_INVALID",
+                "requires_ack 必须是 boolean。",
+            )
+        account = _service_account(request) or run.service_account
+        if account is None:
+            raise ArtifactExportError(
+                "ARTIFACT_EXPORT_SERVICE_ACCOUNT_REQUIRED",
+                "只有归属于 Service Account 的分析运行可以创建 Artifact Export。",
+                http_status=409,
+            )
+        export, created = create_artifact_export(
+            run=run,
+            account=account,
+            idempotency_key=_idempotency_key(request),
+            profile_name=profile_name,
+            requires_ack=requires_ack,
+            retain_until=body.get("retain_until"),
+            actor=_actor(request),
+        )
+        export = _visible_artifact_exports(request).get(pk=export.pk)
+    except ArtifactExportError as error:
+        return _artifact_export_error_response(request, error)
+    except IntegrationAPIError as error:
+        return _error_response(request, error)
+    return Response(
+        artifact_export_payload(export),
+        status=(status.HTTP_201_CREATED if created else status.HTTP_200_OK),
+    )
+
+
+@require_service_scopes("analysis:read")
+@api_view(["GET"])
+@permission_classes([IntegrationScopePermission])
+def integration_artifact_export_detail(request, export_id):
+    export = get_object_or_404(_visible_artifact_exports(request), pk=export_id)
+    return Response(artifact_export_payload(export))
+
+
+@require_service_scopes("analysis:acknowledge")
+@api_view(["POST"])
+@permission_classes([IntegrationScopePermission])
+def integration_artifact_export_acknowledge(request, export_id):
+    export = get_object_or_404(_visible_artifact_exports(request), pk=export_id)
+    body = request.data
+    try:
+        if not isinstance(body, dict) or set(body) - {
+            "manifest_digest",
+            "external_receipt",
+        }:
+            raise ArtifactExportError(
+                "ARTIFACT_EXPORT_ACK_INVALID",
+                "交付确认请求包含未知字段。",
+            )
+        export = acknowledge_artifact_export(
+            export,
+            manifest_digest=str(body.get("manifest_digest") or "").strip(),
+            external_receipt=str(body.get("external_receipt") or "").strip(),
+            actor=_actor(request),
+        )
+        export = _visible_artifact_exports(request).get(pk=export.pk)
+    except ArtifactExportError as error:
+        return _artifact_export_error_response(request, error)
+    return Response(artifact_export_payload(export))
+
+
 @require_service_scopes("analysis:download")
 @api_view(["GET"])
 @permission_classes([IntegrationScopePermission])
 def integration_analysis_run_output_download(request, run_id):
     run = get_object_or_404(_visible_runs(request), pk=run_id)
+    retention = getattr(run, "output_retention", None)
+    if (
+        retention is not None
+        and retention.state == AnalysisOutputRetention.State.CLEANED
+    ):
+        return _error_response(
+            request,
+            IntegrationAPIError(
+                "ANALYSIS_OUTPUT_CLEANED",
+                "本地分析输出已按显式保留策略清理；请使用已确认的 Artifact Export。",
+                category="resource",
+                http_status=status.HTTP_410_GONE,
+            ),
+        )
     key = str(request.query_params.get("key") or "")
     manifest = run.output_manifest if isinstance(run.output_manifest, dict) else {}
     has_integrity_v2 = output_manifest_has_integrity_v2(manifest)

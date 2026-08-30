@@ -6,6 +6,10 @@ BioWorkflowManage 作为通用分析执行控制面，负责固定 Workflow/Tool
 排队、miniwdl 执行、状态、事件、取消、重跑和语义化输出。OKB 等报告系统继续负责患者、
 样本业务、QC/SNV/CNV 入库和报告，不共享数据库，也不直接写 `AnalysisRun`。
 
+平台也可以作为独立组件部署：上游用 Integration API 提交任务，下游通过轮询或签名 Webhook
+接收状态，再按部署侧 profile 把不可变结果异步交付到 S3/MinIO 或受管目录。分析结论、结果交付
+和上游业务入库是三个独立状态，任一交付故障都不会反向改写 `AnalysisRun.status`。
+
 外部系统只通过 `/api/v1/integration/` 接口访问。在线 OpenAPI 位于：
 
 ```text
@@ -31,6 +35,8 @@ docker compose exec backend python backend/manage.py manage_service_account \
   --scope analysis:cancel \
   --scope analysis:retry \
   --scope analysis:download \
+  --scope analysis:export \
+  --scope analysis:acknowledge \
   --scope workflow:read \
   --token-name production-01 \
   --expires-days 90 \
@@ -54,7 +60,7 @@ docker compose exec backend python backend/manage.py manage_service_account \
 | --- | --- |
 | 只读目录/状态 | `workflow:read`、`library:read`、`analysis:read` |
 | AI 小数据 Task 测试 | 上述只读权限 + `task:test` |
-| 报告系统投递 | `workflow:read`、`analysis:submit`、`analysis:read`、`analysis:download` |
+| 报告系统投递并异步接收结果 | `workflow:read`、`analysis:submit`、`analysis:read`、`analysis:download`、`analysis:export`、`analysis:acknowledge` |
 | 人工运维代理 | 按需额外增加 `analysis:cancel`、`analysis:retry` |
 
 不要默认给 AI Agent 取消、重跑权限。Service Account 的 scope 发生变化时，该账户的所有
@@ -378,9 +384,121 @@ v2 输出清单按单项放行：若某个值、目录或文件无法固化，�
 升级前的历史清单只有 `schema_version=1`、没有 `integrity_version=2` 时不提供下载地址；下载
 请求稳定返回 409 `ANALYSIS_OUTPUT_UNVERIFIED`，完成发布手册中的受控回填后才恢复下载。
 
+### 5.1 异步 Artifact Export、确认与保留
+
+大结果不应通过 Webhook body 传输。上游在运行 `succeeded` 且输出清单已固化后，用独立幂等键
+创建 Artifact Export：
+
+```bash
+curl -sS -X POST \
+  -H "Authorization: Bearer $BIOWORKFLOW_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: MES-20260830-001-delivery-v1" \
+  http://localhost:8082/api/v1/integration/analysis-runs/<run-id>/artifact-exports \
+  -d '{
+    "target": {"profile": "mes-production"},
+    "requires_ack": true,
+    "retain_until": "2026-10-01T00:00:00Z"
+  }'
+```
+
+请求只允许引用 profile，不接受目录、bucket、endpoint 或凭据。相同 key 与相同请求返回同一
+export；同 key 改变目标、确认要求或保留时间返回 `409 IDEMPOTENCY_CONFLICT`。状态为
+`pending -> exporting -> succeeded`，超过重试次数进入 `dead_letter`。独立
+`artifact-exporter` 从 PostgreSQL 领取带租约的任务；API 与 `webhook-dispatcher` 不复制文件。
+成功响应中的 `manifest` 保留每项 `semantic_type`、`size`、`sha256`、`content_type`、run ID
+和目标位置；文件全部校验成功后才发布 `manifest.json` 并发送完成事件。一次文件失败不会把整个
+export 标为成功，也不会改变分析运行结论。v1 交付 File 和有界 JSON value；Directory 必须由
+Workflow 先打包为 File。
+
+部署侧 profile 位于
+`${ANALYSIS_ARTIFACT_EXPORT_SECRETS_HOST_PATH}/<profile>.json`。受管目录示例：
+
+```json
+{
+  "type": "managed_directory",
+  "allowed_clients": ["mes-production"],
+  "directory": "customers/mes-production",
+  "root_alias": "mes-results",
+  "public_uri_prefix": "nas://mes-results"
+}
+```
+
+`directory` 是相对 `ANALYSIS_ARTIFACT_EXPORT_HOST_PATH` 的路径；新建交付目录为 `0750`、目标文件
+为只读，部署方可用 `MINIWDL_GID` 对应的共享只读组让接收系统访问。已有同名文件只有在大小和
+SHA-256 完全一致时才幂等复用。S3/MinIO 示例：
+
+```json
+{
+  "type": "s3",
+  "allowed_clients": ["mes-production"],
+  "endpoint_url": "https://minio.example.internal",
+  "region": "us-east-1",
+  "bucket": "analysis-deliveries",
+  "prefix": "tenant-a",
+  "allow_private_network": true,
+  "allowed_cidrs": ["10.20.0.0/16"],
+  "access_key_id": "<delivery access key>",
+  "secret_access_key": "<delivery secret>"
+}
+```
+
+profile 文件不得提交到 Git。S3 profile 应使用只允许目标 bucket/prefix 执行 PutObject、
+multipart、HeadObject/GetObject metadata 与 AbortMultipartUpload 的独立
+账号；凭据不会写入数据库、API、清单或 Webhook。默认只允许 HTTPS 公网 endpoint；私网和 HTTP
+分别需要显式允许，并仍受 CIDR、DNS 解析固定和部署层出口策略约束。创建 export 后改变 profile
+路由会失败关闭，重试不会静默写到另一目标。
+
+查询与确认：
+
+```text
+GET  /api/v1/integration/analysis-runs/{run_id}/artifact-exports
+GET  /api/v1/integration/artifact-exports/{export_id}
+POST /api/v1/integration/artifact-exports/{export_id}/acknowledge
+```
+
+列表返回 `view=summary` 且每项 `manifest=null`，避免最多 200 个大清单放大响应；完整清单只从
+单个 export 详情读取。
+
+确认请求使用成功响应中的清单摘要，而不是文件摘要：
+
+```json
+{
+  "manifest_digest": "sha256:...",
+  "external_receipt": "MES-RECEIPT-20260830-001"
+}
+```
+
+相同摘要和回执重复确认幂等；摘要或回执冲突返回 409。`requires_ack=true` 且未确认、export 未成功、
+运行未终态或 `retain_until` 未到期时，本地输出都不可清理。清理没有常驻自动任务，命令默认只预览：
+
+```bash
+# 队列、到期任务和最老 pending 年龄
+docker compose exec backend python backend/manage.py artifact_export_stats
+
+# 修复目标后重放失败 export；沿用 export ID、目标 key 和历史 attempt
+docker compose exec backend python backend/manage.py replay_artifact_export \
+  --export-id <uuid> --actor operator@example.com
+
+# 默认 dry-run，不删除文件
+docker compose --profile maintenance run --rm artifact-cleaner \
+  python backend/manage.py cleanup_analysis_outputs --run-id <run-id>
+
+# 审核 dry-run 后显式执行；只隔离并删除该运行的受管输出树
+docker compose --profile maintenance run --rm artifact-cleaner \
+  python backend/manage.py cleanup_analysis_outputs --run-id <run-id> \
+  --apply --actor operator@example.com
+```
+
+清理成功只把 `output_status` 置为 `unavailable`，保留清单、export、回执和审计；下载稳定返回
+`410 ANALYSIS_OUTPUT_CLEANED`。不指定 `--run-id` 的批量执行还必须同时显式提供
+`--apply --all-eligible`；任一清理失败时命令非零退出。命令不删除 Docker volume，也不自动删除
+交付目标中的副本。
+
 ## 6. 事务 Outbox 与签名 Webhook
 
-Webhook 只通知 `succeeded`、`failed`、`canceled` 三种终态。状态更新、不可变
+Webhook 通知运行 `succeeded`、`failed`、`canceled` 终态，以及成功的
+`analysis.artifact_export.completed` 交付事件。状态更新、不可变
 `IntegrationOutboxEvent` 和当时已激活订阅对应的 `WebhookDelivery` 在同一数据库事务中提交；
 `analysis-worker` 和 HTTP 请求都不访问外部网络。独立 `webhook-dispatcher` 领取 delivery，
 因此接收方故障不会改变 `AnalysisRun.status`、`output_status` 或错误结论。
@@ -397,6 +515,7 @@ docker compose exec backend python backend/manage.py manage_webhook_endpoint \
   --name terminal \
   --url https://mes.example.com/hooks/bioworkflow \
   --event analysis.run.terminal \
+  --event analysis.artifact_export.completed \
   --actor deployment
 ```
 
@@ -413,7 +532,7 @@ docker compose exec backend python backend/manage.py manage_webhook_endpoint \
 
 ### 6.2 事件与验签
 
-Webhook body 不包含输出正文或文件；接收方收到通知后使用现有详情/输出清单 API 拉取结果：
+Webhook body 不包含输出正文或文件；运行终态事件提示接收方读取详情或创建 Artifact Export：
 
 ```json
 {
@@ -446,6 +565,12 @@ Webhook body 不包含输出正文或文件；接收方收到通知后使用现�
 }
 ```
 
+Artifact Export 成功后会发送单独事件，其中只有 `artifact_export_id`、run/external ref、
+`manifest_digest`、`manifest_location`、`requires_ack` 和 API 链接，不包含 `manifest.items`。接收方
+先验签和去重，再读取 export 详情并校验清单；需要确认时使用其中的 `manifest_digest` 调用
+acknowledge 接口。交付完成事件的完整契约位于 OpenAPI 顶层
+`webhooks.artifactExportCompleted`。
+
 每次请求携带：
 
 - `X-BioWorkflow-Delivery-ID`：同一 endpoint 的自动重试和人工重放保持不变；
@@ -462,8 +587,8 @@ delivery_id + "." + event_id + "." + timestamp + "." + canonical_json_body
 
 `canonical_json_body` 使用 key 排序、无多余空白的 UTF-8 JSON。接收方必须先对原始 body 做
 constant-time HMAC 比较，再检查 timestamp（建议 ±300 秒），持久化去重 `event_id`，最后仅在
-`status_version` 不旧于本地已处理版本时推进状态。OpenAPI 3.1 顶层 `webhooks.analysisRunTerminal`
-定义了完整 header 与 body 契约。
+`status_version` 不旧于本地已处理版本时推进状态。OpenAPI 3.1 顶层
+`webhooks.analysisRunTerminal` 定义了完整 header 与 body 契约。
 
 ### 6.3 重试、死信、重放与指标
 
@@ -548,15 +673,15 @@ uv run python backend/manage_mcp.py
 ## 8. 升级与验证
 
 迁移到包含 `0021_serviceaccount_servicetoken_and_more` 至
-`0030_inputstagingcoordinator_inputstaginglease` 的版本前先停止分析 Worker 与
-Webhook dispatcher，避免代码与数据库 Schema 短暂不一致：
+`0031_analysisoutputretention_artifactexport_and_more` 的版本前先停止分析 Worker、
+Artifact Exporter 与 Webhook dispatcher，避免代码与数据库 Schema 短暂不一致：
 
 ```bash
 docker compose --profile wdl-runtime stop analysis-worker
 docker compose --profile wdl-host-runtime stop analysis-worker-host
-docker compose stop webhook-dispatcher
+docker compose stop artifact-exporter webhook-dispatcher
 docker compose up -d --build backend
-docker compose up -d --build webhook-dispatcher
+docker compose up -d --build artifact-exporter webhook-dispatcher
 docker compose --profile wdl-host-runtime up -d --build analysis-worker-host
 docker compose restart gateway
 ```

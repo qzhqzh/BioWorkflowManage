@@ -2141,6 +2141,7 @@ def public_output_manifest(run: AnalysisRun) -> list[dict[str, Any]]:
                 public["reason"] = reason
         if (
             has_integrity_v2
+            and run.output_status != AnalysisRun.OutputStatus.UNAVAILABLE
             and output_manifest_file_item_is_verified(item)
         ):
             public["download_url"] = (
