@@ -280,3 +280,40 @@ ANALYSIS_RUN_HEARTBEAT_SECONDS = min(
     max(5, int(os.environ.get("ANALYSIS_RUN_HEARTBEAT_SECONDS", "30"))),
     max(5, ANALYSIS_RUN_LEASE_SECONDS // 3),
 )
+
+WEBHOOK_SIGNING_KEY = os.environ.get("WEBHOOK_SIGNING_KEY") or (
+    f"bioworkflow-webhook-v1:{SECRET_KEY}"
+)
+WEBHOOK_DELIVERY_TIMEOUT_SECONDS = max(
+    0.1,
+    float(os.environ.get("WEBHOOK_DELIVERY_TIMEOUT_SECONDS", "10")),
+)
+WEBHOOK_DELIVERY_POLL_SECONDS = max(
+    0.2,
+    float(os.environ.get("WEBHOOK_DELIVERY_POLL_SECONDS", "2")),
+)
+WEBHOOK_DELIVERY_LEASE_SECONDS = max(
+    30,
+    int(os.environ.get("WEBHOOK_DELIVERY_LEASE_SECONDS", "60")),
+)
+WEBHOOK_MAX_ATTEMPTS = max(
+    1,
+    int(os.environ.get("WEBHOOK_MAX_ATTEMPTS", "8")),
+)
+WEBHOOK_BACKOFF_BASE_SECONDS = max(
+    1.0,
+    float(os.environ.get("WEBHOOK_BACKOFF_BASE_SECONDS", "5")),
+)
+WEBHOOK_BACKOFF_MAX_SECONDS = max(
+    WEBHOOK_BACKOFF_BASE_SECONDS,
+    float(os.environ.get("WEBHOOK_BACKOFF_MAX_SECONDS", "3600")),
+)
+WEBHOOK_RESPONSE_MAX_BYTES = max(
+    0,
+    int(os.environ.get("WEBHOOK_RESPONSE_MAX_BYTES", "2048")),
+)
+WEBHOOK_ALLOWED_HTTP_HOSTS = _csv_environment("WEBHOOK_ALLOWED_HTTP_HOSTS", "")
+WEBHOOK_PRIVATE_HOST_ALLOWLIST = _csv_environment(
+    "WEBHOOK_PRIVATE_HOST_ALLOWLIST",
+    "",
+)

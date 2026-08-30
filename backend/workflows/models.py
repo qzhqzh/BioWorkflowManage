@@ -4,6 +4,7 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models.functions import Lower
+from django.utils import timezone
 
 
 def default_wdl_release_checks():
@@ -15,6 +16,10 @@ def default_wdl_release_checks():
         "resolved_threads",
         "small_data_run",
     ]
+
+
+def default_webhook_event_types():
+    return ["analysis.run.terminal"]
 
 
 class ImmutableSnapshot(models.Model):
@@ -51,6 +56,17 @@ class AnalysisProductVersionQuerySet(models.QuerySet):
 
     def delete(self):
         raise ValidationError("AnalysisProductVersion snapshots cannot be deleted.")
+
+
+class IntegrationOutboxEventQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        raise ValidationError("IntegrationOutboxEvent snapshots cannot be updated.")
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        raise ValidationError("IntegrationOutboxEvent snapshots cannot be updated.")
+
+    def delete(self):
+        raise ValidationError("IntegrationOutboxEvent snapshots cannot be deleted.")
 
 
 class WorkflowDocument(models.Model):
@@ -1371,3 +1387,195 @@ class AnalysisRunEvent(models.Model):
 
     class Meta:
         ordering = ["created_at", "id"]
+
+
+class WebhookEndpoint(models.Model):
+    """Outbound terminal-event subscription owned by one Service Account."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    service_account = models.ForeignKey(
+        ServiceAccount,
+        on_delete=models.PROTECT,
+        related_name="webhook_endpoints",
+    )
+    name = models.SlugField(max_length=128)
+    url = models.URLField(max_length=2048)
+    event_types = models.JSONField(default=default_webhook_event_types)
+    is_active = models.BooleanField(default=True)
+    secret_salt = models.UUIDField(default=uuid.uuid4, editable=False)
+    secret_version = models.PositiveIntegerField(default=1)
+    created_by = models.CharField(max_length=256, default="deployment")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["service_account_id", "name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["service_account", "name"],
+                name="unique_service_webhook_endpoint",
+            )
+        ]
+
+
+class IntegrationOutboxEvent(ImmutableSnapshot):
+    """Immutable event snapshot committed with an AnalysisRun terminal state."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    service_account = models.ForeignKey(
+        ServiceAccount,
+        on_delete=models.PROTECT,
+        related_name="outbox_events",
+    )
+    run = models.ForeignKey(
+        AnalysisRun,
+        on_delete=models.PROTECT,
+        related_name="outbox_events",
+    )
+    event_type = models.CharField(max_length=64)
+    status_version = models.PositiveIntegerField()
+    payload = models.JSONField()
+    occurred_at = models.DateTimeField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    objects = IntegrationOutboxEventQuerySet.as_manager()
+
+    class Meta:
+        ordering = ["created_at", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["run", "event_type", "status_version"],
+                name="unique_run_outbox_status_event",
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=["service_account", "created_at"],
+                name="outbox_service_created_idx",
+            )
+        ]
+
+
+class WebhookDelivery(models.Model):
+    class State(models.TextChoices):
+        PENDING = "pending", "Pending"
+        DELIVERING = "delivering", "Delivering"
+        DELIVERED = "delivered", "Delivered"
+        DEAD_LETTER = "dead_letter", "Dead letter"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    event = models.ForeignKey(
+        IntegrationOutboxEvent,
+        on_delete=models.PROTECT,
+        related_name="deliveries",
+    )
+    endpoint = models.ForeignKey(
+        WebhookEndpoint,
+        on_delete=models.PROTECT,
+        related_name="deliveries",
+    )
+    target_url = models.URLField(max_length=2048)
+    secret_salt = models.UUIDField(editable=False)
+    secret_version = models.PositiveIntegerField()
+    state = models.CharField(
+        max_length=16,
+        choices=State.choices,
+        default=State.PENDING,
+        db_index=True,
+    )
+    attempt_count = models.PositiveIntegerField(default=0)
+    replay_count = models.PositiveIntegerField(default=0)
+    next_attempt_at = models.DateTimeField(default=timezone.now, db_index=True)
+    lease_token = models.UUIDField(null=True, blank=True, editable=False)
+    lease_expires_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    delivered_at = models.DateTimeField(null=True, blank=True)
+    last_status_code = models.PositiveSmallIntegerField(null=True, blank=True)
+    last_error_code = models.CharField(max_length=64, blank=True)
+    last_error = models.TextField(blank=True)
+    last_response_excerpt = models.TextField(blank=True)
+    last_replayed_at = models.DateTimeField(null=True, blank=True)
+    last_replayed_by = models.CharField(max_length=256, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["next_attempt_at", "created_at", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["event", "endpoint"],
+                name="unique_event_endpoint_delivery",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        state="delivering",
+                        lease_token__isnull=False,
+                        lease_expires_at__isnull=False,
+                    )
+                    | (
+                        ~models.Q(state="delivering")
+                        & models.Q(
+                            lease_token__isnull=True,
+                            lease_expires_at__isnull=True,
+                        )
+                    )
+                ),
+                name="webhook_delivery_lease_matches_state",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~models.Q(state="delivered")
+                    | models.Q(delivered_at__isnull=False)
+                ),
+                name="webhook_delivery_has_delivered_at",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["state", "next_attempt_at"],
+                name="webhook_delivery_due_idx",
+            ),
+            models.Index(
+                fields=["state", "lease_expires_at"],
+                name="webhook_delivery_lease_idx",
+            ),
+        ]
+
+
+class WebhookDeliveryAttempt(models.Model):
+    class Outcome(models.TextChoices):
+        STARTED = "started", "Started"
+        DELIVERED = "delivered", "Delivered"
+        RETRY = "retry", "Retry scheduled"
+        DEAD_LETTER = "dead_letter", "Dead letter"
+        LEASE_EXPIRED = "lease_expired", "Lease expired"
+
+    delivery = models.ForeignKey(
+        WebhookDelivery,
+        on_delete=models.PROTECT,
+        related_name="attempts",
+    )
+    attempt_number = models.PositiveIntegerField()
+    replay_number = models.PositiveIntegerField(default=0)
+    outcome = models.CharField(
+        max_length=16,
+        choices=Outcome.choices,
+        default=Outcome.STARTED,
+    )
+    request_timestamp = models.PositiveBigIntegerField(null=True, blank=True)
+    resolved_address = models.GenericIPAddressField(null=True, blank=True)
+    status_code = models.PositiveSmallIntegerField(null=True, blank=True)
+    error_code = models.CharField(max_length=64, blank=True)
+    error = models.TextField(blank=True)
+    response_excerpt = models.TextField(blank=True)
+    started_at = models.DateTimeField(auto_now_add=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["delivery_id", "attempt_number"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["delivery", "attempt_number"],
+                name="unique_webhook_delivery_attempt",
+            )
+        ]

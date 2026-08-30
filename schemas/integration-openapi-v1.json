@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "BioWorkflowManage Integration API",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "description": "第三方 MES、运营平台、报告系统与 AI Agent 使用的固定分析产品、Task 测试及资产查询接口。所有写操作均受 Service Token scope、受管路径、幂等键和审计约束。"
   },
   "servers": [{"url": "/api/v1/integration"}],
@@ -185,6 +185,28 @@
       "get": {"operationId": "listSoftware", "summary": "读取软件知识库基本信息", "x-required-scope": "library:read", "responses": {"200": {"description": "软件列表"}}}
     }
   },
+  "webhooks": {
+    "analysisRunTerminal": {
+      "post": {
+        "operationId": "receiveAnalysisRunTerminal",
+        "summary": "接收分析运行终态事件",
+        "description": "接收方必须先验证 timestamp 窗口与 HMAC-SHA256，再按 event_id 去重，并以 status_version 拒绝旧于已处理版本的乱序状态。delivery_id 在自动重试和人工重放中保持不变。",
+        "parameters": [
+          {"name": "X-BioWorkflow-Delivery-ID", "in": "header", "required": true, "schema": {"type": "string", "format": "uuid"}},
+          {"name": "X-BioWorkflow-Event-ID", "in": "header", "required": true, "schema": {"type": "string", "format": "uuid"}},
+          {"name": "X-BioWorkflow-Timestamp", "in": "header", "required": true, "schema": {"type": "string", "pattern": "^[0-9]{10,}$"}},
+          {"name": "X-BioWorkflow-Secret-Version", "in": "header", "required": true, "schema": {"type": "string", "pattern": "^[1-9][0-9]*$"}},
+          {"name": "X-BioWorkflow-Signature", "in": "header", "required": true, "schema": {"type": "string", "pattern": "^v1=[0-9a-f]{64}$"}}
+        ],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AnalysisRunTerminalEvent"}}}},
+        "responses": {
+          "200": {"description": "事件已接收或已幂等处理"},
+          "202": {"description": "事件已进入接收方队列"},
+          "204": {"description": "事件已接收，无响应体"}
+        }
+      }
+    }
+  },
   "components": {
     "securitySchemes": {
       "serviceToken": {"type": "http", "scheme": "bearer", "bearerFormat": "BioWorkflowManage Service Token"}
@@ -359,6 +381,56 @@
         "properties": {
           "view": {"type": "string", "const": "summary"},
           "results": {"type": "array", "maxItems": 200, "items": {"$ref": "#/components/schemas/AnalysisRun"}}
+        }
+      },
+      "AnalysisRunTerminalEvent": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["schema_version", "event_id", "event_type", "occurred_at", "data"],
+        "properties": {
+          "schema_version": {"type": "string", "const": "1.0.0"},
+          "event_id": {"type": "string", "format": "uuid"},
+          "event_type": {"type": "string", "const": "analysis.run.terminal"},
+          "occurred_at": {"type": "string", "format": "date-time"},
+          "data": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["run_id", "run_kind", "external_ref", "analysis_product", "status", "status_version", "output_status", "finished_at", "error", "links"],
+            "properties": {
+              "run_id": {"type": "string", "format": "uuid"},
+              "run_kind": {"type": "string", "enum": ["workflow", "tool_test"]},
+              "external_ref": {"$ref": "#/components/schemas/ExternalRef"},
+              "analysis_product": {"oneOf": [{"$ref": "#/components/schemas/AnalysisProductRunRef"}, {"type": "null"}]},
+              "status": {"type": "string", "enum": ["succeeded", "failed", "canceled"]},
+              "status_version": {"type": "integer", "minimum": 1},
+              "output_status": {"type": "string", "enum": ["complete", "incomplete", "unavailable"]},
+              "finished_at": {"oneOf": [{"type": "string", "format": "date-time"}, {"type": "null"}]},
+              "error": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["code", "category", "retryable"],
+                    "properties": {
+                      "code": {"type": "string"},
+                      "category": {"type": "string"},
+                      "retryable": {"type": "boolean"}
+                    }
+                  },
+                  {"type": "null"}
+                ]
+              },
+              "links": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["run", "outputs"],
+                "properties": {
+                  "run": {"type": "string"},
+                  "outputs": {"type": "string"}
+                }
+              }
+            }
+          }
         }
       },
       "ErrorEnvelope": {"type": "object", "required": ["error"], "properties": {"error": {"$ref": "#/components/schemas/Error"}}},

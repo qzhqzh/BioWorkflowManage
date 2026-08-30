@@ -31,6 +31,7 @@ from .integration_outputs import (
     ResourceSnapshotBudgetError,
 )
 from .models import AnalysisRun, AnalysisRunEvent
+from .webhooks import enqueue_terminal_event
 from .wdl_packages import normalize_package_path
 from .wdl_source_references import (
     effective_package_files,
@@ -172,14 +173,20 @@ def _update_run(run: AnalysisRun, **values) -> None:
     if status_changed:
         values["status_version"] = F("status_version") + 1
     values["updated_at"] = timezone.now()
-    queryset = AnalysisRun.objects.filter(pk=run.pk)
-    if lease_token is not None:
-        queryset = queryset.filter(
-            lease_token=lease_token,
-            status__in=[AnalysisRun.Status.PREPARING, AnalysisRun.Status.RUNNING],
-        )
-    if queryset.update(**values) != 1:
-        raise AnalysisRunLeaseLost(f"analysis run {run.id} lease is no longer active")
+    with transaction.atomic():
+        queryset = AnalysisRun.objects.filter(pk=run.pk)
+        if lease_token is not None:
+            queryset = queryset.filter(
+                lease_token=lease_token,
+                status__in=[AnalysisRun.Status.PREPARING, AnalysisRun.Status.RUNNING],
+            )
+        if queryset.update(**values) != 1:
+            raise AnalysisRunLeaseLost(
+                f"analysis run {run.id} lease is no longer active"
+            )
+        if status_changed:
+            persisted_run = AnalysisRun.objects.get(pk=run.pk)
+            enqueue_terminal_event(persisted_run)
     for name, value in values.items():
         if name != "status_version":
             setattr(run, name, value)
@@ -338,6 +345,7 @@ def _finalize_cancelled_run(run_id, lease_token) -> bool:
                 "updated_at",
             ]
         )
+        enqueue_terminal_event(run)
         _event(run, "运行已按请求取消。", kind="cancellation", level="warning")
         return True
 
@@ -398,6 +406,7 @@ def _recover_stale_runs(now) -> None:
         run.worker_heartbeat_at = None
         run.lease_expires_at = None
         run.save()
+        enqueue_terminal_event(run)
         _event(run, message, kind="lease", level=level)
         if stale_work_directory:
             transaction.on_commit(

@@ -25,6 +25,13 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-bioworkflow}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?Set DJANGO_SECRET_KEY in .env}
+      WEBHOOK_SIGNING_KEY: "${WEBHOOK_SIGNING_KEY:-}"
+      WEBHOOK_ALLOWED_HTTP_HOSTS: "${WEBHOOK_ALLOWED_HTTP_HOSTS:-}"
+      WEBHOOK_PRIVATE_HOST_ALLOWLIST: "${WEBHOOK_PRIVATE_HOST_ALLOWLIST:-}"
+      WEBHOOK_DELIVERY_TIMEOUT_SECONDS: "${WEBHOOK_DELIVERY_TIMEOUT_SECONDS:-10}"
+      WEBHOOK_MAX_ATTEMPTS: "${WEBHOOK_MAX_ATTEMPTS:-8}"
+      WEBHOOK_BACKOFF_BASE_SECONDS: "${WEBHOOK_BACKOFF_BASE_SECONDS:-5}"
+      WEBHOOK_BACKOFF_MAX_SECONDS: "${WEBHOOK_BACKOFF_MAX_SECONDS:-3600}"
       DJANGO_ALLOWED_HOSTS: "${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1,[::1],wdl.qzhqzh.com}"
       DJANGO_CSRF_TRUSTED_ORIGINS: "${DJANGO_CSRF_TRUSTED_ORIGINS:-https://wdl.qzhqzh.com,http://localhost:8082,http://127.0.0.1:8082}"
       CORS_ALLOWED_ORIGINS: "${CORS_ALLOWED_ORIGINS:-https://wdl.qzhqzh.com,http://localhost:3000,http://127.0.0.1:3000}"
@@ -104,6 +111,42 @@ services:
       RAWDATA_INDEX_STALE_SECONDS: "${RAWDATA_INDEX_STALE_SECONDS:-900}"
     volumes:
       - ${ANALYSIS_RAWDATA_HOST_PATH:-./workspace/rawdata}:/analysis/rawdata:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  webhook-dispatcher:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    restart: unless-stopped
+    command: ["python", "backend/manage.py", "run_webhook_dispatcher"]
+    user: "${MINIWDL_UID:-1000}:${MINIWDL_GID:-1000}"
+    read_only: true
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_DB: ${POSTGRES_DB:-bioworkflow}
+      POSTGRES_USER: ${POSTGRES_USER:-bioworkflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?Set DJANGO_SECRET_KEY in .env}
+      WEBHOOK_SIGNING_KEY: "${WEBHOOK_SIGNING_KEY:-}"
+      WEBHOOK_ALLOWED_HTTP_HOSTS: "${WEBHOOK_ALLOWED_HTTP_HOSTS:-}"
+      WEBHOOK_PRIVATE_HOST_ALLOWLIST: "${WEBHOOK_PRIVATE_HOST_ALLOWLIST:-}"
+      WEBHOOK_DELIVERY_TIMEOUT_SECONDS: "${WEBHOOK_DELIVERY_TIMEOUT_SECONDS:-10}"
+      WEBHOOK_DELIVERY_POLL_SECONDS: "${WEBHOOK_DELIVERY_POLL_SECONDS:-2}"
+      WEBHOOK_DELIVERY_LEASE_SECONDS: "${WEBHOOK_DELIVERY_LEASE_SECONDS:-60}"
+      WEBHOOK_MAX_ATTEMPTS: "${WEBHOOK_MAX_ATTEMPTS:-8}"
+      WEBHOOK_BACKOFF_BASE_SECONDS: "${WEBHOOK_BACKOFF_BASE_SECONDS:-5}"
+      WEBHOOK_BACKOFF_MAX_SECONDS: "${WEBHOOK_BACKOFF_MAX_SECONDS:-3600}"
+      WEBHOOK_RESPONSE_MAX_BYTES: "${WEBHOOK_RESPONSE_MAX_BYTES:-2048}"
     depends_on:
       db:
         condition: service_healthy

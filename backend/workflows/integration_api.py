@@ -73,6 +73,7 @@ from .models import (
 )
 from .request_ids import request_id, with_request_id
 from .tool_runs import _safe_identifier, _tool_test_bundle, _validate_constraints
+from .webhooks import enqueue_terminal_event
 
 
 EXTERNAL_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -2116,6 +2117,7 @@ def integration_analysis_run_cancel(request, run_id):
             run.current_step = "正在取消运行"
         run.status_version += 1
         run.save()
+        enqueue_terminal_event(run)
         AnalysisRunEvent.objects.create(
             run=run,
             kind="cancellation",
