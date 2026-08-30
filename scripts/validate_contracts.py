@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCHEMAS = ROOT / "schemas"
 FIXTURE = ROOT / "examples" / "phase1-fastp"
 VALIDATION_FIXTURE = ROOT / "examples" / "validation"
+ANALYSIS_NODE_PACKAGE = ROOT / "deploy" / "analysis-node"
 
 STAGES = (
     "parse",
@@ -233,6 +234,8 @@ def main() -> None:
     }
     for schema in schemas.values():
         Draft202012Validator.check_schema(schema)
+    for name in ("config.schema.json", "images-lock.schema.json"):
+        Draft202012Validator.check_schema(load_json(ANALYSIS_NODE_PACKAGE / name))
 
     tool = load_json(FIXTURE / "tool-fastp.json")
     graph = load_json(FIXTURE / "workflow-graph.json")

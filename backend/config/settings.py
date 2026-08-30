@@ -66,6 +66,9 @@ WSGI_APPLICATION = "config.wsgi.application"
 # Authentication is enabled by default. Contract-focused API test modules opt out
 # explicitly; authentication tests exercise the deployed setting.
 AUTH_REQUIRED = os.environ.get("DJANGO_AUTH_REQUIRED", "1") == "1"
+INTEGRATION_REQUIRE_ANALYSIS_PRODUCT = (
+    os.environ.get("INTEGRATION_REQUIRE_ANALYSIS_PRODUCT", "0") == "1"
+)
 SESSION_COOKIE_HTTPONLY = True
 SESSION_COOKIE_SAMESITE = os.environ.get("DJANGO_SESSION_COOKIE_SAMESITE", "Lax")
 SESSION_COOKIE_SECURE = os.environ.get("DJANGO_SESSION_COOKIE_SECURE", "0") == "1"

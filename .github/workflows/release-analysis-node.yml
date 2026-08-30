@@ -1,0 +1,206 @@
+name: Release Analysis Node
+
+on:
+  push:
+    tags:
+      - "analysis-node-v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Semantic version without the v prefix
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+
+concurrency:
+  group: analysis-node-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-sign-package:
+    name: Build, sign, and package linux/amd64
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      REGISTRY: ghcr.io
+      BACKEND_REPOSITORY: ghcr.io/qzhqzh/bioworkflowmanage-backend
+      FRONTEND_REPOSITORY: ghcr.io/qzhqzh/bioworkflowmanage-frontend
+    steps:
+      - name: Checkout release revision
+        uses: actions/checkout@v4
+
+      - name: Resolve and validate version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/analysis-node-v* ]]; then
+            value=${GITHUB_REF_NAME#analysis-node-v}
+          else
+            value=$INPUT_VERSION
+          fi
+          if [[ ! "$value" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]; then
+            echo "Invalid semantic version: $value" >&2
+            exit 64
+          fi
+          echo "value=$value" >> "$GITHUB_OUTPUT"
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies and run package gates
+        run: |
+          uv sync --frozen
+          uvx --from ruff==0.15.14 ruff check backend scripts deploy/analysis-node/lib
+          uv run pytest backend/tests/test_analysis_node_deploy.py backend/tests/test_integration_api.py::test_product_only_deployment_rejects_direct_workflow_source
+          uv run python backend/manage.py check
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Sign in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push backend image
+        id: backend
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.backend
+          platforms: linux/amd64
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: ${{ env.BACKEND_REPOSITORY }}:${{ steps.version.outputs.value }}
+          build-args: |
+            ANALYSIS_NODE_VERSION=${{ steps.version.outputs.value }}
+            GIT_REVISION=${{ github.sha }}
+
+      - name: Build and push console image
+        id: frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.frontend
+          platforms: linux/amd64
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: ${{ env.FRONTEND_REPOSITORY }}:${{ steps.version.outputs.value }}
+          build-args: |
+            ANALYSIS_NODE_VERSION=${{ steps.version.outputs.value }}
+            GIT_REVISION=${{ github.sha }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Sign application images and retain verification bundles
+        env:
+          BACKEND_REF: ${{ env.BACKEND_REPOSITORY }}@${{ steps.backend.outputs.digest }}
+          FRONTEND_REF: ${{ env.FRONTEND_REPOSITORY }}@${{ steps.frontend.outputs.digest }}
+        run: |
+          mkdir -p dist/image-signatures
+          cosign sign --yes --bundle dist/image-signatures/backend.sigstore.json "$BACKEND_REF"
+          cosign sign --yes --bundle dist/image-signatures/frontend.sigstore.json "$FRONTEND_REF"
+          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release-analysis-node.yml@${GITHUB_REF}"
+          cosign verify --offline \
+            --bundle dist/image-signatures/backend.sigstore.json \
+            --certificate-identity "$identity" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$BACKEND_REF"
+          cosign verify --offline \
+            --bundle dist/image-signatures/frontend.sigstore.json \
+            --certificate-identity "$identity" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$FRONTEND_REF"
+
+      - name: Build offline bundle and SBOMs
+        env:
+          BACKEND_REF: ${{ env.BACKEND_REPOSITORY }}@${{ steps.backend.outputs.digest }}
+          FRONTEND_REF: ${{ env.FRONTEND_REPOSITORY }}@${{ steps.frontend.outputs.digest }}
+        run: >-
+          uv run python scripts/build_analysis_node_bundle.py
+          --version "${{ steps.version.outputs.value }}"
+          --backend-ref "$BACKEND_REF"
+          --frontend-ref "$FRONTEND_REF"
+          --git-revision "${{ github.sha }}"
+          --signature-dir dist/image-signatures
+          --output-dir dist
+
+      - name: Sign package manifest and final archive
+        id: artifacts
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          package="dist/analysis-node-$VERSION"
+          archive="dist/analysis-node-$VERSION-linux-amd64.tar.gz"
+          cosign sign-blob --yes --bundle "$package/SHA256SUMS.sigstore.json" "$package/SHA256SUMS"
+          tar -C dist -czf "$archive" "analysis-node-$VERSION"
+          (cd dist && sha256sum "$(basename "$archive")" > "$(basename "$archive").sha256")
+          cosign sign-blob --yes --bundle "$archive.sigstore.json" "$archive"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Verify generated signatures and bundle checksums
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          package="dist/analysis-node-$VERSION"
+          archive="dist/analysis-node-$VERSION-linux-amd64.tar.gz"
+          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release-analysis-node.yml@${GITHUB_REF}"
+          cosign verify-blob \
+            --offline \
+            --bundle "$package/SHA256SUMS.sigstore.json" \
+            --certificate-identity "$identity" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$package/SHA256SUMS"
+          cosign verify-blob \
+            --offline \
+            --bundle "$archive.sigstore.json" \
+            --certificate-identity "$identity" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$archive"
+          "$package/bin/analysis-node" \
+            --env-file "$package/.env.example" \
+            --images-env "$package/images.env" \
+            verify-bundle
+
+      - name: Upload delivery artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: analysis-node-${{ steps.version.outputs.value }}-linux-amd64
+          path: |
+            dist/analysis-node-${{ steps.version.outputs.value }}-linux-amd64.tar.gz
+            dist/analysis-node-${{ steps.version.outputs.value }}-linux-amd64.tar.gz.sha256
+            dist/analysis-node-${{ steps.version.outputs.value }}-linux-amd64.tar.gz.sigstore.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Publish GitHub Release for a release tag
+        if: startsWith(github.ref, 'refs/tags/analysis-node-v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.value }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME"
+          "dist/analysis-node-$VERSION-linux-amd64.tar.gz"
+          "dist/analysis-node-$VERSION-linux-amd64.tar.gz.sha256"
+          "dist/analysis-node-$VERSION-linux-amd64.tar.gz.sigstore.json"
+          --verify-tag
+          --generate-notes
+          --title "Analysis Node $VERSION"

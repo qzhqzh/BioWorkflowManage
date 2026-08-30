@@ -845,6 +845,39 @@ def test_analysis_product_missing_uses_stable_error_contract():
 
 
 @pytest.mark.django_db
+def test_product_only_deployment_rejects_direct_workflow_source(
+    settings,
+    integration_workspace,
+):
+    settings.INTEGRATION_REQUIRE_ANALYSIS_PRODUCT = True
+    _, _, _, client = _token_client()
+    version = _workflow_version()
+    product_version = _analysis_product_version(version)
+
+    direct = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        _submission(version),
+        format="json",
+    )
+    assert direct.status_code == 400
+    assert direct.data["error"]["code"] == "ANALYSIS_PRODUCT_REQUIRED"
+
+    product_body = _submission(version, external_run_id="product-only")
+    product_body.pop("workflow")
+    product_body["analysis_product"] = {
+        "analysis_code": product_version.product.code,
+        "contract_version": product_version.contract_version,
+    }
+    accepted = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        product_body,
+        format="json",
+    )
+    assert accepted.status_code == 200, accepted.data
+    assert accepted.data["analysis_product"]["analysis_code"] == "dna-panel"
+
+
+@pytest.mark.django_db
 def test_service_token_auth_scope_revocation_and_isolation(settings):
     settings.AUTH_REQUIRED = True
     account, token, raw_token, client = _token_client(scopes=["workflow:read"])

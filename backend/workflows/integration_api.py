@@ -541,6 +541,12 @@ def _analysis_source(
         item = _fixed_analysis_product(body.get("analysis_product"))
         return item.workflow_version, item
     if has_workflow:
+        if settings.INTEGRATION_REQUIRE_ANALYSIS_PRODUCT:
+            raise IntegrationAPIError(
+                "ANALYSIS_PRODUCT_REQUIRED",
+                "当前部署只接受已发布的 analysis_product。",
+                category="workflow",
+            )
         return _fixed_workflow(body.get("workflow")), None
     raise IntegrationAPIError(
         "ANALYSIS_SOURCE_REQUIRED",
