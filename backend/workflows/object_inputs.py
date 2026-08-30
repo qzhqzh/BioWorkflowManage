@@ -91,8 +91,7 @@ class ObjectStorageProfile:
     endpoint_url: str
     region: str
     allowed_buckets: tuple[str, ...]
-    allowed_client_ids: tuple[str, ...]
-    allowed_key_prefixes: dict[str, tuple[str, ...]]
+    client_grants: dict[str, dict[str, tuple[str, ...]]]
     access_key_id: str
     secret_access_key: str
     session_token: str
@@ -182,57 +181,60 @@ def _load_profile(name: str) -> ObjectStorageProfile:
             "OBJECT_INPUT_PROFILE_INVALID",
             "对象存储 profile 的 bucket 白名单无效。",
         )
-    raw_clients = value.get("allowed_client_ids")
-    if not isinstance(raw_clients, list) or not raw_clients:
+    raw_grants = value.get("client_grants")
+    if not isinstance(raw_grants, dict) or not raw_grants:
         raise _profile_error(
             "OBJECT_INPUT_PROFILE_INVALID",
-            "对象存储 profile 必须配置 Service Account 白名单。",
+            "对象存储 profile 必须配置 Service Account 授权。",
         )
-    allowed_client_ids = tuple(str(item).strip() for item in raw_clients)
-    if any(not CLIENT_PATTERN.fullmatch(item) for item in allowed_client_ids):
-        raise _profile_error(
-            "OBJECT_INPUT_PROFILE_INVALID",
-            "对象存储 profile 的 Service Account 白名单无效。",
-        )
-    raw_prefixes = value.get("allowed_key_prefixes") or {}
-    if not isinstance(raw_prefixes, dict) or any(
-        bucket not in allowed_buckets for bucket in raw_prefixes
-    ):
-        raise _profile_error(
-            "OBJECT_INPUT_PROFILE_INVALID",
-            "对象存储 profile 的 key 前缀白名单无效。",
-        )
-    allowed_key_prefixes: dict[str, tuple[str, ...]] = {}
-    for bucket, raw_values in raw_prefixes.items():
-        if not isinstance(raw_values, list) or not raw_values:
+    client_grants: dict[str, dict[str, tuple[str, ...]]] = {}
+    for client_id, raw_bucket_grants in raw_grants.items():
+        if (
+            not isinstance(client_id, str)
+            or not CLIENT_PATTERN.fullmatch(client_id)
+            or not isinstance(raw_bucket_grants, dict)
+            or not raw_bucket_grants
+        ):
             raise _profile_error(
                 "OBJECT_INPUT_PROFILE_INVALID",
-                "对象存储 profile 的 key 前缀白名单必须是非空数组。",
+                "对象存储 profile 的 Service Account 授权无效。",
             )
-        prefixes: list[str] = []
-        for raw_prefix in raw_values:
-            if not isinstance(raw_prefix, str) or not raw_prefix:
-                raise _profile_error(
-                    "OBJECT_INPUT_PROFILE_INVALID",
-                    "对象存储 profile 的 key 前缀无效。",
-                )
-            try:
-                encoded_prefix = raw_prefix.encode("utf-8")
-            except UnicodeEncodeError as error:
-                raise _profile_error(
-                    "OBJECT_INPUT_PROFILE_INVALID",
-                    "对象存储 profile 的 key 前缀无效。",
-                ) from error
-            if len(encoded_prefix) > 1024 or any(
-                ord(character) < 32 or ord(character) == 127
-                for character in raw_prefix
+        bucket_grants: dict[str, tuple[str, ...]] = {}
+        for bucket, raw_prefixes in raw_bucket_grants.items():
+            if (
+                bucket not in allowed_buckets
+                or not isinstance(raw_prefixes, list)
+                or not raw_prefixes
             ):
                 raise _profile_error(
                     "OBJECT_INPUT_PROFILE_INVALID",
-                    "对象存储 profile 的 key 前缀无效。",
+                    "对象存储 profile 的 bucket/prefix 授权无效。",
                 )
-            prefixes.append(raw_prefix)
-        allowed_key_prefixes[str(bucket)] = tuple(prefixes)
+            prefixes: list[str] = []
+            for raw_prefix in raw_prefixes:
+                if not isinstance(raw_prefix, str) or not raw_prefix:
+                    raise _profile_error(
+                        "OBJECT_INPUT_PROFILE_INVALID",
+                        "对象存储 profile 的 key 前缀无效。",
+                    )
+                try:
+                    encoded_prefix = raw_prefix.encode("utf-8")
+                except UnicodeEncodeError as error:
+                    raise _profile_error(
+                        "OBJECT_INPUT_PROFILE_INVALID",
+                        "对象存储 profile 的 key 前缀无效。",
+                    ) from error
+                if len(encoded_prefix) > 1024 or any(
+                    ord(character) < 32 or ord(character) == 127
+                    for character in raw_prefix
+                ):
+                    raise _profile_error(
+                        "OBJECT_INPUT_PROFILE_INVALID",
+                        "对象存储 profile 的 key 前缀无效。",
+                    )
+                prefixes.append(raw_prefix)
+            bucket_grants[bucket] = tuple(prefixes)
+        client_grants[client_id] = bucket_grants
     raw_networks = value.get("allowed_cidrs") or []
     if not isinstance(raw_networks, list):
         raise _profile_error(
@@ -253,8 +255,7 @@ def _load_profile(name: str) -> ObjectStorageProfile:
         endpoint_url=endpoint_url,
         region=region,
         allowed_buckets=allowed_buckets,
-        allowed_client_ids=allowed_client_ids,
-        allowed_key_prefixes=allowed_key_prefixes,
+        client_grants=client_grants,
         access_key_id=access_key_id,
         secret_access_key=secret_access_key,
         session_token=session_token,
@@ -335,6 +336,7 @@ def _validate_endpoint(profile: ObjectStorageProfile) -> tuple[str, ...]:
         if (
             address.is_multicast
             or address.is_unspecified
+            or address.is_loopback
             or address.is_link_local
             or address.is_reserved
             or getattr(address, "is_site_local", False)
@@ -618,14 +620,21 @@ def _authorize_reference(
             "对象 bucket 不在 profile 白名单中。",
             http_status=403,
         )
-    if client_id is not None and client_id not in profile.allowed_client_ids:
+    bucket_grants = profile.client_grants.get(client_id or "")
+    if bucket_grants is None:
         raise ObjectInputError(
             "OBJECT_INPUT_PROFILE_FORBIDDEN",
             "当前 Service Account 无权使用该对象存储 profile。",
             http_status=403,
         )
-    prefixes = profile.allowed_key_prefixes.get(reference["bucket"], ())
-    if prefixes and not any(reference["key"].startswith(prefix) for prefix in prefixes):
+    prefixes = bucket_grants.get(reference["bucket"])
+    if prefixes is None:
+        raise ObjectInputError(
+            "OBJECT_INPUT_BUCKET_FORBIDDEN",
+            "当前 Service Account 无权使用该对象 bucket。",
+            http_status=403,
+        )
+    if not any(reference["key"].startswith(prefix) for prefix in prefixes):
         raise ObjectInputError(
             "OBJECT_INPUT_KEY_FORBIDDEN",
             "对象 key 不在 profile 前缀白名单中。",
@@ -686,8 +695,9 @@ def inspect_object_reference(
         profile = _load_profile(reference["profile"])
         _authorize_reference(profile, reference, client_id=client_id)
         addresses = _validate_endpoint(profile)
-        client = _s3_client(profile, addresses)
+        client = None
         try:
+            client = _s3_client(profile, addresses)
             response = client.head_object(
                 **_request_parameters(reference, profile, conditional=True)
             )
@@ -696,7 +706,7 @@ def inspect_object_reference(
                 raise
             raise _mapped_client_error(error, changed_on_missing=False) from error
         finally:
-            close = getattr(client, "close", None)
+            close = getattr(client, "close", None) if client is not None else None
             if callable(close):
                 close()
         return profile, response
@@ -794,9 +804,19 @@ def _staging_relative_path(digest: str, key: str) -> str:
             "对象输入清单的 SHA-256 无效。",
         )
     value = match.group(1).lower()
-    suffixes = "".join(Path(key).suffixes[-3:]).lower()
-    if len(suffixes) > 32 or not re.fullmatch(r"(?:\.[a-z0-9]{1,10}){0,3}", suffixes):
-        suffixes = ""
+    safe_suffixes: list[str] = []
+    suffix_length = 0
+    for raw_suffix in reversed(Path(key).suffixes):
+        suffix = raw_suffix.lower()
+        if (
+            len(safe_suffixes) >= 3
+            or re.fullmatch(r"\.[a-z0-9]{1,10}", suffix) is None
+            or suffix_length + len(suffix) > 32
+        ):
+            break
+        safe_suffixes.insert(0, suffix)
+        suffix_length += len(suffix)
+    suffixes = "".join(safe_suffixes)
     return f"sha256/{value[:2]}/{value}{suffixes}"
 
 
@@ -868,6 +888,8 @@ def object_manifest_items(manifest: Any) -> list[dict[str, Any]]:
         )
     items: list[dict[str, Any]] = []
     unique_sizes: dict[str, int] = {}
+    transfer_identities: set[tuple[Any, ...]] = set()
+    transfer_bytes = 0
     for raw_item in raw_items:
         reference = _manifest_reference(raw_item)
         staging_path = str(raw_item["staging_relative_path"])
@@ -878,11 +900,23 @@ def object_manifest_items(manifest: Any) -> list[dict[str, Any]]:
                 "同一对象摘要声明了不同大小。",
             )
         unique_sizes[staging_path] = reference["size"]
+        identity = (
+            reference["profile"],
+            reference["bucket"],
+            reference["key"],
+            reference["version_id"],
+            reference["etag"],
+            reference["size"],
+            reference["sha256"],
+        )
+        if identity not in transfer_identities:
+            transfer_identities.add(identity)
+            transfer_bytes += reference["size"]
         items.append(raw_item)
-    if sum(unique_sizes.values()) > int(settings.ANALYSIS_OBJECT_STAGE_MAX_RUN_BYTES):
+    if transfer_bytes > int(settings.ANALYSIS_OBJECT_STAGE_MAX_RUN_BYTES):
         raise ObjectInputError(
             "OBJECT_INPUT_RUN_TOO_LARGE",
-            "任务对象输入总量超过部署上限。",
+            "任务对象输入传输总量超过部署上限。",
             http_status=413,
         )
     return items
@@ -1232,6 +1266,7 @@ def _download_to_staging(
             response = client.get_object(
                 **_request_parameters(reference, profile, conditional=True)
             )
+            body = response.get("Body")
             observed_size = response.get("ContentLength")
             observed_etag = _normalized_etag(response.get("ETag"))
             observed_version = str(response.get("VersionId") or "").strip()
@@ -1257,7 +1292,6 @@ def _download_to_staging(
                     "OBJECT_INPUT_CHANGED",
                     "对象版本在暂存前发生变化。",
                 )
-            body = response.get("Body")
             if body is None or not callable(getattr(body, "read", None)):
                 raise ObjectInputError(
                     "OBJECT_INPUT_UNAVAILABLE",
@@ -1433,7 +1467,7 @@ def _validate_staged_semantic(
             if checkpoint is not None:
                 checkpoint()
             if semantic_type in {"bio.fastq.gz.r1", "bio.fastq.gz.r2"}:
-                if not name.lower().endswith((".fastq.gz", ".fq.gz")):
+                if not reference["key"].lower().endswith((".fastq.gz", ".fq.gz")):
                     raise ObjectInputError(
                         "FASTQ_EXTENSION_INVALID",
                         "对象 FASTQ 文件扩展名无效。",
@@ -1473,10 +1507,13 @@ def _validate_staged_semantic(
                             "FASTQ_MATE_INVALID",
                             "对象 FASTQ mate 与输入语义不一致。",
                         )
-                evidence: tuple[int, str] | None = (expected_mate, read_id)
+                read_id_digest = (
+                    f"sha256:{hashlib.sha256(read_id.encode('utf-8')).hexdigest()}"
+                )
+                evidence: tuple[int, str] | None = (expected_mate, read_id_digest)
             else:
                 with os.fdopen(os.dup(descriptor), "rb") as handle:
-                    if name.lower().endswith(".gz"):
+                    if reference["key"].lower().endswith(".gz"):
                         first_line = _read_gzip_text_lines(
                             handle,
                             line_count=1,
@@ -1701,12 +1738,12 @@ def stage_run_object_inputs(run: AnalysisRun, *, checkpoint=None) -> int:
         if not isinstance(evidence, dict) or evidence.get("kind") != "fastq":
             continue
         mate = evidence.get("mate")
-        read_id = evidence.get("first_read_id")
+        read_id = evidence.get("first_read_id_sha256")
         sequence = managed.get("input_sequence")
         if (
             mate not in {1, 2}
             or not isinstance(read_id, str)
-            or not read_id
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", read_id) is None
             or not isinstance(sequence, int)
             or isinstance(sequence, bool)
         ):
@@ -1715,6 +1752,7 @@ def stage_run_object_inputs(run: AnalysisRun, *, checkpoint=None) -> int:
                 "受管 FASTQ 语义证据无效。",
             )
         reads[mate].append((sequence, read_id))
+    stage_error: BaseException | None = None
     try:
         with _open_lease_directory(lease.id) as temporary_directory:
             for item, _reference_value in unique_references.values():
@@ -1765,9 +1803,16 @@ def stage_run_object_inputs(run: AnalysisRun, *, checkpoint=None) -> int:
                     "FASTQ_PAIR_MISMATCH",
                     "R1/R2 FASTQ 首条 read ID 不配对。",
                 )
+    except BaseException as error:
+        stage_error = error
+        raise
     finally:
         try:
-            _remove_lease_directory(lease.id)
+            try:
+                _remove_lease_directory(lease.id)
+            except BaseException:
+                if stage_error is None:
+                    raise
         finally:
             InputStagingLease.objects.filter(
                 pk=lease.pk,
@@ -1780,18 +1825,31 @@ def stage_run_object_inputs(run: AnalysisRun, *, checkpoint=None) -> int:
 def verify_run_object_inputs(run: AnalysisRun, *, checkpoint=None) -> int:
     items = object_manifest_items(run.request_payload.get("input_resource_manifest"))
     verified_paths: set[str] = set()
+    run_deadline = time.monotonic() + float(
+        settings.ANALYSIS_OBJECT_STAGE_RUN_TIMEOUT_SECONDS
+    )
     for item in items:
         reference = _manifest_reference(item)
         staging_path = str(item["staging_relative_path"])
         if staging_path in verified_paths:
             continue
-        with _open_target_parent(reference) as (parent_descriptor, name):
-            digest = _hash_target_at(
-                parent_descriptor,
-                name,
-                expected_size=reference["size"],
-                checkpoint=checkpoint,
+        remaining = run_deadline - time.monotonic()
+        if remaining <= 0:
+            raise ObjectInputError(
+                "OBJECT_INPUT_STAGE_TIMEOUT",
+                "对象输入执行前复核超过总时间上限。",
+                retryable=True,
             )
+        with _hard_timeout(
+            min(float(settings.ANALYSIS_OBJECT_STAGE_TIMEOUT_SECONDS), remaining)
+        ):
+            with _open_target_parent(reference) as (parent_descriptor, name):
+                digest = _hash_target_at(
+                    parent_descriptor,
+                    name,
+                    expected_size=reference["size"],
+                    checkpoint=checkpoint,
+                )
         if digest != reference["sha256"]:
             raise ObjectInputError(
                 "OBJECT_INPUT_STAGING_CHANGED",

@@ -90,9 +90,12 @@ chmod 0640 ./secrets/object-storage/*.json
 ```
 
 每个对象存储 profile 只授予白名单 bucket 的只读 object/version 权限，并配置精确的
-`allowed_client_ids` 与可选 `allowed_key_prefixes`；不要把凭据写入 `.env`、
+按 Service Account 绑定 bucket/key prefix 的 `client_grants`；不要把凭据写入 `.env`、
 任务 JSON 或 WDL。按实际部署验证 endpoint/CIDR 防火墙后，再用一个固定 VersionId/ETag、size 和
 SHA-256 的小对象完成 preflight 与真实运行。
+在 #32 的自动 retention/GC 合并前，还必须为 input staging 配置磁盘监控与人工排空窗口；
+只可在停止所有 analysis worker 且确认没有排队/活跃任务后处理 `sha256/` 持久缓存，保留
+`.leases/` 并且不得删除 Docker volume。
 
 Workflow 列表现在默认每页 50、最大 100，并返回 `total`/`has_next`/`summary`。前端已显式翻页；
 任何直接调用 `/api/v1/editor/workflows` 且假设无参数返回全集的旧客户端，必须在发布前改为传

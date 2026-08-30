@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -595,6 +596,23 @@ def _managed_resource(
             f"输入 {input_name} 必须使用 root_alias + relative_path。",
             category="input",
         )
+    prohibited_fields = {
+        "profile",
+        "bucket",
+        "version_id",
+        "etag",
+        "access_key_id",
+        "secret_access_key",
+        "session_token",
+        "endpoint_url",
+        "presigned_url",
+    }
+    if prohibited_fields & set(value):
+        raise IntegrationAPIError(
+            "MANAGED_RESOURCE_INVALID",
+            f"输入 {input_name} 不能包含对象存储凭据或 endpoint。",
+            category="input",
+        )
     if kind == "file" and value.get("identity_digest"):
         raise IntegrationAPIError(
             "MANAGED_RESOURCE_DIGEST_INVALID",
@@ -837,7 +855,28 @@ def _coerce_input(
     if value is None and optional:
         return None
     if normalized_type == "File":
-        if isinstance(value, dict) and value.get("type") == "s3_object":
+        value_fields = set(value) if isinstance(value, dict) else set()
+        managed_fields = {"root_alias", "relative_path"}
+        managed_shape = managed_fields <= value_fields
+        object_identity_fields = {"profile", "bucket", "version_id", "etag"}
+        if (
+            isinstance(value, dict)
+            and value.get("type") == "s3_object"
+            and (
+                (not managed_shape and bool(managed_fields & value_fields))
+                or (managed_shape and bool(object_identity_fields & value_fields))
+            )
+        ):
+            raise IntegrationAPIError(
+                "INPUT_REFERENCE_AMBIGUOUS",
+                f"输入 {input_name} 不能混用受管路径和对象引用字段。",
+                category="input",
+            )
+        if (
+            isinstance(value, dict)
+            and value.get("type") == "s3_object"
+            and not managed_shape
+        ):
             if len(manifests["objects"]) >= int(
                 settings.ANALYSIS_OBJECT_STAGE_MAX_ITEMS
             ):
@@ -1186,12 +1225,14 @@ def _content_checks(
                 containment_root=item["containment_root"],
                 snapshot_budget=snapshot_budget,
             )
-            reads[1].append(read_id)
-            item["manifest"]["semantic_evidence"] = {
-                "kind": "fastq",
-                "mate": 1,
-                "first_read_id": read_id,
-            }
+            read_id_digest = f"sha256:{hashlib.sha256(read_id.encode('utf-8')).hexdigest()}"
+            reads[1].append(read_id_digest)
+            if skip_fastq_pair:
+                item["manifest"]["semantic_evidence"] = {
+                    "kind": "fastq",
+                    "mate": 1,
+                    "first_read_id_sha256": read_id_digest,
+                }
             checked.append({"input": item["input"], "check": "fastq_r1", "ready": True})
         elif semantic == "bio.fastq.gz.r2":
             read_id = _validate_fastq(
@@ -1201,12 +1242,14 @@ def _content_checks(
                 containment_root=item["containment_root"],
                 snapshot_budget=snapshot_budget,
             )
-            reads[2].append(read_id)
-            item["manifest"]["semantic_evidence"] = {
-                "kind": "fastq",
-                "mate": 2,
-                "first_read_id": read_id,
-            }
+            read_id_digest = f"sha256:{hashlib.sha256(read_id.encode('utf-8')).hexdigest()}"
+            reads[2].append(read_id_digest)
+            if skip_fastq_pair:
+                item["manifest"]["semantic_evidence"] = {
+                    "kind": "fastq",
+                    "mate": 2,
+                    "first_read_id_sha256": read_id_digest,
+                }
             checked.append({"input": item["input"], "check": "fastq_r2", "ready": True})
         elif item["kind"] == "file" and "fasta" in semantic.casefold():
             _validate_fasta(
@@ -1215,7 +1258,6 @@ def _content_checks(
                 containment_root=item["containment_root"],
                 snapshot_budget=snapshot_budget,
             )
-            item["manifest"]["semantic_evidence"] = {"kind": "fasta"}
             checked.append({"input": item["input"], "check": "fasta", "ready": True})
     if (reads[1] or reads[2]) and not skip_fastq_pair:
         if len(reads[1]) != len(reads[2]) or reads[1] != reads[2]:

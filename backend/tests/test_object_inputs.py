@@ -20,6 +20,8 @@ from workflows.models import (
 )
 from workflows.object_inputs import (
     _bounded_call,
+    inspect_object_reference,
+    object_manifest_items,
     _pinned_connection_class,
     _reference,
     _request_parameters,
@@ -28,6 +30,7 @@ from workflows.object_inputs import (
     _validate_endpoint,
     ObjectInputError,
     ObjectStorageProfile,
+    verify_run_object_inputs,
 )
 
 
@@ -64,8 +67,7 @@ def _profile(**values) -> ObjectStorageProfile:
         "endpoint_url": "https://objects.example.test",
         "region": "us-east-1",
         "allowed_buckets": ("inputs",),
-        "allowed_client_ids": ("okb",),
-        "allowed_key_prefixes": {},
+        "client_grants": {"okb": {"inputs": ("incoming/",)}},
         "access_key_id": "access-key-marker",
         "secret_access_key": "secret-key-marker",
         "session_token": "",
@@ -87,6 +89,14 @@ def test_object_endpoint_blocks_link_local_and_unapproved_private_addresses():
     ):
         _validate_endpoint(_profile(allow_private_network=True))
     assert link_local_error.value.code == "OBJECT_INPUT_ENDPOINT_FORBIDDEN"
+
+    loopback = [(2, 1, 6, "", ("127.0.0.1", 443))]
+    with (
+        patch("workflows.object_inputs.socket.getaddrinfo", return_value=loopback),
+        pytest.raises(ObjectInputError) as loopback_error,
+    ):
+        _validate_endpoint(_profile(allow_private_network=True))
+    assert loopback_error.value.code == "OBJECT_INPUT_ENDPOINT_FORBIDDEN"
 
     with (
         patch("workflows.object_inputs.socket.getaddrinfo", return_value=private),
@@ -160,6 +170,39 @@ def test_object_if_match_reaches_botocore_wire_with_quotes():
     assert seen_headers["If-Match"] == b'"abc123"'
 
 
+def test_object_client_configuration_errors_use_stable_envelope():
+    reference = {
+        "type": "s3_object",
+        "profile": "test",
+        "bucket": "inputs",
+        "key": "incoming/read.fastq.gz",
+        "version_id": "version-1",
+        "etag": "abc123",
+        "size": 1,
+        "sha256": "sha256:" + "0" * 64,
+    }
+    with (
+        patch(
+            "workflows.object_inputs._load_profile",
+            return_value=_profile(region="not a valid region"),
+        ),
+        patch(
+            "workflows.object_inputs._validate_endpoint",
+            return_value=("203.0.113.10",),
+        ),
+        pytest.raises(ObjectInputError) as caught,
+    ):
+        inspect_object_reference(
+            reference,
+            input_name="read",
+            semantic_type="bio.fastq.gz.r1",
+            client_id="okb",
+        )
+
+    assert caught.value.code == "OBJECT_INPUT_UNAVAILABLE"
+    assert caught.value.http_status == 503
+
+
 def test_object_connections_use_only_pinned_addresses():
     connection_class = _pinned_connection_class(
         AWSHTTPConnection,
@@ -214,6 +257,96 @@ def test_object_staging_rejects_symlink_ancestor(settings, tmp_path):
     with pytest.raises(ObjectInputError) as caught:
         _target_path(reference)
     assert caught.value.code == "OBJECT_INPUT_STAGE_IO_ERROR"
+
+
+def test_object_run_budget_counts_distinct_remote_identities(settings):
+    settings.ANALYSIS_OBJECT_STAGE_MAX_RUN_BYTES = 100
+    digest = "sha256:" + "a" * 64
+
+    def item(key: str, sequence: int):
+        return {
+            "reference_type": "s3_object",
+            "input": f"read{sequence}",
+            "semantic_type": "core.file.unknown",
+            "authorized_client_id": "okb",
+            "input_sequence": sequence,
+            "kind": "file",
+            "profile": "test",
+            "bucket": "inputs",
+            "key": key,
+            "version_id": f"version-{sequence}",
+            "etag": f"etag-{sequence}",
+            "size": 60,
+            "sha256": digest,
+            "verification": "head+conditional-get+sha256",
+            "staging_relative_path": (
+                f"sha256/aa/{'a' * 64}.fastq.gz"
+            ),
+        }
+
+    manifest = {
+        "schema_version": 2,
+        "objects": [
+            item("incoming/a.fastq.gz", 1),
+            item("incoming/b.fastq.gz", 2),
+        ],
+    }
+
+    with pytest.raises(ObjectInputError) as caught:
+        object_manifest_items(manifest)
+
+    assert caught.value.code == "OBJECT_INPUT_RUN_TOO_LARGE"
+
+
+def test_object_execution_recheck_has_hard_timeout(settings, tmp_path, monkeypatch):
+    from workflows import object_inputs
+
+    settings.ANALYSIS_INPUT_STAGING_ROOT = tmp_path / "staging"
+    settings.ANALYSIS_OBJECT_STAGE_TIMEOUT_SECONDS = 0.01
+    settings.ANALYSIS_OBJECT_STAGE_RUN_TIMEOUT_SECONDS = 0.05
+    digest = "sha256:" + "a" * 64
+    item = {
+        "reference_type": "s3_object",
+        "input": "read1",
+        "semantic_type": "core.file.unknown",
+        "authorized_client_id": "okb",
+        "input_sequence": 0,
+        "kind": "file",
+        "profile": "test",
+        "bucket": "inputs",
+        "key": "incoming/read.fastq.gz",
+        "version_id": "version-1",
+        "etag": "etag-1",
+        "size": 1,
+        "sha256": digest,
+        "verification": "head+conditional-get+sha256",
+        "staging_relative_path": f"sha256/aa/{'a' * 64}.fastq.gz",
+    }
+    run = type(
+        "Run",
+        (),
+        {
+            "request_payload": {
+                "input_resource_manifest": {
+                    "schema_version": 2,
+                    "files": [],
+                    "objects": [item],
+                }
+            }
+        },
+    )()
+    monkeypatch.setattr(
+        object_inputs,
+        "_hash_target_at",
+        lambda *_args, **_kwargs: time.sleep(1),
+    )
+
+    started = time.monotonic()
+    with pytest.raises(ObjectInputError) as caught:
+        verify_run_object_inputs(run)
+
+    assert caught.value.code == "OBJECT_INPUT_STAGE_TIMEOUT"
+    assert time.monotonic() - started < 0.5
 
 
 @pytest.mark.django_db(transaction=True)

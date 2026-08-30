@@ -252,9 +252,11 @@ docker compose --profile wdl-host-runtime up -d analysis-worker-host
 切换前必须确认没有 `queued`、`preparing` 或 `running` 状态的分析。镜像和容器层复用宿主
 Docker 的数据目录；原始数据、数据库、call cache、中间结果和最终结果仍使用 `.env` 中
 的 `/mnt/nas/workspace` 路径。worker 与宿主 Docker 看到的 NAS 路径必须完全一致。
-宿主模式还需将 `ANALYSIS_RAWDATA_EXECUTION_ROOT` 和
-`ANALYSIS_DATABASE_EXECUTION_ROOT` 分别设置为 NAS 原始数据与数据库的宿主绝对路径；
-backend 会在创建任务时把容器内校验路径转换为这两个执行路径。
+宿主模式还需将 `ANALYSIS_RAWDATA_EXECUTION_ROOT`、
+`ANALYSIS_DATABASE_EXECUTION_ROOT` 和 `ANALYSIS_INPUT_STAGING_EXECUTION_ROOT` 分别设置为
+NAS 原始数据、数据库与对象暂存目录的宿主绝对路径；backend 会在创建任务时把容器内校验路径
+转换为这些执行路径。对象存储 profile 则从
+`ANALYSIS_OBJECT_STORAGE_SECRETS_HOST_PATH` 只读挂载，不能放入 NAS 输入目录或提交到 Git。
 
 挂载 `/var/run/docker.sock` 等同于授予 analysis-worker 管理宿主 Docker 的高权限，只能
 运行受信任的 WDL。宿主模式会与其他容器共享 Docker 引擎、镜像缓存和计算资源；需要更强

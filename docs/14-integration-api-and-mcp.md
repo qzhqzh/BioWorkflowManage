@@ -167,8 +167,9 @@ File 输入也可以使用 S3/MinIO 兼容对象引用；Directory 仍只接受�
   "endpoint_url": "https://minio.example.internal",
   "region": "us-east-1",
   "allowed_buckets": ["validated-inputs"],
-  "allowed_client_ids": ["mes-production"],
-  "allowed_key_prefixes": {"validated-inputs": ["tenant-a/"]},
+  "client_grants": {
+    "mes-production": {"validated-inputs": ["tenant-a/"]}
+  },
   "allowed_cidrs": ["10.20.0.0/16"],
   "allow_private_network": true,
   "access_key_id": "<read-only access key>",
@@ -177,9 +178,10 @@ File 输入也可以使用 S3/MinIO 兼容对象引用；Directory 仍只接受�
 ```
 
 profile 文件不得提交到 Git；默认目录 `./secrets/object-storage` 已忽略。每个 profile 必须通过
-`allowed_client_ids` 绑定 Service Account，可再按 bucket 配置 `allowed_key_prefixes`。HTTP endpoint
-默认拒绝，私网地址必须显式 `allow_private_network=true`，link-local/site-local/multicast/unspecified/
-reserved 地址始终拒绝；`allowed_cidrs` 可进一步收窄出口。应用会把每次请求固定到本次已审核的
+`client_grants` 把 Service Account、bucket 与 key prefix 绑定为同一条授权，不能把多租户账号与
+前缀分别配置成两个全局白名单。HTTP endpoint
+默认拒绝，私网地址必须显式 `allow_private_network=true`，loopback/link-local/site-local/multicast/
+unspecified/reserved 地址始终拒绝；`allowed_cidrs` 可进一步收窄出口。应用会把每次请求固定到本次已审核的
 解析地址，拒绝跳转到其他 origin，并限制单进程残留 HEAD 调用数量；生产环境仍应在主机防火墙或
 容器网络策略中做第二层出口白名单。profile 只挂载给 backend 与 analysis-worker，不挂载给 miniwdl task 容器，凭据不会
 进入 `AnalysisRun.request_payload`、日志、API 响应或 Webhook。
@@ -577,7 +579,14 @@ SHA-256 字节上限由
 singleton row 串行分配，Worker 崩溃后 lease 到期自动回收。`ANALYSIS_INPUT_STAGING_HOST_PATH`
 必须由 Worker UID 可写，并同时以只读方式挂载给 backend 和 miniwdl Docker daemon；主机运行
 profile 还应把 `ANALYSIS_INPUT_STAGING_EXECUTION_ROOT` 设置为同一个宿主绝对路径。
+单任务字节上限按不同远端对象身份的实际下载量计算；磁盘预留则按尚未命中的不同内容寻址路径计算，
+相同声明摘要不能把多次远端传输折叠出配额。
+内容寻址文件是持久缓存，当前版本不会自动回收；安全 retention/GC 由 #32 跟踪。在该能力合并前，
+部署方必须监控 staging 使用量。需要人工回收时，先确认没有 `queued/preparing/running/cancel_requested`
+任务并停止所有 analysis worker，只清点和处理 `sha256/` 内容树，保留 `.leases/` 交给 lease
+回收逻辑；不得删除 staging 根目录或 Docker volume。下次执行会从远端重新验证并重建缺失内容。
 每个暂存 lease 使用独立的 `.leases/<lease-id>` 临时目录；过期 lease 的孤儿普通文件会在下一次
 分配槽位时按数据库活动 lease 白名单清理。内容寻址文件每次执行仍会对对应对象身份做条件 GET
 并完整计算 SHA-256，缓存命中不能绕过对象删除、撤权或“对象身份→摘要”的真实性校验；FASTQ/
 FASTA 语义和 R1/R2 首条 read ID 会在暂存后、启动 miniwdl 前再次校验。
+配对审计证据只持久化规范化 read ID 的 SHA-256，不保存原始 FASTQ header/read ID。

@@ -99,7 +99,7 @@ def _write_object_profile(
     profile_dir: Path,
     *,
     name="lab-minio",
-    allowed_client_ids=("okb",),
+    client_grants=None,
 ) -> tuple[str, str]:
     access_key = "test-access-key-not-for-storage"
     secret_key = "test-secret-key-not-for-storage"
@@ -109,8 +109,8 @@ def _write_object_profile(
                 "endpoint_url": "https://objects.example.test",
                 "region": "us-east-1",
                 "allowed_buckets": ["validated-inputs"],
-                "allowed_client_ids": list(allowed_client_ids),
-                "allowed_key_prefixes": {"validated-inputs": ["incoming/"]},
+                "client_grants": client_grants
+                or {"okb": {"validated-inputs": ["incoming/"]}},
                 "access_key_id": access_key,
                 "secret_access_key": secret_key,
             }
@@ -143,6 +143,7 @@ class _FakeS3Client:
         self.get_error = get_error
         self.head_calls = []
         self.get_calls = []
+        self.bodies = []
 
     def _response(self, key: str):
         content = self.objects[key]
@@ -160,9 +161,11 @@ class _FakeS3Client:
         self.get_calls.append(kwargs)
         if self.get_error is not None:
             raise self.get_error
+        body = _FakeObjectBody(self.objects[kwargs["Key"]])
+        self.bodies.append(body)
         return {
             **self._response(kwargs["Key"]),
-            "Body": _FakeObjectBody(self.objects[kwargs["Key"]]),
+            "Body": body,
         }
 
     def close(self):
@@ -935,16 +938,22 @@ def test_s3_inputs_share_auditable_manifest_and_stage_without_credentials(
     read1 = _fastq_bytes(1)
     read2 = _fastq_bytes(2)
     objects = {
-        "incoming/S001_R1.fastq.gz": read1,
-        "incoming/S001_R2.fastq.gz": read2,
+        "incoming/S001.verylonglibraryname_R1.fastq.gz": read1,
+        "incoming/S001.verylonglibraryname_R2.fastq.gz": read2,
     }
     access_key, secret_key = _write_object_profile(
         Path(settings.ANALYSIS_OBJECT_STORAGE_PROFILE_DIR)
     )
     body = _submission(version, external_run_id="portable-input-run")
     body["inputs"] = {
-        "read1": _object_reference(read1, key="incoming/S001_R1.fastq.gz"),
-        "read2": _object_reference(read2, key="incoming/S001_R2.fastq.gz"),
+        "read1": _object_reference(
+            read1,
+            key="incoming/S001.verylonglibraryname_R1.fastq.gz",
+        ),
+        "read2": _object_reference(
+            read2,
+            key="incoming/S001.verylonglibraryname_R2.fastq.gz",
+        ),
     }
     fake_client = _FakeS3Client(objects)
 
@@ -1083,6 +1092,11 @@ def test_s3_input_changes_and_conditional_get_fail_closed(
         )
     assert created.status_code == 201, created.data
     run = AnalysisRun.objects.get(pk=created.data["id"])
+    managed_evidence = run.request_payload["input_resource_manifest"]["files"][0][
+        "semantic_evidence"
+    ]
+    assert managed_evidence["first_read_id_sha256"].startswith("sha256:")
+    assert "read-001" not in json.dumps(run.request_payload)
     run.status = AnalysisRun.Status.PREPARING
     run.lease_token = uuid.uuid4()
     run.save(update_fields=["status", "lease_token", "updated_at"])
@@ -1105,6 +1119,28 @@ def test_s3_input_changes_and_conditional_get_fail_closed(
         stage_run_object_inputs(run)
     assert caught.value.code == "OBJECT_INPUT_CHANGED"
 
+    identity_client = _FakeS3Client({"incoming/S001_R1.fastq.gz": read1})
+
+    def changed_identity_get(**kwargs):
+        identity_client.get_calls.append(kwargs)
+        body = _FakeObjectBody(read1)
+        identity_client.bodies.append(body)
+        return {
+            **identity_client._response(kwargs["Key"]),
+            "ETag": '"different-etag"',
+            "Body": body,
+        }
+
+    identity_client.get_object = changed_identity_get
+    with (
+        patch("workflows.object_inputs._validate_endpoint"),
+        patch("workflows.object_inputs._s3_client", return_value=identity_client),
+        pytest.raises(ObjectInputError) as identity_error,
+    ):
+        stage_run_object_inputs(run)
+    assert identity_error.value.code == "OBJECT_INPUT_CHANGED"
+    assert identity_client.bodies[0].closed
+
     manifest_item = run.request_payload["input_resource_manifest"]["objects"][0]
     cached = Path(settings.ANALYSIS_INPUT_STAGING_ROOT) / manifest_item[
         "staging_relative_path"
@@ -1125,6 +1161,14 @@ def test_s3_input_changes_and_conditional_get_fail_closed(
     with (
         patch("workflows.object_inputs._validate_endpoint"),
         patch("workflows.object_inputs._s3_client", return_value=corrupt_client),
+        patch(
+            "workflows.object_inputs._remove_lease_directory",
+            side_effect=ObjectInputError(
+                "OBJECT_INPUT_STAGE_IO_ERROR",
+                "cleanup failed",
+                retryable=True,
+            ),
+        ),
         pytest.raises(ObjectInputError) as digest_error,
     ):
         stage_run_object_inputs(run)
@@ -1169,6 +1213,26 @@ def test_s3_profile_enforces_service_account_and_key_prefix(
     )
     assert forbidden_key.status_code == 403
     assert forbidden_key.data["error"]["code"] == "OBJECT_INPUT_KEY_FORBIDDEN"
+
+    _write_object_profile(
+        Path(settings.ANALYSIS_OBJECT_STORAGE_PROFILE_DIR),
+        client_grants={
+            "okb": {"validated-inputs": ["tenant-a/"]},
+            "other": {"validated-inputs": ["tenant-b/"]},
+        },
+    )
+    cross_tenant = _submission(version, external_run_id="cross-tenant-prefix")
+    cross_tenant["inputs"]["read1"] = _object_reference(
+        content,
+        key="tenant-b/S001_R1.fastq.gz",
+    )
+    cross_tenant_response = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        cross_tenant,
+        format="json",
+    )
+    assert cross_tenant_response.status_code == 403
+    assert cross_tenant_response.data["error"]["code"] == "OBJECT_INPUT_KEY_FORBIDDEN"
 
 
 @pytest.mark.django_db
@@ -1272,7 +1336,7 @@ def test_managed_input_keeps_legacy_custom_type_compatible(integration_workspace
     _, _, _, client = _token_client()
     version = _workflow_version()
     body = _submission(version, external_run_id="legacy-managed-type")
-    body["inputs"]["read1"]["type"] = "legacy_rawdata_file"
+    body["inputs"]["read1"]["type"] = "s3_object"
 
     response = client.post(
         "/api/v1/integration/analysis-runs/preflight",
@@ -1282,6 +1346,43 @@ def test_managed_input_keeps_legacy_custom_type_compatible(integration_workspace
 
     assert response.status_code == 200, response.data
     assert response.data["ready"] is True
+
+    ambiguous = _submission(version, external_run_id="ambiguous-input-reference")
+    ambiguous["inputs"]["read1"].pop("relative_path")
+    ambiguous["inputs"]["read1"].update({"type": "s3_object", "profile": "lab-minio"})
+    rejected = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        ambiguous,
+        format="json",
+    )
+    assert rejected.status_code == 400
+    assert rejected.data["error"]["code"] == "INPUT_REFERENCE_AMBIGUOUS"
+
+    complete_ambiguous = _submission(
+        version,
+        external_run_id="complete-ambiguous-input-reference",
+    )
+    complete_ambiguous["inputs"]["read1"].update(
+        {"type": "s3_object", "profile": "lab-minio", "bucket": "inputs"}
+    )
+    rejected_complete = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        complete_ambiguous,
+        format="json",
+    )
+    assert rejected_complete.status_code == 400
+    assert rejected_complete.data["error"]["code"] == "INPUT_REFERENCE_AMBIGUOUS"
+
+    credential = _submission(version, external_run_id="managed-credential-field")
+    credential["inputs"]["read1"]["secret_access_key"] = "must-not-persist"
+    rejected_credential = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        credential,
+        format="json",
+    )
+    assert rejected_credential.status_code == 400
+    assert rejected_credential.data["error"]["code"] == "MANAGED_RESOURCE_INVALID"
+    assert "must-not-persist" not in json.dumps(rejected_credential.data)
 
 
 @pytest.mark.django_db

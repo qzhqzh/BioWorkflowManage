@@ -232,8 +232,21 @@
       "ManagedResource": {
         "type": "object",
         "required": ["root_alias", "relative_path"],
+        "not": {
+          "anyOf": [
+            {"required": ["profile"]},
+            {"required": ["bucket"]},
+            {"required": ["version_id"]},
+            {"required": ["etag"]},
+            {"required": ["access_key_id"]},
+            {"required": ["secret_access_key"]},
+            {"required": ["session_token"]},
+            {"required": ["endpoint_url"]},
+            {"required": ["presigned_url"]}
+          ]
+        },
         "properties": {
-          "type": {"type": "string", "description": "推荐使用 managed_path；为兼容 1.2 及更早调用方，也接受并忽略既有自定义值。"},
+          "type": {"type": "string", "description": "推荐使用 managed_path；为兼容 1.2 及更早调用方，也接受并忽略既有自定义值（包括仅出现在受管路径形态中的历史 s3_object 值）。"},
           "root_alias": {"type": "string", "enum": ["rawdata", "database"]},
           "relative_path": {"type": "string"},
           "sha256": {

@@ -1012,6 +1012,14 @@ def execute_analysis_run(
         checkpoint=resource_checkpoint,
     )
     if staged_object_count:
+        _verify_run_resource_manifests(
+            run,
+            checkpoint=resource_checkpoint,
+            snapshot_budget=ResourceSnapshotBudget(
+                deadline_seconds=settings.ANALYSIS_WORKER_RESOURCE_MANIFEST_TIMEOUT_SECONDS,
+                checkpoint=resource_checkpoint,
+            ),
+        )
         _event(
             run,
             f"已校验并固定 {staged_object_count} 个对象存储输入。",
@@ -1062,6 +1070,8 @@ def execute_analysis_run(
             ),
         },
     )
+    if staged_object_count:
+        verify_run_object_inputs(run, checkpoint=resource_checkpoint)
     _update_run(
         run,
         status=AnalysisRun.Status.RUNNING,
@@ -1088,7 +1098,8 @@ def execute_analysis_run(
     result: dict[str, Any] | None = None
     failure_message = ""
     for attempt in range(1, retry_count + 2):
-        verify_run_object_inputs(run, checkpoint=resource_checkpoint)
+        if attempt > 1 and staged_object_count:
+            verify_run_object_inputs(run, checkpoint=resource_checkpoint)
         paths = _attempt_paths(run_directory, attempt)
         arguments = [
             executable,
