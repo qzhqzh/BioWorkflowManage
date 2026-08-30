@@ -182,8 +182,8 @@ profile 文件不得提交到 Git；默认目录 `./secrets/object-storage` 已�
 前缀分别配置成两个全局白名单。HTTP endpoint
 默认拒绝，私网地址必须显式 `allow_private_network=true`，loopback/link-local/site-local/multicast/
 unspecified/reserved 地址始终拒绝；`allowed_cidrs` 可进一步收窄出口。应用会把每次请求固定到本次已审核的
-解析地址，拒绝跳转到其他 origin；HEAD 在可终止的隔离子进程中执行，超时后先回收子进程再释放
-并发槽。生产环境仍应在主机防火墙或
+解析地址，拒绝跳转到其他 origin；HEAD 通过关闭继承 FD 的独立 Worker 进程执行，Worker 同时配置
+自身硬期限和 Linux parent-death signal，父进程超时后先回收 Worker 再释放并发槽。生产环境仍应在主机防火墙或
 容器网络策略中做第二层出口白名单。profile 只挂载给 backend 与 analysis-worker，不挂载给 miniwdl task 容器，凭据不会
 进入 `AnalysisRun.request_payload`、日志、API 响应或 Webhook。
 

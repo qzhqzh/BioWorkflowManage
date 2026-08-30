@@ -172,6 +172,27 @@ class _FakeS3Client:
         return None
 
 
+def _mock_object_head(client: _FakeS3Client):
+    def inspect(reference, **_kwargs):
+        parameters = {
+            "Bucket": reference["bucket"],
+            "Key": reference["key"],
+        }
+        if reference["version_id"]:
+            parameters["VersionId"] = reference["version_id"]
+        if reference["etag"]:
+            parameters["IfMatch"] = f'"{reference["etag"]}"'
+        response = client.head_object(**parameters)
+        return {
+            "ContentLength": response.get("ContentLength"),
+            "DeleteMarker": response.get("DeleteMarker") is True,
+            "ETag": response.get("ETag"),
+            "VersionId": response.get("VersionId"),
+        }
+
+    return patch("workflows.object_inputs._run_object_head_worker", side_effect=inspect)
+
+
 @pytest.fixture
 def integration_workspace(settings, tmp_path: Path):
     rawdata = tmp_path / "rawdata"
@@ -957,10 +978,7 @@ def test_s3_inputs_share_auditable_manifest_and_stage_without_credentials(
     }
     fake_client = _FakeS3Client(objects)
 
-    with (
-        patch("workflows.object_inputs._validate_endpoint"),
-        patch("workflows.object_inputs._s3_client", return_value=fake_client),
-    ):
+    with _mock_object_head(fake_client):
         preflight = client.post(
             "/api/v1/integration/analysis-runs/preflight",
             body,
@@ -1046,10 +1064,7 @@ def test_s3_input_changes_and_conditional_get_fail_closed(
     changed_client = _FakeS3Client(
         {"incoming/S001_R1.fastq.gz": b"x" * len(read1)}
     )
-    with (
-        patch("workflows.object_inputs._validate_endpoint"),
-        patch("workflows.object_inputs._s3_client", return_value=changed_client),
-    ):
+    with _mock_object_head(changed_client):
         changed = client.post(
             "/api/v1/integration/analysis-runs/preflight",
             body,
@@ -1080,10 +1095,7 @@ def test_s3_input_changes_and_conditional_get_fail_closed(
     assert "must-not-echo" not in json.dumps(rejected_credential.data)
 
     good_client = _FakeS3Client({"incoming/S001_R1.fastq.gz": read1})
-    with (
-        patch("workflows.object_inputs._validate_endpoint"),
-        patch("workflows.object_inputs._s3_client", return_value=good_client),
-    ):
+    with _mock_object_head(good_client):
         created = client.post(
             "/api/v1/integration/analysis-runs",
             body,
@@ -1303,10 +1315,7 @@ def test_s3_stage_validates_remote_fastq_content(
         "read2": _object_reference(read2, key=read2_key),
     }
     fake_client = _FakeS3Client(objects)
-    with (
-        patch("workflows.object_inputs._validate_endpoint"),
-        patch("workflows.object_inputs._s3_client", return_value=fake_client),
-    ):
+    with _mock_object_head(fake_client):
         created = client.post(
             "/api/v1/integration/analysis-runs",
             body,

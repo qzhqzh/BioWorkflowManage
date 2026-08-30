@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
 import queue
+import signal
 import threading
 import time
 import uuid
+from pathlib import Path
 from unittest.mock import patch
 
 import boto3
@@ -19,8 +22,8 @@ from workflows.models import (
     WorkflowVersion,
 )
 from workflows.object_inputs import (
-    _bounded_call,
-    inspect_object_reference,
+    _inspect_object_reference_metadata,
+    _run_object_head_worker,
     object_manifest_items,
     _pinned_connection_class,
     _reference,
@@ -78,6 +81,21 @@ def _profile(**values) -> ObjectStorageProfile:
     }
     defaults.update(values)
     return ObjectStorageProfile(**defaults)
+
+
+def _head_worker_script(tmp_path: Path, payload: dict | None) -> Path:
+    worker = tmp_path / "object_head_test_worker.py"
+    if payload is None:
+        source = "import time\nwhile True:\n    time.sleep(60)\n"
+    else:
+        response = json.dumps(payload, separators=(",", ":"))
+        source = (
+            "import sys\n"
+            "sys.stdin.buffer.read()\n"
+            f"sys.stdout.write({response!r})\n"
+        )
+    worker.write_text(source, encoding="utf-8")
+    return worker
 
 
 def test_object_endpoint_blocks_link_local_and_unapproved_private_addresses():
@@ -171,7 +189,7 @@ def test_object_if_match_reaches_botocore_wire_with_quotes():
 
 
 def test_object_client_configuration_errors_use_stable_envelope():
-    reference = {
+    reference = _reference({
         "type": "s3_object",
         "profile": "test",
         "bucket": "inputs",
@@ -180,7 +198,7 @@ def test_object_client_configuration_errors_use_stable_envelope():
         "etag": "abc123",
         "size": 1,
         "sha256": "sha256:" + "0" * 64,
-    }
+    }, input_name="read")
     with (
         patch(
             "workflows.object_inputs._load_profile",
@@ -192,10 +210,8 @@ def test_object_client_configuration_errors_use_stable_envelope():
         ),
         pytest.raises(ObjectInputError) as caught,
     ):
-        inspect_object_reference(
+        _inspect_object_reference_metadata(
             reference,
-            input_name="read",
-            semantic_type="bio.fastq.gz.r1",
             client_id="okb",
         )
 
@@ -218,42 +234,165 @@ def test_object_connections_use_only_pinned_addresses():
     assert create_connection.call_args.args[0] == ("203.0.113.10", 80)
 
 
-def test_object_head_timeout_terminates_process_and_releases_slot(monkeypatch):
+def test_object_head_timeout_terminates_process_and_releases_slot(
+    monkeypatch,
+    tmp_path,
+):
     from workflows import object_inputs
 
-    def block_forever():
-        while True:
-            time.sleep(60)
-
     monkeypatch.setattr(object_inputs, "_HEAD_CALL_SLOTS", threading.BoundedSemaphore(1))
+    monkeypatch.setattr(
+        object_inputs,
+        "_OBJECT_HEAD_WORKER",
+        _head_worker_script(tmp_path, None),
+    )
     started = time.monotonic()
     with pytest.raises(ObjectInputError) as timed_out:
-        _bounded_call(block_forever, 0.01)
+        _run_object_head_worker({}, client_id=None, timeout=0.01)
     assert timed_out.value.code == "OBJECT_INPUT_HEAD_TIMEOUT"
     assert time.monotonic() - started < 1
-    assert _bounded_call(lambda: "ready", 0.5) == "ready"
+    ready = {
+        "ok": True,
+        "metadata": {
+            "ContentLength": 1,
+            "DeleteMarker": False,
+            "ETag": '"abc123"',
+            "VersionId": "version-1",
+        },
+    }
+    monkeypatch.setattr(
+        object_inputs,
+        "_OBJECT_HEAD_WORKER",
+        _head_worker_script(tmp_path, ready),
+    )
+    assert _run_object_head_worker({}, client_id=None, timeout=0.5) == ready["metadata"]
 
 
-def test_object_head_process_preserves_stable_errors():
-    expected = ObjectInputError(
-        "OBJECT_INPUT_PROFILE_FORBIDDEN",
-        "forbidden",
-        retryable=False,
-        details={"profile": "test"},
-        http_status=403,
+def test_object_head_worker_preserves_stable_errors(monkeypatch, tmp_path):
+    from workflows import object_inputs
+
+    expected = {
+        "ok": False,
+        "error": {
+            "code": "OBJECT_INPUT_PROFILE_FORBIDDEN",
+            "message": "forbidden",
+            "retryable": False,
+            "details": {"profile": "test"},
+            "http_status": 403,
+        },
+    }
+    monkeypatch.setattr(
+        object_inputs,
+        "_OBJECT_HEAD_WORKER",
+        _head_worker_script(tmp_path, expected),
+    )
+    with pytest.raises(ObjectInputError) as caught:
+        _run_object_head_worker({}, client_id=None, timeout=0.5)
+
+    assert caught.value.code == expected["error"]["code"]
+    assert str(caught.value) == expected["error"]["message"]
+    assert caught.value.retryable is False
+    assert caught.value.details == expected["error"]["details"]
+    assert caught.value.http_status == expected["error"]["http_status"]
+
+
+def test_object_head_worker_runs_from_request_thread(monkeypatch, tmp_path):
+    from workflows import object_inputs
+
+    response = {
+        "ok": True,
+        "metadata": {
+            "ContentLength": 1,
+            "DeleteMarker": False,
+            "ETag": '"abc123"',
+            "VersionId": "version-1",
+        },
+    }
+    monkeypatch.setattr(
+        object_inputs,
+        "_OBJECT_HEAD_WORKER",
+        _head_worker_script(tmp_path, response),
+    )
+    results = queue.Queue()
+
+    def invoke():
+        try:
+            results.put((True, _run_object_head_worker({}, client_id=None, timeout=1)))
+        except BaseException as error:
+            results.put((False, error))
+
+    request_thread = threading.Thread(target=invoke)
+    request_thread.start()
+    request_thread.join(timeout=2)
+
+    assert not request_thread.is_alive()
+    succeeded, value = results.get_nowait()
+    assert succeeded is True
+    assert value == response["metadata"]
+
+
+@pytest.mark.parametrize("failure", [OSError("full"), RuntimeError("unavailable")])
+def test_object_head_worker_start_failure_is_stable(monkeypatch, failure):
+    from workflows import object_inputs
+
+    slots = threading.BoundedSemaphore(1)
+    monkeypatch.setattr(object_inputs, "_HEAD_CALL_SLOTS", slots)
+    with (
+        patch("workflows.object_inputs.subprocess.Popen", side_effect=failure),
+        pytest.raises(ObjectInputError) as caught,
+    ):
+        _run_object_head_worker({}, client_id=None, timeout=0.5)
+
+    assert caught.value.code == "OBJECT_INPUT_UNAVAILABLE"
+    assert caught.value.retryable is True
+    assert caught.value.http_status == 503
+    assert slots.acquire(blocking=False) is True
+    slots.release()
+
+
+def test_object_head_worker_enforces_own_deadline():
+    from workflows.object_head_worker import _ObjectHeadDeadline, _arm_deadline
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.setitimer(signal.ITIMER_REAL, 0)
+    try:
+        _arm_deadline(0.1)
+        with pytest.raises(_ObjectHeadDeadline):
+            time.sleep(1)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_timer[0] > 0:
+            signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+
+
+def test_object_head_worker_parent_death_race_is_fail_closed(monkeypatch):
+    from workflows import object_head_worker
+
+    class Libc:
+        def __init__(self):
+            self.calls = []
+
+        def prctl(self, *values):
+            self.calls.append(values)
+            return 0
+
+    libc = Libc()
+    kills = []
+    monkeypatch.setattr(object_head_worker.sys, "platform", "linux")
+    monkeypatch.setattr(object_head_worker.ctypes, "CDLL", lambda *_args, **_kwargs: libc)
+    monkeypatch.setattr(object_head_worker.os, "getppid", lambda: 222)
+    monkeypatch.setattr(object_head_worker.os, "getpid", lambda: 333)
+    monkeypatch.setattr(
+        object_head_worker.os,
+        "kill",
+        lambda pid, target_signal: kills.append((pid, target_signal)),
     )
 
-    def fail():
-        raise expected
+    object_head_worker._arm_parent_death_signal(111)
 
-    with pytest.raises(ObjectInputError) as caught:
-        _bounded_call(fail, 0.5)
-
-    assert caught.value.code == expected.code
-    assert str(caught.value) == str(expected)
-    assert caught.value.retryable is False
-    assert caught.value.details == expected.details
-    assert caught.value.http_status == expected.http_status
+    assert libc.calls == [(1, signal.SIGKILL, 0, 0, 0)]
+    assert kills == [(333, signal.SIGKILL)]
 
 
 def test_object_staging_rejects_symlink_ancestor(settings, tmp_path):

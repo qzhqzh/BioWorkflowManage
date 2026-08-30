@@ -3,13 +3,14 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
-import multiprocessing
 import os
 import re
 import shutil
 import signal
 import socket
 import stat as stat_module
+import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -17,7 +18,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Iterator
 from urllib.parse import urlsplit
 
 import boto3
@@ -65,7 +66,8 @@ STAGING_DIRECTORY_FLAGS = (
 _HEAD_CALL_SLOTS = threading.BoundedSemaphore(
     max(1, int(settings.ANALYSIS_OBJECT_HEAD_MAX_CONCURRENT))
 )
-_HEAD_PROCESS_CONTEXT = multiprocessing.get_context("fork")
+_OBJECT_HEAD_WORKER = Path(__file__).with_name("object_head_worker.py")
+_MAX_OBJECT_HEAD_WORKER_RESPONSE_BYTES = 64 * 1024
 
 
 class ObjectInputError(RuntimeError):
@@ -458,105 +460,224 @@ def _s3_client(profile: ObjectStorageProfile, addresses: tuple[str, ...]):
     return _pin_client_connections(client, profile, addresses)
 
 
-def _head_process_entry(callback: Callable[[], Any], connection) -> None:
+def _inspect_object_reference_metadata(
+    reference: dict[str, Any],
+    *,
+    client_id: str | None,
+) -> dict[str, Any]:
+    profile = _load_profile(reference["profile"])
+    _authorize_reference(profile, reference, client_id=client_id)
+    addresses = _validate_endpoint(profile)
+    client = None
     try:
-        connection.send(("success", callback()))
-    except ObjectInputError as error:
-        connection.send(
-            (
-                "object_error",
-                {
-                    "code": error.code,
-                    "message": str(error),
-                    "retryable": error.retryable,
-                    "details": error.details,
-                    "http_status": error.http_status,
-                },
-            )
+        client = _s3_client(profile, addresses)
+        response = client.head_object(
+            **_request_parameters(reference, profile, conditional=True)
         )
-    except BaseException:
-        connection.send(("internal_error", None))
+    except BaseException as error:
+        if isinstance(error, ObjectInputError):
+            raise
+        raise _mapped_client_error(error, changed_on_missing=False) from error
     finally:
-        connection.close()
+        close = getattr(client, "close", None) if client is not None else None
+        if callable(close):
+            close()
+    return {
+        "ContentLength": response.get("ContentLength"),
+        "ETag": response.get("ETag"),
+        "VersionId": response.get("VersionId"),
+        "DeleteMarker": response.get("DeleteMarker") is True,
+    }
 
 
-def _stop_head_process(process) -> None:
-    if process.pid is None:
-        return
-    process.join(timeout=0)
-    if process.is_alive():
-        process.terminate()
-        process.join(timeout=0.1)
-    if process.is_alive():
+def _head_worker_environment(timeout: float) -> dict[str, str]:
+    environment = {
+        "ANALYSIS_OBJECT_HEAD_TIMEOUT_SECONDS": str(timeout),
+        "ANALYSIS_OBJECT_STAGE_MAX_OBJECT_BYTES": str(
+            int(settings.ANALYSIS_OBJECT_STAGE_MAX_OBJECT_BYTES)
+        ),
+        "ANALYSIS_OBJECT_STORAGE_PROFILE_DIR": str(
+            Path(settings.ANALYSIS_OBJECT_STORAGE_PROFILE_DIR).resolve()
+        ),
+        "AWS_CONFIG_FILE": os.devnull,
+        "AWS_EC2_METADATA_DISABLED": "true",
+        "AWS_SHARED_CREDENTIALS_FILE": os.devnull,
+        "DJANGO_SETTINGS_MODULE": "config.settings",
+        "PYTHONUNBUFFERED": "1",
+    }
+    for name in ("AWS_CA_BUNDLE", "SSL_CERT_DIR", "SSL_CERT_FILE"):
+        value = os.environ.get(name)
+        if value:
+            environment[name] = value
+    return environment
+
+
+def _object_head_unavailable(message: str) -> ObjectInputError:
+    return ObjectInputError(
+        "OBJECT_INPUT_UNAVAILABLE",
+        message,
+        retryable=True,
+        http_status=503,
+    )
+
+
+def _close_head_worker_streams(process: subprocess.Popen[bytes]) -> None:
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
+def _reap_head_worker(
+    process: subprocess.Popen[bytes],
+    slot: threading.BoundedSemaphore,
+) -> None:
+    try:
+        process.wait()
+    finally:
+        _close_head_worker_streams(process)
+        slot.release()
+
+
+def _kill_head_worker(process: subprocess.Popen[bytes]) -> bool:
+    if process.poll() is not None:
+        return True
+    try:
         process.kill()
-        process.join()
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        _close_head_worker_streams(process)
+        return False
+    return True
 
 
-def _bounded_call(callback: Callable[[], Any], timeout: float) -> Any:
-    if not _HEAD_CALL_SLOTS.acquire(blocking=False):
+def _validated_head_worker_response(raw: bytes) -> dict[str, Any]:
+    if len(raw) > _MAX_OBJECT_HEAD_WORKER_RESPONSE_BYTES:
+        raise _object_head_unavailable("对象存储预检进程返回过多数据。")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, ValueError) as error:
+        raise _object_head_unavailable("对象存储预检进程返回无效数据。") from error
+    if not isinstance(payload, dict) or not isinstance(payload.get("ok"), bool):
+        raise _object_head_unavailable("对象存储预检进程返回无效信封。")
+    if payload["ok"]:
+        metadata = payload.get("metadata")
+        if not isinstance(metadata, dict) or set(metadata) != {
+            "ContentLength",
+            "DeleteMarker",
+            "ETag",
+            "VersionId",
+        }:
+            raise _object_head_unavailable("对象存储预检进程返回无效元数据。")
+        return metadata
+    error = payload.get("error")
+    if (
+        not isinstance(error, dict)
+        or not isinstance(error.get("code"), str)
+        or not error["code"]
+        or not isinstance(error.get("message"), str)
+        or not isinstance(error.get("retryable"), bool)
+        or not isinstance(error.get("details"), dict)
+        or not isinstance(error.get("http_status"), int)
+        or isinstance(error.get("http_status"), bool)
+        or not 400 <= error["http_status"] <= 599
+    ):
+        raise _object_head_unavailable("对象存储预检进程返回无效错误。")
+    raise ObjectInputError(
+        error["code"],
+        error["message"],
+        retryable=error["retryable"],
+        details=error["details"],
+        http_status=error["http_status"],
+    )
+
+
+def _run_object_head_worker(
+    reference: dict[str, Any],
+    *,
+    client_id: str | None,
+    timeout: float,
+) -> dict[str, Any]:
+    timeout = max(0.1, timeout)
+    request = json.dumps(
+        {"client_id": client_id, "reference": reference},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    slot = _HEAD_CALL_SLOTS
+    if not slot.acquire(blocking=False):
         raise ObjectInputError(
             "OBJECT_INPUT_HEAD_BUSY",
             "对象存储预检并发槽暂时不可用。",
             retryable=True,
             http_status=503,
         )
-    deadline = time.monotonic() + max(0.1, timeout)
-    receive_connection = None
-    send_connection = None
-    process = None
+    release_slot = True
+    process: subprocess.Popen[bytes] | None = None
+    deadline = time.monotonic() + timeout
     try:
-        receive_connection, send_connection = _HEAD_PROCESS_CONTEXT.Pipe(duplex=False)
-        process = _HEAD_PROCESS_CONTEXT.Process(
-            target=_head_process_entry,
-            args=(callback, send_connection),
-            name="object-input-head",
-            daemon=True,
-        )
-        process.start()
-        send_connection.close()
-        send_connection = None
-        remaining = max(0, deadline - time.monotonic())
-        if not receive_connection.poll(remaining):
+        command = [
+            sys.executable,
+            str(_OBJECT_HEAD_WORKER),
+            "--deadline-seconds",
+            str(timeout),
+            "--parent-pid",
+            str(os.getpid()),
+        ]
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=str(_OBJECT_HEAD_WORKER.parents[1]),
+                env=_head_worker_environment(timeout),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                start_new_session=True,
+            )
+        except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as error:
+            raise _object_head_unavailable(
+                "对象存储预检进程无法启动。"
+            ) from error
+        try:
+            stdout, _ = process.communicate(
+                input=request,
+                timeout=max(0.001, deadline - time.monotonic()),
+            )
+        except subprocess.TimeoutExpired as error:
             raise ObjectInputError(
                 "OBJECT_INPUT_HEAD_TIMEOUT",
                 "对象存储预检超过时间上限。",
                 retryable=True,
                 http_status=503,
-            )
-        try:
-            status, value = receive_connection.recv()
-        except EOFError as error:
-            raise ObjectInputError(
-                "OBJECT_INPUT_UNAVAILABLE",
-                "对象存储预检进程异常退出。",
-                retryable=True,
-                http_status=503,
             ) from error
-        if status == "success":
-            return value
-        if status == "object_error":
-            raise ObjectInputError(
-                value["code"],
-                value["message"],
-                retryable=value["retryable"],
-                details=value["details"],
-                http_status=value["http_status"],
-            )
-        raise ObjectInputError(
-            "OBJECT_INPUT_UNAVAILABLE",
-            "对象存储预检进程执行失败。",
-            retryable=True,
-            http_status=503,
-        )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise _object_head_unavailable(
+                "对象存储预检进程通信失败。"
+            ) from error
+        if process.returncode != 0:
+            raise _object_head_unavailable("对象存储预检进程异常退出。")
+        return _validated_head_worker_response(stdout)
     finally:
-        if send_connection is not None:
-            send_connection.close()
-        if receive_connection is not None:
-            receive_connection.close()
         if process is not None:
-            _stop_head_process(process)
-            process.close()
-        _HEAD_CALL_SLOTS.release()
+            if process.poll() is None and not _kill_head_worker(process):
+                reaper = threading.Thread(
+                    target=_reap_head_worker,
+                    args=(process, slot),
+                    name="object-input-head-reaper",
+                    daemon=True,
+                )
+                reaper.start()
+                release_slot = False
+            else:
+                _close_head_worker_streams(process)
+        if release_slot:
+            slot.release()
 
 
 def _normalized_etag(value: Any) -> str:
@@ -755,34 +876,10 @@ def inspect_object_reference(
 ) -> tuple[str, dict[str, Any], dict[str, Any]]:
     reference = _reference(value, input_name=input_name)
 
-    def inspect() -> dict[str, Any]:
-        profile = _load_profile(reference["profile"])
-        _authorize_reference(profile, reference, client_id=client_id)
-        addresses = _validate_endpoint(profile)
-        client = None
-        try:
-            client = _s3_client(profile, addresses)
-            response = client.head_object(
-                **_request_parameters(reference, profile, conditional=True)
-            )
-        except BaseException as error:
-            if isinstance(error, ObjectInputError):
-                raise
-            raise _mapped_client_error(error, changed_on_missing=False) from error
-        finally:
-            close = getattr(client, "close", None) if client is not None else None
-            if callable(close):
-                close()
-        return {
-            "ContentLength": response.get("ContentLength"),
-            "ETag": response.get("ETag"),
-            "VersionId": response.get("VersionId"),
-            "DeleteMarker": response.get("DeleteMarker") is True,
-        }
-
-    response = _bounded_call(
-        inspect,
-        float(settings.ANALYSIS_OBJECT_HEAD_TIMEOUT_SECONDS),
+    response = _run_object_head_worker(
+        reference,
+        client_id=client_id,
+        timeout=float(settings.ANALYSIS_OBJECT_HEAD_TIMEOUT_SECONDS),
     )
     observed_size = response.get("ContentLength")
     observed_etag = _normalized_etag(response.get("ETag"))
