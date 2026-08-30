@@ -625,6 +625,13 @@ def test_target_validation_blocks_ssrf_and_allows_explicit_private_hosts(
         with pytest.raises(WebhookError, match="私网"):
             resolve_webhook_target("https://mixed.example.test/hook")
 
+    public_record = [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+    ]
+    with patch("workflows.webhooks.socket.getaddrinfo", return_value=public_record):
+        public = resolve_webhook_target("https://public.example.test/hook")
+    assert public.address == "93.184.216.34"
+
     settings.WEBHOOK_PRIVATE_HOST_ALLOWLIST = ["internal.example.test"]
     with patch("workflows.webhooks.socket.getaddrinfo", return_value=private_record):
         target = resolve_webhook_target("https://internal.example.test/hook")

@@ -337,7 +337,10 @@ def resolve_webhook_target(url: str) -> WebhookTarget:
             (
                 not parsed_address.is_global
                 or parsed_address.is_multicast
-                or parsed_address.is_site_local
+                or (
+                    isinstance(parsed_address, ipaddress.IPv6Address)
+                    and parsed_address.is_site_local
+                )
             )
             and hostname not in private_allowlist
             and address.casefold() not in private_allowlist
