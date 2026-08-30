@@ -31,6 +31,11 @@ from .integration_outputs import (
     ResourceSnapshotBudgetError,
 )
 from .models import AnalysisRun, AnalysisRunEvent
+from .object_inputs import (
+    ObjectInputError,
+    object_manifest_items,
+    stage_run_object_inputs,
+)
 from .webhooks import enqueue_terminal_event
 from .wdl_packages import normalize_package_path
 from .wdl_source_references import (
@@ -759,6 +764,7 @@ def _verify_run_resource_manifests(
     snapshot_budget: ResourceSnapshotBudget | None = None,
 ) -> None:
     payload = run.request_payload
+    object_manifest_items(payload.get("input_resource_manifest"))
     _verify_manifest_files(
         payload.get("input_resource_manifest"),
         Path(settings.ANALYSIS_RAWDATA_ROOT),
@@ -992,6 +998,17 @@ def execute_analysis_run(
                 f"analysis run {run.id} lease was lost during resource verification"
             )
 
+    staged_object_count = stage_run_object_inputs(
+        run,
+        checkpoint=resource_checkpoint,
+    )
+    if staged_object_count:
+        _event(
+            run,
+            f"已校验并固定 {staged_object_count} 个对象存储输入。",
+            kind="input",
+            details={"object_count": staged_object_count},
+        )
     _verify_run_resource_manifests(
         run,
         checkpoint=resource_checkpoint,
@@ -1287,7 +1304,15 @@ def process_analysis_run(run: AnalysisRun) -> None:
         return
     except Exception as error:
         try:
-            failure = _failure_metadata(str(error))
+            failure = (
+                {
+                    "code": error.code,
+                    "category": error.category,
+                    "retryable": error.retryable,
+                }
+                if isinstance(error, ObjectInputError)
+                else _failure_metadata(str(error))
+            )
             _update_run(
                 run,
                 status=AnalysisRun.Status.FAILED,
@@ -1297,7 +1322,7 @@ def process_analysis_run(run: AnalysisRun) -> None:
                 error_code=failure["code"],
                 error_category=failure["category"],
                 error_retryable=failure["retryable"],
-                error_details={},
+                error_details=(error.details if isinstance(error, ObjectInputError) else {}),
                 output_status=AnalysisRun.OutputStatus.UNAVAILABLE,
                 finished_at=timezone.now(),
                 lease_token=None,

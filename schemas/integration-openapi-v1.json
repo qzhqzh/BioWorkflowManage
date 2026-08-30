@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "BioWorkflowManage Integration API",
-    "version": "1.2.0",
-    "description": "第三方 MES、运营平台、报告系统与 AI Agent 使用的固定分析产品、Task 测试及资产查询接口。所有写操作均受 Service Token scope、受管路径、幂等键和审计约束。"
+    "version": "1.3.0",
+    "description": "第三方 MES、运营平台、报告系统与 AI Agent 使用的固定分析产品、Task 测试及资产查询接口。所有写操作均受 Service Token scope、可移植输入引用、幂等键和审计约束。"
   },
   "servers": [{"url": "/api/v1/integration"}],
   "security": [{"serviceToken": []}],
@@ -63,10 +63,10 @@
     "/analysis-runs/preflight": {
       "post": {
         "operationId": "preflightAnalysisRun",
-        "summary": "预检固定分析产品或 WorkflowVersion 和受管输入，不创建运行",
+        "summary": "预检固定分析产品或 WorkflowVersion 和可移植输入，不创建运行",
         "x-required-scope": "analysis:submit",
         "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AnalysisPreflight"}}}},
-        "responses": {"200": {"description": "预检通过"}, "400": {"$ref": "#/components/responses/Error"}, "404": {"$ref": "#/components/responses/Error"}, "409": {"$ref": "#/components/responses/Error"}}
+        "responses": {"200": {"description": "预检通过"}, "400": {"$ref": "#/components/responses/Error"}, "403": {"$ref": "#/components/responses/Error"}, "404": {"$ref": "#/components/responses/Error"}, "409": {"$ref": "#/components/responses/Error"}, "413": {"$ref": "#/components/responses/Error"}, "503": {"$ref": "#/components/responses/Error"}}
       }
     },
     "/analysis-runs": {
@@ -83,7 +83,7 @@
         "x-required-scope": "analysis:submit",
         "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}, {"$ref": "#/components/parameters/RequestId"}],
         "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AnalysisSubmission"}}}},
-        "responses": {"201": {"description": "创建运行", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AnalysisRun"}}}}, "200": {"description": "幂等重放"}, "400": {"$ref": "#/components/responses/Error"}, "404": {"$ref": "#/components/responses/Error"}, "409": {"$ref": "#/components/responses/Error"}}
+        "responses": {"201": {"description": "创建运行", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AnalysisRun"}}}}, "200": {"description": "幂等重放"}, "400": {"$ref": "#/components/responses/Error"}, "403": {"$ref": "#/components/responses/Error"}, "404": {"$ref": "#/components/responses/Error"}, "409": {"$ref": "#/components/responses/Error"}, "413": {"$ref": "#/components/responses/Error"}, "503": {"$ref": "#/components/responses/Error"}}
       }
     },
     "/analysis-runs/by-external-ref": {
@@ -165,7 +165,7 @@
         "summary": "预检不可变 ToolVersion 的独立测试",
         "x-required-scope": "task:test",
         "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ToolTestPreflight"}}}},
-        "responses": {"200": {"description": "预检通过"}}
+        "responses": {"200": {"description": "预检通过"}, "400": {"$ref": "#/components/responses/Error"}, "403": {"$ref": "#/components/responses/Error"}, "404": {"$ref": "#/components/responses/Error"}, "409": {"$ref": "#/components/responses/Error"}, "413": {"$ref": "#/components/responses/Error"}, "503": {"$ref": "#/components/responses/Error"}}
       }
     },
     "/tool-test-runs": {
@@ -175,7 +175,7 @@
         "x-required-scope": "task:test",
         "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}],
         "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ToolTestSubmission"}}}},
-        "responses": {"201": {"description": "测试运行"}, "409": {"$ref": "#/components/responses/Error"}}
+        "responses": {"201": {"description": "测试运行"}, "400": {"$ref": "#/components/responses/Error"}, "403": {"$ref": "#/components/responses/Error"}, "404": {"$ref": "#/components/responses/Error"}, "409": {"$ref": "#/components/responses/Error"}, "413": {"$ref": "#/components/responses/Error"}, "503": {"$ref": "#/components/responses/Error"}}
       }
     },
     "/tools": {
@@ -233,6 +233,7 @@
         "type": "object",
         "required": ["root_alias", "relative_path"],
         "properties": {
+          "type": {"type": "string", "const": "managed_path", "description": "可选；省略时保持 1.2 及更早版本兼容。"},
           "root_alias": {"type": "string", "enum": ["rawdata", "database"]},
           "relative_path": {"type": "string"},
           "sha256": {
@@ -246,6 +247,32 @@
             "description": "Directory 的 sha256-tree-identity-v1 身份摘要。"
           }
         }
+      },
+      "S3ObjectReference": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type", "profile", "bucket", "key", "size", "sha256"],
+        "anyOf": [
+          {"required": ["version_id"]},
+          {"required": ["etag"]}
+        ],
+        "properties": {
+          "type": {"type": "string", "const": "s3_object"},
+          "profile": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", "description": "部署侧对象存储 profile；不是凭据。"},
+          "bucket": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,62}$"},
+          "key": {"type": "string", "minLength": 1, "maxLength": 1024},
+          "version_id": {"type": "string", "minLength": 1, "maxLength": 1024},
+          "etag": {"type": "string", "minLength": 1, "maxLength": 1024},
+          "size": {"type": "integer", "minimum": 1},
+          "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+        }
+      },
+      "InputReference": {
+        "description": "File 输入支持 legacy managed path 或固定的 S3-compatible object reference。Directory 仅支持 managed path。",
+        "oneOf": [
+          {"$ref": "#/components/schemas/ManagedResource"},
+          {"$ref": "#/components/schemas/S3ObjectReference"}
+        ]
       },
       "DatabaseSelection": {
         "type": "object",
@@ -320,7 +347,7 @@
           "workflow": {"$ref": "#/components/schemas/WorkflowVersionRef"},
           "analysis_product": {"$ref": "#/components/schemas/AnalysisProductRef"},
           "subject": {"type": "object", "required": ["sample_id"], "properties": {"sample_id": {"type": "string", "maxLength": 128}}},
-          "inputs": {"type": "object", "additionalProperties": true},
+          "inputs": {"type": "object", "additionalProperties": true, "description": "按分析契约提供输入；File 值使用 InputReference，数组与 Pair 可递归包含 InputReference。"},
           "database": {"$ref": "#/components/schemas/DatabaseSelection"},
           "metadata": {"type": "object", "additionalProperties": true}
         }
@@ -335,7 +362,7 @@
         "properties": {
           "workflow": {"$ref": "#/components/schemas/WorkflowVersionRef"},
           "analysis_product": {"$ref": "#/components/schemas/AnalysisProductRef"},
-          "inputs": {"type": "object", "additionalProperties": true},
+          "inputs": {"type": "object", "additionalProperties": true, "description": "按分析契约提供输入；File 值使用 InputReference，数组与 Pair 可递归包含 InputReference。"},
           "database": {"$ref": "#/components/schemas/DatabaseSelection"},
           "metadata": {"type": "object", "additionalProperties": true}
         }
@@ -345,7 +372,7 @@
         "required": ["tool", "inputs"],
         "properties": {
           "tool": {"type": "object", "required": ["tool_id", "version", "expected_digest"], "properties": {"tool_id": {"type": "string"}, "version": {"type": "string"}, "expected_digest": {"type": "string"}}},
-          "inputs": {"type": "object", "additionalProperties": true}
+          "inputs": {"type": "object", "additionalProperties": true, "description": "File 值使用 InputReference；凭据仅来自部署侧 profile。"}
         }
       },
       "ToolTestSubmission": {
@@ -354,7 +381,7 @@
         "properties": {
           "external_ref": {"$ref": "#/components/schemas/ExternalRef"},
           "tool": {"type": "object", "required": ["tool_id", "version", "expected_digest"], "properties": {"tool_id": {"type": "string"}, "version": {"type": "string"}, "expected_digest": {"type": "string"}}},
-          "inputs": {"type": "object", "additionalProperties": true},
+          "inputs": {"type": "object", "additionalProperties": true, "description": "File 值使用 InputReference；凭据仅来自部署侧 profile。"},
           "label": {"type": "string", "maxLength": 256}
         }
       },

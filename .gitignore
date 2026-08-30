@@ -16,6 +16,7 @@ dist/
 coverage/
 *.log
 data/
+secrets/
 workspace/rawdata/**
 workspace/databases/**
 !workspace/databases/README.md

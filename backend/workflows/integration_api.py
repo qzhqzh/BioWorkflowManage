@@ -71,6 +71,11 @@ from .models import (
     WorkflowDocument,
     WorkflowVersion,
 )
+from .object_inputs import (
+    ObjectInputError,
+    inspect_object_reference,
+    object_manifest_items,
+)
 from .request_ids import request_id, with_request_id
 from .tool_runs import _safe_identifier, _tool_test_bundle, _validate_constraints
 from .webhooks import enqueue_terminal_event
@@ -590,6 +595,13 @@ def _managed_resource(
             f"输入 {input_name} 必须使用 root_alias + relative_path。",
             category="input",
         )
+    reference_type = value.get("type")
+    if reference_type not in {None, "managed_path"}:
+        raise IntegrationAPIError(
+            "INPUT_REFERENCE_TYPE_INVALID",
+            f"输入 {input_name} 的引用类型无效。",
+            category="input",
+        )
     if kind == "file" and value.get("identity_digest"):
         raise IntegrationAPIError(
             "MANAGED_RESOURCE_DIGEST_INVALID",
@@ -761,6 +773,7 @@ def _managed_resource(
             category="input",
         )
     manifest: dict[str, Any] = {
+        "reference_type": "managed_path",
         "root_alias": alias,
         "relative_path": normalized.as_posix(),
         "kind": kind,
@@ -819,6 +832,7 @@ def _coerce_input(
     semantic_type: str,
     manifests: dict[str, list[dict[str, Any]]],
     observed: list[dict[str, Any]],
+    object_checks: list[dict[str, Any]],
     snapshot_budget: ResourceSnapshotBudget,
 ) -> Any:
     optional = wdl_type.endswith("?")
@@ -826,6 +840,35 @@ def _coerce_input(
     if value is None and optional:
         return None
     if normalized_type == "File":
+        if isinstance(value, dict) and value.get("type") == "s3_object":
+            if len(manifests["objects"]) >= int(
+                settings.ANALYSIS_OBJECT_STAGE_MAX_ITEMS
+            ):
+                raise IntegrationAPIError(
+                    "OBJECT_INPUT_LIMIT_EXCEEDED",
+                    "对象输入数量超过部署上限。",
+                    category="input",
+                )
+            try:
+                _snapshot_checkpoint(snapshot_budget)
+                execution_path, manifest, check = inspect_object_reference(
+                    value,
+                    input_name=input_name,
+                    semantic_type=semantic_type,
+                )
+                _snapshot_checkpoint(snapshot_budget)
+            except ObjectInputError as error:
+                raise IntegrationAPIError(
+                    error.code,
+                    str(error),
+                    category=error.category,
+                    retryable=error.retryable,
+                    details=error.details,
+                    http_status=error.http_status,
+                ) from error
+            manifests["objects"].append(manifest)
+            object_checks.append(check)
+            return execution_path
         return _managed_resource(
             value,
             kind="file",
@@ -861,6 +904,7 @@ def _coerce_input(
                 semantic_type=semantic_type,
                 manifests=manifests,
                 observed=observed,
+                object_checks=object_checks,
                 snapshot_budget=snapshot_budget,
             )
             for item in value
@@ -881,6 +925,7 @@ def _coerce_input(
                 semantic_type=semantic_type,
                 manifests=manifests,
                 observed=observed,
+                object_checks=object_checks,
                 snapshot_budget=snapshot_budget,
             )
             for index, side in enumerate(("left", "right"))
@@ -1122,6 +1167,7 @@ def _content_checks(
     observed: list[dict[str, Any]],
     *,
     snapshot_budget: ResourceSnapshotBudget,
+    skip_fastq_pair: bool = False,
 ) -> list[dict[str, Any]]:
     reads: dict[int, list[str]] = {1: [], 2: []}
     checked = []
@@ -1159,7 +1205,7 @@ def _content_checks(
                 snapshot_budget=snapshot_budget,
             )
             checked.append({"input": item["input"], "check": "fasta", "ready": True})
-    if reads[1] or reads[2]:
+    if (reads[1] or reads[2]) and not skip_fastq_pair:
         if len(reads[1]) != len(reads[2]) or reads[1] != reads[2]:
             raise IntegrationAPIError(
                 "FASTQ_PAIR_MISMATCH",
@@ -1190,9 +1236,14 @@ def _prepare_contract_inputs(
             category="input",
             details={"inputs": unknown},
         )
-    manifests: dict[str, list[dict[str, Any]]] = {"rawdata": [], "database": []}
+    manifests: dict[str, list[dict[str, Any]]] = {
+        "rawdata": [],
+        "database": [],
+        "objects": [],
+    }
     snapshot_budget = snapshot_budget or ResourceSnapshotBudget()
     observed: list[dict[str, Any]] = []
+    object_checks: list[dict[str, Any]] = []
     values: dict[str, Any] = {}
     for name, port in by_name.items():
         if name in raw_inputs:
@@ -1215,6 +1266,7 @@ def _prepare_contract_inputs(
             semantic_type=str(port.get("semantic_type") or "core.value.unknown"),
             manifests=manifests,
             observed=observed,
+            object_checks=object_checks,
             snapshot_budget=snapshot_budget,
         )
         try:
@@ -1227,14 +1279,25 @@ def _prepare_contract_inputs(
             ) from error
         key = input_keys[name] if input_keys else name
         values[f"{workflow_name}.{key}"] = value
-    content_checks = _content_checks(
-        observed,
-        snapshot_budget=snapshot_budget,
-    )
+    content_checks = [
+        *object_checks,
+        *_content_checks(
+            observed,
+            snapshot_budget=snapshot_budget,
+            skip_fastq_pair=any(
+                item.get("semantic_type") in {"bio.fastq.gz.r1", "bio.fastq.gz.r2"}
+                for item in manifests["objects"]
+            ),
+        ),
+    ]
     resource_manifests = {
         "input_resource_manifest": (
-            {"schema_version": 1, "files": manifests["rawdata"]}
-            if manifests["rawdata"]
+            {
+                "schema_version": 2 if manifests["objects"] else 1,
+                "files": manifests["rawdata"],
+                "objects": manifests["objects"],
+            }
+            if manifests["rawdata"] or manifests["objects"]
             else None
         ),
         "database_resource_manifest": (
@@ -1243,6 +1306,17 @@ def _prepare_contract_inputs(
             else None
         ),
     }
+    try:
+        object_manifest_items(resource_manifests["input_resource_manifest"])
+    except ObjectInputError as error:
+        raise IntegrationAPIError(
+            error.code,
+            str(error),
+            category=error.category,
+            retryable=error.retryable,
+            details=error.details,
+            http_status=error.http_status,
+        ) from error
     return values, resource_manifests, content_checks
 
 
@@ -1254,7 +1328,7 @@ def _declared_resources(
     resources = version.interface_contract.get("resources") or []
     if not resources:
         return {"database_resource_manifest": None, "checks": []}
-    manifests = {"rawdata": [], "database": []}
+    manifests = {"rawdata": [], "database": [], "objects": []}
     snapshot_budget = snapshot_budget or ResourceSnapshotBudget()
     observed: list[dict[str, Any]] = []
     for index, resource in enumerate(resources, 1):
@@ -1654,6 +1728,9 @@ def _public_text(value: Any) -> str:
             "ANALYSIS_DATABASE_EXECUTION_ROOT",
             "ANALYSIS_RUN_ROOT",
             "ANALYSIS_RUN_EXECUTION_ROOT",
+            "ANALYSIS_INPUT_STAGING_ROOT",
+            "ANALYSIS_INPUT_STAGING_EXECUTION_ROOT",
+            "ANALYSIS_OBJECT_STORAGE_PROFILE_DIR",
         )
     }
     for root in sorted((item for item in roots if item), key=len, reverse=True):
@@ -2180,6 +2257,15 @@ def integration_analysis_run_retry(request, run_id):
                 original,
                 snapshot_budget=ResourceSnapshotBudget(),
             )
+        except ObjectInputError as error:
+            raise IntegrationAPIError(
+                error.code,
+                str(error),
+                category=error.category,
+                retryable=error.retryable,
+                details={"retry_of": str(original.id), **error.details},
+                http_status=status.HTTP_409_CONFLICT,
+            ) from error
         except ResourceSnapshotBudgetError as error:
             raise IntegrationAPIError(
                 "MANAGED_RESOURCE_LIMIT_EXCEEDED",
