@@ -25,6 +25,7 @@ CSRF_TRUSTED_ORIGINS = _csv_environment(
     "DJANGO_CSRF_TRUSTED_ORIGINS",
     "https://wdl.qzhqzh.com,http://localhost:8082,http://127.0.0.1:8082",
 )
+CSRF_FAILURE_VIEW = "workflows.auth_views.csrf_failure"
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
 INSTALLED_APPS = [
@@ -62,9 +63,8 @@ CORS_ALLOW_CREDENTIALS = True
 ROOT_URLCONF = "config.urls"
 WSGI_APPLICATION = "config.wsgi.application"
 
-# Authentication is enabled by default for deployed services. Test settings turn
-# this off by default so the pre-authentication API tests remain focused on their
-# existing contracts; authentication tests opt back in explicitly.
+# Authentication is enabled by default. Contract-focused API test modules opt out
+# explicitly; authentication tests exercise the deployed setting.
 AUTH_REQUIRED = os.environ.get("DJANGO_AUTH_REQUIRED", "1") == "1"
 SESSION_COOKIE_HTTPONLY = True
 SESSION_COOKIE_SAMESITE = os.environ.get("DJANGO_SESSION_COOKIE_SAMESITE", "Lax")
@@ -108,7 +108,15 @@ REST_FRAMEWORK = {
     ],
     "EXCEPTION_HANDLER": "workflows.integration_exceptions.integration_exception_handler",
     "UNAUTHENTICATED_USER": None,
+    "NUM_PROXIES": max(0, int(os.environ.get("DJANGO_TRUSTED_PROXY_COUNT", "1"))),
+    "DEFAULT_THROTTLE_RATES": {
+        "login": os.environ.get("DJANGO_LOGIN_THROTTLE_RATE", "30/min"),
+    },
 }
+LOGIN_THROTTLE_RETENTION_DAYS = max(
+    1,
+    int(os.environ.get("DJANGO_LOGIN_THROTTLE_RETENTION_DAYS", "7")),
+)
 
 SPROCKET_BINARY = os.environ.get("SPROCKET_BINARY", "sprocket")
 SPROCKET_FORMAT_CONFIG = os.environ.get(
@@ -141,6 +149,80 @@ RAWDATA_SCAN_MAX_DEPTH = max(
 RAWDATA_SCAN_BATCH_SECONDS = max(
     0.25,
     float(os.environ.get("RAWDATA_SCAN_BATCH_SECONDS", "2")),
+)
+ANALYSIS_RESOURCE_MANIFEST_TIMEOUT_SECONDS = max(
+    0.1,
+    float(os.environ.get("ANALYSIS_RESOURCE_MANIFEST_TIMEOUT_SECONDS", "2")),
+)
+ANALYSIS_WORKER_RESOURCE_MANIFEST_TIMEOUT_SECONDS = max(
+    0.1,
+    float(
+        os.environ.get(
+            "ANALYSIS_WORKER_RESOURCE_MANIFEST_TIMEOUT_SECONDS",
+            "300",
+        )
+    ),
+)
+ANALYSIS_RESOURCE_MANIFEST_MAX_ENTRIES = max(
+    1,
+    int(os.environ.get("ANALYSIS_RESOURCE_MANIFEST_MAX_ENTRIES", "100000")),
+)
+ANALYSIS_RESOURCE_MANIFEST_MAX_DEPTH = max(
+    1,
+    int(os.environ.get("ANALYSIS_RESOURCE_MANIFEST_MAX_DEPTH", "128")),
+)
+ANALYSIS_MANAGED_RESOURCE_MAX_ITEMS = max(
+    1,
+    int(os.environ.get("ANALYSIS_MANAGED_RESOURCE_MAX_ITEMS", "256")),
+)
+ANALYSIS_INPUT_TEXT_LINE_MAX_CHARS = max(
+    1,
+    int(os.environ.get("ANALYSIS_INPUT_TEXT_LINE_MAX_CHARS", "1048576")),
+)
+ANALYSIS_INPUT_GZIP_HEADER_MAX_BYTES = max(
+    10,
+    int(os.environ.get("ANALYSIS_INPUT_GZIP_HEADER_MAX_BYTES", "65536")),
+)
+ANALYSIS_MANAGED_FILE_CHECKSUM_MAX_BYTES = max(
+    1,
+    int(os.environ.get("ANALYSIS_MANAGED_FILE_CHECKSUM_MAX_BYTES", "17179869184")),
+)
+ANALYSIS_OUTPUT_SNAPSHOT_MAX_ITEMS = max(
+    1,
+    int(os.environ.get("ANALYSIS_OUTPUT_SNAPSHOT_MAX_ITEMS", "256")),
+)
+ANALYSIS_OUTPUT_SNAPSHOT_MAX_BYTES = max(
+    1,
+    int(os.environ.get("ANALYSIS_OUTPUT_SNAPSHOT_MAX_BYTES", "1099511627776")),
+)
+ANALYSIS_OUTPUT_SNAPSHOT_MAX_DIRECTORY_ENTRIES = max(
+    1,
+    int(
+        os.environ.get(
+            "ANALYSIS_OUTPUT_SNAPSHOT_MAX_DIRECTORY_ENTRIES",
+            "200000",
+        )
+    ),
+)
+ANALYSIS_OUTPUT_SNAPSHOT_TIMEOUT_SECONDS = max(
+    0.1,
+    float(os.environ.get("ANALYSIS_OUTPUT_SNAPSHOT_TIMEOUT_SECONDS", "300")),
+)
+ANALYSIS_OUTPUT_SNAPSHOT_MIN_FREE_BYTES = max(
+    0,
+    int(os.environ.get("ANALYSIS_OUTPUT_SNAPSHOT_MIN_FREE_BYTES", "1073741824")),
+)
+ANALYSIS_OUTPUT_MANIFEST_MAX_DEPTH = max(
+    1,
+    int(os.environ.get("ANALYSIS_OUTPUT_MANIFEST_MAX_DEPTH", "32")),
+)
+ANALYSIS_OUTPUT_VALUE_MAX_BYTES = max(
+    1,
+    int(os.environ.get("ANALYSIS_OUTPUT_VALUE_MAX_BYTES", "65536")),
+)
+ANALYSIS_RESULT_JSON_MAX_BYTES = max(
+    1,
+    int(os.environ.get("ANALYSIS_RESULT_JSON_MAX_BYTES", "67108864")),
 )
 RAWDATA_SCAN_LEASE_SECONDS = max(
     30,

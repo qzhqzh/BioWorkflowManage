@@ -8,13 +8,20 @@ from django.core.exceptions import ValidationError
 from rest_framework.test import APIClient
 
 from compiler_core.compiler import compile_workflow, validate_wdl
-from compiler_core.validation import semantic_digest, validate_workflow_graph
+from compiler_core.validation import (
+    canonical_digest,
+    semantic_digest,
+    validate_workflow_graph,
+)
 from workflows.models import (
     ToolVersion,
     WDLRevision,
     WorkflowDocument,
     WorkflowVersion,
 )
+
+
+pytestmark = pytest.mark.usefixtures("auth_disabled")
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -35,6 +42,190 @@ def chain_fixture():
         json.loads((CHAIN_FIXTURE / "tool-bwa-mem.json").read_text(encoding="utf-8")),
     ]
     return graph, tools
+
+
+def test_tool_validation_returns_schema_report_for_non_list_inputs():
+    graph, tool = fixture()
+    tool["inputs"] = None
+
+    response = APIClient().post(
+        "/api/v1/validations/tool-spec",
+        {"tool_spec": tool},
+        format="json",
+    )
+
+    assert response.status_code == 200
+    assert response.data["validation"]["status"] == "invalid"
+    assert any(
+        item["code"] == "SCHEMA001"
+        and item["path"] == "/inputs"
+        for item in response.data["validation"]["diagnostics"]
+    )
+
+
+def parameter_fixture():
+    graph, tool = fixture()
+    tool = deepcopy(tool)
+    tool["inputs"] = [
+        *tool["inputs"],
+        {
+            "name": "label",
+            "wdl_type": "String",
+            "semantic_type": "core.string",
+            "required": False,
+        },
+        {
+            "name": "threshold",
+            "wdl_type": "Float",
+            "semantic_type": "core.float",
+            "required": False,
+        },
+        {
+            "name": "enabled",
+            "wdl_type": "Boolean",
+            "semantic_type": "core.boolean",
+            "required": False,
+        },
+        {
+            "name": "labels",
+            "wdl_type": "Array[String]",
+            "semantic_type": "core.string.array",
+            "required": False,
+        },
+        {
+            "name": "optional_note",
+            "wdl_type": "String",
+            "semantic_type": "core.string",
+            "required": False,
+        },
+    ]
+    tool_node = next(node for node in graph["nodes"] if node["id"] == "fastp_1")
+    tool_node["tool_ref"]["digest"] = canonical_digest(tool)
+    return graph, tool
+
+
+def test_semantic_any_is_only_a_target_file_wildcard():
+    graph, tool = fixture()
+    source_any = deepcopy(graph)
+    source = next(node for node in source_any["nodes"] if node["id"] == "input_reads_1")
+    source["port"]["semantic_type"] = "core.file.any"
+
+    validation, _ = validate_workflow_graph(source_any, [tool])
+
+    assert validation["status"] == "invalid"
+    assert "WG013" in {item["code"] for item in validation["diagnostics"]}
+
+    target_any = deepcopy(graph)
+    target = next(node for node in target_any["nodes"] if node["id"] == "fastp_1")
+    target["tool_ref"]["digest"] = canonical_digest(tool)
+    tool_with_any = deepcopy(tool)
+    reads_1 = next(port for port in tool_with_any["inputs"] if port["name"] == "reads_1")
+    reads_1["semantic_type"] = "core.file.any"
+    target["tool_ref"]["digest"] = canonical_digest(tool_with_any)
+
+    validation, _ = validate_workflow_graph(target_any, [tool_with_any])
+
+    assert validation["status"] == "valid"
+
+
+def test_parameter_values_validate_scalars_arrays_and_optional_inputs():
+    graph, tool = parameter_fixture()
+    tool_node = next(node for node in graph["nodes"] if node["id"] == "fastp_1")
+    tool_node["parameter_values"] = {
+        "label": "sample-1",
+        "threshold": 0.5,
+        "enabled": True,
+        "labels": ["tumor", "normal"],
+    }
+
+    validation, _ = validate_workflow_graph(graph, [tool])
+
+    assert validation["status"] == "valid"
+
+
+def test_parameter_values_reject_unknown_ports_wrong_types_and_file_paths():
+    graph, tool = parameter_fixture()
+    tool["inputs"].append(
+        {
+            "name": "reference",
+            "wdl_type": "File",
+            "semantic_type": "core.file.any",
+            "required": False,
+        }
+    )
+    tool_node = next(node for node in graph["nodes"] if node["id"] == "fastp_1")
+    tool_node["tool_ref"]["digest"] = canonical_digest(tool)
+    tool_node["parameter_values"] = {
+        "ghost": 1,
+        "label": 3,
+        "threads": True,
+        "threshold": False,
+        "labels": ["ok", 2],
+        "reference": "/tmp/reference.fa",
+        "optional_note": None,
+    }
+
+    validation, _ = validate_workflow_graph(graph, [tool])
+
+    diagnostics = validation["diagnostics"]
+    assert validation["status"] == "invalid"
+    assert {item["code"] for item in diagnostics} == {"WG009", "WG010"}
+    assert {item["location"]["port"] for item in diagnostics} == {
+        "ghost",
+        "label",
+        "threads",
+        "threshold",
+        "labels",
+        "reference",
+        "optional_note",
+    }
+
+
+def test_workflow_output_requires_exactly_one_inbound_edge():
+    graph, tool = fixture()
+    graph["edges"] = [
+        edge
+        for edge in graph["edges"]
+        if edge["target"]["node_id"] != "output_clean_reads_1"
+    ]
+
+    validation, artifacts = compile_workflow(graph, [tool])
+
+    assert validation["status"] == "invalid"
+    output_diagnostics = [
+        item
+        for item in validation["diagnostics"]
+        if item["code"] == "WG015"
+    ]
+    assert len(output_diagnostics) == 1
+    assert output_diagnostics[0]["location"] == {
+        "node_id": "output_clean_reads_1",
+        "port": "value",
+    }
+    assert artifacts == []
+
+    graph, tool = fixture()
+    inbound = next(
+        edge
+        for edge in graph["edges"]
+        if edge["target"]["node_id"] == "output_clean_reads_1"
+    )
+    duplicate = deepcopy(inbound)
+    duplicate["id"] = f"{inbound['id']}_duplicate"
+    graph["edges"].append(duplicate)
+
+    validation, artifacts = compile_workflow(graph, [tool])
+
+    assert validation["status"] == "invalid"
+    assert any(
+        item["code"] == "WG015"
+        and item["location"] == {
+            "node_id": "output_clean_reads_1",
+            "port": "value",
+        }
+        for item in validation["diagnostics"]
+    )
+    assert artifacts == []
 
 
 def publish_workflow(client, slug: str, payload: dict | None = None):

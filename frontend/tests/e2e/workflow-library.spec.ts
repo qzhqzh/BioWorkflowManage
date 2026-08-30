@@ -312,21 +312,22 @@ test('WDL 映射出的工具草稿可从画布直接进入审查', async ({ page
 
 test('流程列表失败时可以在当前页面重试', async ({ page }) => {
   let shouldFail = true
+  const workflowsRoute = /\/api\/v1\/editor\/workflows(?:\?.*)?$/
   const routeHandler = async (route: import('@playwright/test').Route) => {
-    if (route.request().method() !== 'GET' || !route.request().url().endsWith('/api/v1/editor/workflows')) {
+    if (route.request().method() !== 'GET' || new URL(route.request().url()).pathname !== '/api/v1/editor/workflows') {
       return route.continue()
     }
     if (!shouldFail) return route.continue()
     await route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: { message: 'unavailable' } }) })
   }
-  await page.route('**/api/v1/editor/workflows', routeHandler)
+  await page.route(workflowsRoute, routeHandler)
   await page.goto('/?section=artifacts&workflow=fastp_bwa_demo')
   await expect(page.getByText('流程列表载入失败', { exact: true })).toBeVisible()
 
   shouldFail = false
   await page.getByRole('button', { name: '重新加载', exact: true }).click()
   await expect(page.getByRole('heading', { name: '我的流程' })).toBeVisible()
-  await page.unroute('**/api/v1/editor/workflows', routeHandler)
+  await page.unroute(workflowsRoute, routeHandler)
 })
 
 test('keeps workflow creation and tool versions visible in the current workspace', async ({ page }) => {
@@ -1340,7 +1341,7 @@ test('shows all mocked compile artifacts without writing compilation history', a
   })
 
   const workflowLibraryRefresh = page.waitForResponse(response =>
-    response.url().endsWith('/api/v1/editor/workflows')
+    new URL(response.url()).pathname === '/api/v1/editor/workflows'
     && response.request().method() === 'GET',
   )
   await page.getByRole('button', { name: '发布流程版本' }).click()

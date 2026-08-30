@@ -71,10 +71,25 @@ def _plain(value: Any) -> Any:
 
 def integration_exception_handler(exc, context):
     request = context.get("request")
-    if request is None or not request.path.startswith("/api/v1/integration/"):
+    if request is None:
         return exception_handler(exc, context)
 
     response = exception_handler(exc, context)
+    if request.path == "/api/v1/auth/login":
+        if response is None or response.status_code != status.HTTP_429_TOO_MANY_REQUESTS:
+            return response
+        value = request_id(request)
+        response.data = {
+            "error": {
+                "code": "AUTH_RATE_LIMITED",
+                "message": "登录尝试过于频繁，请稍后重试。",
+                "request_id": value,
+            }
+        }
+        return with_request_id(response, value)
+    if not request.path.startswith("/api/v1/integration/"):
+        return response
+
     if response is None:
         logger.exception(
             "Unhandled Integration API exception",

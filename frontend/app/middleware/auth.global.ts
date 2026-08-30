@@ -20,6 +20,7 @@ export default defineNuxtRouteMiddleware(async (to) => {
     return
   }
   if (!auth.user.value) return navigateTo('/login', { external: nuxtApp.isHydrating })
+  if (to.path === '/no-access') return
   const section = routeSection(to.path, to.query.section)
   if (!auth.user.value.allowed_sections.includes(section)) {
     return navigateTo(defaultRouteForUser(auth.user.value), { external: nuxtApp.isHydrating })

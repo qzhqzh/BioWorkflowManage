@@ -12,7 +12,14 @@ from workflows.models import (
     AnalysisResourceCatalog,
     AnalysisResourceCatalogRevision,
 )
-from workflows.resource_catalog import catalog_digest, entry_requirements
+from workflows.resource_catalog import (
+    catalog_digest,
+    entry_requirements,
+    validate_catalog,
+)
+
+
+pytestmark = pytest.mark.usefixtures("auth_disabled")
 
 
 @pytest.fixture
@@ -253,6 +260,77 @@ def test_resource_checks_sha256_and_bed_basename(settings, tmp_path):
 
     reasons = {item["reason"] for item in requirements if not item["present"]}
     assert reasons == {"checksum_mismatch", "constraint_mismatch"}
+
+
+def test_full_verification_returns_observed_directory_identity(settings, tmp_path):
+    databases = tmp_path / "databases"
+    bundle = databases / "hg19" / "bundle"
+    bundle.mkdir(parents=True)
+    (bundle / "reference.fa").write_text(">chr1\nACGT\n", encoding="utf-8")
+    settings.ANALYSIS_DATABASE_ROOT = databases
+    entry = {
+        "required": [
+            {
+                "path": "hg19/bundle",
+                "label": "Reference bundle",
+                "kind": "directory",
+            }
+        ]
+    }
+
+    requirement = entry_requirements(entry, verify_checksums=True)[0]
+
+    assert requirement["present"] is True
+    assert requirement["observed_identity_digest"].startswith("sha256:")
+
+
+def test_missing_legacy_directory_is_not_reported_ready(settings, tmp_path):
+    settings.ANALYSIS_DATABASE_ROOT = tmp_path / "databases"
+    requirement = entry_requirements(
+        {
+            "required": [
+                {
+                    "path": "missing",
+                    "label": "Missing directory",
+                    "kind": "directory",
+                    "sha256": "a" * 64,
+                }
+            ]
+        }
+    )[0]
+
+    assert requirement["present"] is False
+    assert requirement["reason"] == "missing"
+    assert requirement["warning"] == "legacy_directory_sha256_ignored"
+
+
+def test_catalog_preserves_legacy_directory_sha_and_explicit_identity_digest():
+    document = {
+        "schema_version": 1,
+        "references": [
+            {
+                "id": "hg19",
+                "name": "hg19",
+                "required": [
+                    {
+                        "path": "hg19/bundle",
+                        "kind": "directory",
+                        "sha256": "a" * 64,
+                        "identity_digest": "b" * 64,
+                    }
+                ],
+            }
+        ],
+        "panels": [],
+    }
+
+    normalized = validate_catalog(document)
+
+    assert normalized["references"][0]["required"][0]["sha256"] == "a" * 64
+    assert (
+        normalized["references"][0]["required"][0]["identity_digest"]
+        == "b" * 64
+    )
 
 
 @pytest.mark.django_db

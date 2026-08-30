@@ -11,9 +11,12 @@ from django.urls import resolve
 from rest_framework.test import APIClient
 
 from workflows import api_overrides, views, wdl_assets
-from workflows.models import ToolDocument, ToolVersion
+from workflows.models import ToolDocument, ToolVersion, WorkflowDocument, WorkflowVersion
 from workflows.request_ids import request_id
 import workflows.urls as workflow_urls
+
+
+pytestmark = pytest.mark.usefixtures("auth_disabled")
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -48,6 +51,113 @@ def test_health_endpoint_echoes_valid_request_id():
 
     assert response.status_code == 200
     assert response["X-Request-ID"] == value
+
+
+def test_ready_endpoint_returns_503_when_database_is_unavailable(monkeypatch):
+    monkeypatch.setattr(views, "_database_status", lambda: "unavailable")
+
+    response = APIClient().get("/api/v1/ready")
+
+    assert response.status_code == 503
+    assert response.json()["dependencies"]["database"] == "unavailable"
+
+
+def test_health_endpoint_does_not_probe_database(monkeypatch):
+    def unexpected_database_probe():
+        raise AssertionError("liveness must not access the database")
+
+    monkeypatch.setattr(views, "_database_status", unexpected_database_probe)
+
+    response = APIClient().get("/api/v1/health")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ok"
+    assert response.json()["dependencies"]["database"] == "not_checked"
+
+
+@pytest.mark.django_db
+def test_workflow_listing_is_bounded_and_uses_annotated_latest_version():
+    for slug in ("zeta", "alpha", "beta"):
+        WorkflowDocument.objects.create(
+            slug=slug,
+            name=slug.title(),
+            kind=(
+                WorkflowDocument.Kind.SUBWORKFLOW
+                if slug == "alpha"
+                else WorkflowDocument.Kind.WORKFLOW
+            ),
+        )
+    alpha = WorkflowDocument.objects.get(slug="alpha")
+    WorkflowVersion.objects.create(
+        workflow=alpha,
+        version=1,
+        name="Alpha 1",
+        semantic_digest="sha256:alpha-1",
+        workflow_graph={},
+        kind=WorkflowDocument.Kind.SUBWORKFLOW,
+    )
+    WorkflowDocument.objects.bulk_create(
+        [
+            WorkflowDocument(slug=f"zz-{index:03d}", name=f"Workflow {index}")
+            for index in range(98)
+        ]
+    )
+    WorkflowVersion.objects.create(
+        workflow=alpha,
+        version=3,
+        name="Alpha 3",
+        semantic_digest="sha256:alpha-3",
+        workflow_graph={},
+        kind=WorkflowDocument.Kind.SUBWORKFLOW,
+    )
+
+    with CaptureQueriesContext(connection) as captured:
+        response = APIClient().get(
+            "/api/v1/editor/workflows?page=1&page_size=2"
+        )
+
+    assert response.status_code == 200
+    assert len(captured) <= 4
+    assert [item["slug"] for item in response.json()["results"]] == [
+        "alpha",
+        "beta",
+    ]
+    assert response.json()["results"][0]["latest_version"] == 3
+    assert response.json()["results"][0]["latest_version_snapshot"]["version"] == 3
+    assert response.json()["total"] == 101
+    assert response.json()["has_next"] is True
+
+    next_page = APIClient().get(
+        "/api/v1/editor/workflows?page=2&page_size=2"
+    )
+    assert [item["slug"] for item in next_page.json()["results"]] == [
+        "zeta",
+        "zz-000",
+    ]
+    assert next_page.json()["has_previous"] is True
+
+    default_page = APIClient().get("/api/v1/editor/workflows")
+    assert [item["slug"] for item in default_page.json()["results"][:3]] == [
+        "alpha",
+        "beta",
+        "zeta",
+    ]
+    assert len(default_page.json()["results"]) == 50
+    assert default_page.json()["page_size"] == 50
+    assert default_page.json()["has_next"] is True
+
+    clamped = APIClient().get(
+        "/api/v1/editor/workflows?page=1&page_size=1000"
+    )
+    assert len(clamped.json()["results"]) == 100
+    assert clamped.json()["page_size"] == 100
+    assert clamped.json()["has_next"] is True
+
+    invalid = APIClient().get(
+        "/api/v1/editor/workflows?page=1000001"
+    )
+    assert invalid.status_code == 400
+    assert invalid.json()["error"]["code"] == "WORKFLOW_PAGE_INVALID"
 
 
 def test_default_host_and_cors_configuration_is_restricted():

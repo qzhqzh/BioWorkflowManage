@@ -13,6 +13,9 @@ from workflows.models import (
 )
 
 
+pytestmark = pytest.mark.usefixtures("auth_disabled")
+
+
 ROOT = Path(__file__).resolve().parents[2]
 FASTP_FIXTURE = ROOT / "examples" / "phase1-fastp"
 CHAIN_FIXTURE = ROOT / "examples" / "phase1-fastp-bwa"

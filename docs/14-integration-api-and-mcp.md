@@ -85,7 +85,23 @@ Integration API 不直接执行任意历史 WDL 草稿。需要对外投递的�
 ```
 
 `root_alias` 仅支持 `rawdata` 和 `database`。预检会阻止绝对路径、`..`、符号链接逃逸、
-空文件和类型错误，并检查 gzip FASTQ/FASTA 首条记录与 R1/R2 read ID。
+空文件和类型错误，并在有界行长和共享请求时间预算内检查 gzip FASTQ/FASTA 首条记录与
+R1/R2 read ID。普通 File 记录包含 ctime、device、inode 的 `identity_v2`；调用方显式携带
+`sha256` 时，预检会同步读取完整文件，清单标记 `verification=sha256`，并受总时间和单文件
+字节上限约束。Directory 使用 `identity_digest`（`sha256-tree-identity-v1`）；历史
+Directory `sha256` 仅兼容接收并忽略，不会被误当成目录身份摘要。
+
+受管根目录在 backend/worker 中必须只读挂载，并由平台控制写入。File 打开会逐级使用
+`openat` + `O_NOFOLLOW` 校验祖先目录，排队后任一祖先被替换为 symlink 都会失败关闭；只读挂载
+同时收窄“校验完成到 miniwdl 打开文件”之间的外部替换窗口。Directory 身份扫描运行在独立、
+可终止且每个服务进程单并发的子进程中；HTTP 预检使用 `ANALYSIS_RESOURCE_MANIFEST_TIMEOUT_SECONDS`，worker
+复核使用 `ANALYSIS_WORKER_RESOURCE_MANIFEST_TIMEOUT_SECONDS`。
+
+### 3.2 运行列表摘要
+
+`GET /api/v1/integration/analysis-runs` 最多返回 200 条，响应带 `view=summary`。列表项中的
+`outputs=[]`，错误只保留稳定 code/category/retryable，task timing 不展开；读取完整输出、错误详情
+和 task timing 必须调用 `GET /api/v1/integration/analysis-runs/{run_id}` 或输出清单接口。
 
 ### 3.1 预检
 
@@ -240,7 +256,8 @@ GET /api/v1/integration/analysis-runs/{run_id}/outputs/download?key=...
 ```
 
 文件清单包含 `key`、`semantic_type`、`kind`、`size`、`sha256`、`content_type` 和受保护
-下载地址。下载前会再次验证文件身份与 SHA-256。miniwdl 成功但缺少必需输出时：
+下载地址。worker 在完成时计算 SHA-256，写入内容地址快照，并固化源/快照文件身份。下载前做 O(1)
+身份校验后流式读取快照，不在 HTTP 请求中重新哈希大文件。miniwdl 成功但缺少必需输出时：
 
 ```text
 execution_status = succeeded
@@ -249,6 +266,12 @@ error.code = REQUIRED_OUTPUT_MISSING
 ```
 
 OKB 后续业务入库失败不得反向改写 BioWorkflowManage 的执行状态。
+v2 输出清单按单项放行：若某个值、目录或文件无法固化，运行保持
+`execution_status=succeeded`、`output_status=incomplete`，该项返回 `kind=unverifiable` 且下载返回
+409 `ANALYSIS_OUTPUT_INCOMPLETE`；同一清单内其他完整 File 仍带下载地址并可正常下载。
+对非 File 项调用下载端点返回 404。
+升级前的历史清单只有 `schema_version=1`、没有 `integrity_version=2` 时不提供下载地址；下载
+请求稳定返回 409 `ANALYSIS_OUTPUT_UNVERIFIED`，完成发布手册中的受控回填后才恢复下载。
 
 ## 6. AI Agent MCP
 
@@ -312,9 +335,16 @@ backend entrypoint 会自动执行 migration。验证：
 
 ```bash
 docker compose exec backend python backend/manage.py showmigrations workflows
-curl -fsS http://127.0.0.1:8082/api/v1/health
+curl -fsS http://127.0.0.1:8082/api/v1/ready
 curl -fsS http://127.0.0.1:8082/api/v1/integration/openapi >/dev/null
 ```
 
-Integration API 不增加新的环境变量；沿用现有
-`ANALYSIS_RAWDATA_*`、`ANALYSIS_DATABASE_*`、`ANALYSIS_RUN_*` 和 Worker 配置。
+资源快照的请求时间、目录条目数/深度、受管输入项数、文本行长、gzip header 和显式文件
+SHA-256 字节上限由
+`ANALYSIS_RESOURCE_MANIFEST_*`、`ANALYSIS_MANAGED_*` 和 `ANALYSIS_INPUT_TEXT_LINE_MAX_CHARS` 配置。具体默认值见
+`.env.example`。worker 会在执行前重新验证同一证据；缺少 ctime/目录摘要的旧在途任务以
+`ANALYSIS_RESOURCE_MANIFEST_OUTDATED` 失败关闭，必须重新投递。显式 File SHA 在 worker 侧沿用
+同一字节上限并响应 lease 取消。目录还受独立深度上限约束。这些限时为 cooperative：可防止
+持续遍历，但无法中断单次卡住的 NAS syscall。当前数据库目录没有后台预计算索引，提供
+`identity_digest` 也仍会在请求中扫描核对；高延迟存储必须在部署层设置 NAS 超时并隔离/监控
+异常挂载，后台索引属于后续演进项。

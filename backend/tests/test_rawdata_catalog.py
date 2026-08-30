@@ -19,7 +19,7 @@ from workflows.rawdata_index import (
 )
 
 
-pytestmark = pytest.mark.django_db
+pytestmark = [pytest.mark.django_db, pytest.mark.usefixtures("auth_disabled")]
 
 
 def _write(path: Path, content: bytes = b"reads\n") -> None:

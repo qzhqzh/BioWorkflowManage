@@ -15,6 +15,22 @@ interface WorkflowEntry {
   is_mine?: boolean
 }
 
+interface WorkflowListPage {
+  results: WorkflowEntry[]
+  page?: number
+  page_size?: number
+  total?: number
+  has_next?: boolean
+  summary?: {
+    my_total: number
+    my_subworkflows: number
+    my_published_subworkflows: number
+    my_draft_subworkflows: number
+    my_workflows: number
+    my_draft_workflows: number
+  }
+}
+
 interface ToolEntry {
   tool_id: string
   name?: string | null
@@ -35,12 +51,8 @@ const catalog = ref<AnalysisCatalog>()
 const loadState = ref<'loading' | 'ready' | 'error'>('loading')
 const resourceState = ref<'loading' | 'ready' | 'error'>('loading')
 const loadFailures = ref(0)
+const workflowSummary = ref<NonNullable<WorkflowListPage['summary']>>()
 
-const myWorkflows = computed(() => workflows.value.filter(item => item.is_mine))
-const mySubworkflows = computed(() => myWorkflows.value.filter(item => item.kind === 'subworkflow'))
-const draftSubworkflows = computed(() => mySubworkflows.value.filter(item => !item.latest_version))
-const publishedSubworkflows = computed(() => mySubworkflows.value.filter(item => item.latest_version))
-const draftWorkflows = computed(() => myWorkflows.value.filter(item => item.kind === 'workflow' && !item.latest_version))
 const publishedTools = computed(() => tools.value.filter(item => item.latest_version))
 const myPackages = computed(() => packages.value.filter(item => item.is_mine && item.lifecycle === 'active'))
 const activeRuns = computed(() => runs.value.filter(item => ['queued', 'preparing', 'running', 'cancel_requested'].includes(item.status)))
@@ -48,9 +60,7 @@ const failedRuns = computed(() => runs.value.filter(item => item.status === 'fai
 const readyRunWorkflows = computed(() => catalog.value?.workflows.filter(item => item.ready) ?? [])
 const blockedRunWorkflows = computed(() => catalog.value?.workflows.filter(item => !item.ready) ?? [])
 const readyReferences = computed(() => catalog.value?.database.references.filter(item => item.ready) ?? [])
-const recentWorkflows = computed(() => myWorkflows.value
-  .toSorted((left, right) => Date.parse(right.updated_at) - Date.parse(left.updated_at))
-  .slice(0, 5))
+const recentWorkflows = computed(() => workflows.value.slice(0, 5))
 const recentRuns = computed(() => runs.value.slice(0, 4))
 const latestCanvas = computed(() => recentWorkflows.value[0])
 
@@ -77,18 +87,28 @@ function runStatusLabel(status: AnalysisRun['status']) {
   }[status]
 }
 
+async function loadRecentWorkflows() {
+  const response = await $api<WorkflowListPage>('/api/v1/editor/workflows', {
+    query: { page: 1, page_size: 5, owner: 'mine', ordering: 'updated' },
+  })
+  return response
+}
+
 async function loadOverview() {
   loadState.value = 'loading'
   resourceState.value = 'loading'
   const results = await Promise.allSettled([
-    $api<{ results: WorkflowEntry[] }>('/api/v1/editor/workflows'),
+    loadRecentWorkflows(),
     $api<{ results: ToolEntry[] }>('/api/v1/tools'),
     $api<{ results: WdlToolPackage[] }>('/api/v1/wdl-packages', { query: { lifecycle: 'active' } }),
     $api<{ results: WdlAsset[] }>('/api/v1/wdl-assets'),
     $api<{ results: AnalysisRun[] }>('/api/v1/analysis-runs'),
   ])
 
-  if (results[0].status === 'fulfilled') workflows.value = results[0].value.results
+  if (results[0].status === 'fulfilled') {
+    workflows.value = results[0].value.results
+    workflowSummary.value = results[0].value.summary
+  }
   if (results[1].status === 'fulfilled') tools.value = results[1].value.results
   if (results[2].status === 'fulfilled') packages.value = results[2].value.results
   if (results[3].status === 'fulfilled') wdlAssets.value = results[3].value.results
@@ -195,7 +215,7 @@ onMounted(() => {
               <span class="overview-lifecycle__index">1</span>
               <div>
                 <strong>子流程</strong>
-                <p>{{ mySubworkflows.length }} 个属于你 · {{ publishedSubworkflows.length }} 个已发布 · {{ draftSubworkflows.length }} 个待完善</p>
+                <p>{{ workflowSummary?.my_subworkflows ?? 0 }} 个属于你 · {{ workflowSummary?.my_published_subworkflows ?? 0 }} 个已发布 · {{ workflowSummary?.my_draft_subworkflows ?? 0 }} 个待完善</p>
               </div>
               <div class="overview-lifecycle__actions">
                 <NuxtLink class="text-button text-button--link" to="/?section=artifacts&owner=mine&kind=subworkflow">管理</NuxtLink>
@@ -220,7 +240,7 @@ onMounted(() => {
               <span class="overview-lifecycle__index">3</span>
               <div>
                 <strong>主流程</strong>
-                <p>{{ myWorkflows.length - mySubworkflows.length }} 个属于你 · {{ draftWorkflows.length }} 个草稿待发布</p>
+                <p>{{ workflowSummary?.my_workflows ?? 0 }} 个属于你 · {{ workflowSummary?.my_draft_workflows ?? 0 }} 个草稿待发布</p>
               </div>
               <div class="overview-lifecycle__actions">
                 <NuxtLink class="text-button text-button--link" to="/?section=artifacts&owner=mine&kind=workflow">流程库</NuxtLink>

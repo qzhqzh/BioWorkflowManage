@@ -3,6 +3,7 @@ from __future__ import annotations
 import mimetypes
 import os
 import re
+import stat as stat_module
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -17,12 +18,22 @@ from rest_framework.response import Response
 from compiler_core import canonical_digest, compile_workflow, validate_tool_spec
 
 from .analysis_runs import (
+    _LegacyOutputLimit,
     _accessible_run_path,
     _flatten_outputs,
     _format_size,
     _run_timing_payload,
 )
 from .models import AnalysisRun, AnalysisRunEvent, ToolVersion
+from .integration_outputs import (
+    ResourceSnapshotBudget,
+    ResourceSnapshotBudgetError,
+    ResourceSnapshotChangedError,
+    open_verified_output,
+    output_manifest_file_item_is_verified,
+    output_manifest_has_integrity_v2,
+    output_value_limit_reason,
+)
 
 
 MANAGED_ROOTS = {
@@ -220,6 +231,7 @@ def _managed_resource(
     kind: str,
     input_name: str,
     manifests: dict[str, list[dict[str, Any]]],
+    snapshot_budget: ResourceSnapshotBudget,
 ) -> str:
     if not isinstance(value, dict):
         raise ToolRunInputError(
@@ -239,6 +251,10 @@ def _managed_resource(
             "TOOL_TEST_INPUT_INVALID",
             f"输入 {input_name} 必须使用受管目录内的相对路径。",
         )
+    try:
+        snapshot_budget.claim_item()
+    except ResourceSnapshotBudgetError as error:
+        raise ToolRunInputError("TOOL_TEST_RESOURCE_LIMIT_EXCEEDED", str(error)) from error
     local_setting, execution_setting = MANAGED_ROOTS[source]
     local_root = Path(getattr(settings, local_setting)).resolve()
     execution_root = Path(getattr(settings, execution_setting)).resolve()
@@ -250,30 +266,83 @@ def _managed_resource(
             "TOOL_TEST_INPUT_INVALID",
             f"输入 {input_name} 越过受管目录。",
         ) from error
-    present = local_path.is_dir() if kind == "directory" else local_path.is_file()
-    if not present:
+    try:
+        stat = os.stat(local_path, follow_symlinks=False)
+    except OSError:
+        stat = None
+    expected_mode = stat_module.S_ISDIR if kind == "directory" else stat_module.S_ISREG
+    if stat is None or not expected_mode(stat.st_mode):
         raise ToolRunInputError(
             "TOOL_TEST_RESOURCE_MISSING",
             f"输入 {input_name} 的资源不存在：{normalized.as_posix()}",
         )
-    stat = local_path.stat()
+    directory_manifest = None
+    if kind == "directory":
+        try:
+            directory_manifest = snapshot_budget.directory_manifest(
+                local_path,
+                containment_root=local_root,
+            )
+        except ResourceSnapshotBudgetError as error:
+            raise ToolRunInputError(
+                "TOOL_TEST_RESOURCE_LIMIT_EXCEEDED",
+                str(error),
+            ) from error
+        except ResourceSnapshotChangedError as error:
+            raise ToolRunInputError(
+                "TOOL_TEST_RESOURCE_CHANGED",
+                str(error),
+            ) from error
+        except (OSError, ValueError) as error:
+            raise ToolRunInputError(
+                "TOOL_TEST_RESOURCE_UNSUPPORTED",
+                f"输入 {input_name} 的目录包含不受支持的节点。",
+            ) from error
+        identity = directory_manifest["identity"]
+    else:
+        try:
+            identity = snapshot_budget.file_identity(
+                local_path,
+                containment_root=local_root,
+            )
+        except (OSError, ValueError) as error:
+            raise ToolRunInputError(
+                "TOOL_TEST_INPUT_INVALID",
+                f"输入 {input_name} 越过受管目录或包含符号链接。",
+            ) from error
     manifest_item: dict[str, Any] = {
         "relative_path": normalized.as_posix(),
         "kind": kind,
         "input": input_name,
-        "verification": "exists" if kind == "directory" else "identity",
+        "verification": (
+            "directory_identity_sha256" if kind == "directory" else "identity_v2"
+        ),
+        "identity": {
+            "mtime_ns": identity["mtime_ns"],
+            "ctime_ns": identity["ctime_ns"],
+            "device": identity["device"],
+            "inode": identity["inode"],
+        },
     }
-    if kind != "directory":
+    if kind == "directory":
         manifest_item.update(
             {
-                "size": stat.st_size,
-                "mtime_ns": stat.st_mtime_ns,
-                "device": stat.st_dev,
-                "inode": stat.st_ino,
+                "digest": directory_manifest["digest"],
+                "entry_count": directory_manifest["entry_count"],
+            }
+        )
+    else:
+        manifest_item.update(
+            {
+                "size": identity["size"],
+                "mtime_ns": identity["mtime_ns"],
+                "ctime_ns": identity["ctime_ns"],
+                "device": identity["device"],
+                "inode": identity["inode"],
             }
         )
     manifests[source].append(manifest_item)
-    return str((execution_root / normalized).resolve())
+    return str(execution_root / normalized)
 
 
 def _validate_constraints(port: dict[str, Any], value: Any) -> None:
@@ -318,16 +387,25 @@ def _coerce_input(
     port: dict[str, Any],
     value: Any,
     manifests: dict[str, list[dict[str, Any]]],
+    snapshot_budget: ResourceSnapshotBudget,
 ) -> Any:
     name = str(port["name"])
     wdl_type = str(port["wdl_type"])
     if wdl_type == "File":
         result = _managed_resource(
-            value, kind="file", input_name=name, manifests=manifests
+            value,
+            kind="file",
+            input_name=name,
+            manifests=manifests,
+            snapshot_budget=snapshot_budget,
         )
     elif wdl_type == "Directory":
         result = _managed_resource(
-            value, kind="directory", input_name=name, manifests=manifests
+            value,
+            kind="directory",
+            input_name=name,
+            manifests=manifests,
+            snapshot_budget=snapshot_budget,
         )
     elif wdl_type == "Pair[File,File]":
         if not isinstance(value, list) or len(value) != 2:
@@ -335,7 +413,13 @@ def _coerce_input(
                 "TOOL_TEST_INPUT_INVALID", f"输入 {name} 需要两个文件。"
             )
         pair = [
-            _managed_resource(item, kind="file", input_name=name, manifests=manifests)
+            _managed_resource(
+                item,
+                kind="file",
+                input_name=name,
+                manifests=manifests,
+                snapshot_budget=snapshot_budget,
+            )
             for item in value
         ]
         result = {"left": pair[0], "right": pair[1]}
@@ -345,7 +429,13 @@ def _coerce_input(
                 "TOOL_TEST_INPUT_INVALID", f"输入 {name} 必须是文件数组。"
             )
         result = [
-            _managed_resource(item, kind="file", input_name=name, manifests=manifests)
+            _managed_resource(
+                item,
+                kind="file",
+                input_name=name,
+                manifests=manifests,
+                snapshot_budget=snapshot_budget,
+            )
             for item in value
         ]
     elif wdl_type == "String":
@@ -412,6 +502,7 @@ def _prepare_inputs(
             f"包含未知输入：{', '.join(unknown)}。",
         )
     manifests: dict[str, list[dict[str, Any]]] = {"rawdata": [], "database": []}
+    snapshot_budget = ResourceSnapshotBudget()
     values: dict[str, Any] = {}
     for name, port in ports.items():
         has_value = name in raw_inputs and raw_inputs[name] is not None
@@ -426,7 +517,10 @@ def _prepare_inputs(
         else:
             continue
         values[f"tool_test.{input_nodes[name]}"] = _coerce_input(
-            port, raw_value, manifests
+            port,
+            raw_value,
+            manifests,
+            snapshot_budget,
         )
     resource_manifests = {
         "input_resource_manifest": (
@@ -440,7 +534,56 @@ def _prepare_inputs(
 
 
 def _tool_output_payload(run: AnalysisRun) -> list[dict[str, Any]]:
-    if not run.outputs or not run.work_directory:
+    output_labels = dict(run.request_payload.get("output_labels") or {})
+    for index, port in enumerate(run.tool_version.tool_spec.get("outputs", []), 1):
+        name = str(port["name"])
+        key = f"tool_test.{_safe_identifier('output_', index, name)}"
+        output_labels.setdefault(key, str(port.get("label") or name))
+
+    manifest = run.output_manifest if isinstance(run.output_manifest, dict) else {}
+    if output_manifest_has_integrity_v2(manifest):
+        payload = []
+        items = manifest.get("items")
+        if not isinstance(items, list):
+            return payload
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("key") or "")
+            kind = str(item.get("kind") or "value")
+            output = {
+                "key": key,
+                "label": str(output_labels.get(key) or item.get("label") or key),
+                "kind": kind,
+            }
+            if kind == "file":
+                output["name"] = str(
+                    item.get("filename") or item.get("name") or key
+                )
+                size = item.get("size")
+                if isinstance(size, int):
+                    output["size"] = size
+                    output["size_label"] = _format_size(size)
+                if output_manifest_file_item_is_verified(item):
+                    output["download_url"] = (
+                        f"/api/v1/tool-test-runs/{run.id}/outputs"
+                        f"?key={quote(key, safe='')}"
+                    )
+            elif kind == "value":
+                reason = output_value_limit_reason(item.get("value"))
+                if reason is None:
+                    output["value"] = item.get("value")
+                else:
+                    output["kind"] = "unverifiable"
+                    output["reason"] = reason
+            elif "entry_count" in item:
+                output["entry_count"] = item["entry_count"]
+            if item.get("reason"):
+                output["reason"] = str(item["reason"])
+            payload.append(output)
+        return payload
+
+    if not run.work_directory or not run.outputs:
         return []
     try:
         root = _accessible_run_path(Path(run.work_directory))
@@ -448,13 +591,18 @@ def _tool_output_payload(run: AnalysisRun) -> list[dict[str, Any]]:
         return []
     outputs = run.outputs.get("outputs", run.outputs)
     payload = []
-    output_labels = dict(run.request_payload.get("output_labels") or {})
-    for index, port in enumerate(run.tool_version.tool_spec.get("outputs", []), 1):
-        name = str(port["name"])
-        key = f"tool_test.{_safe_identifier('output_', index, name)}"
-        output_labels.setdefault(key, str(port.get("label") or name))
     for key, value in _flatten_outputs(outputs):
         label = str(output_labels.get(key) or key)
+        if isinstance(value, _LegacyOutputLimit):
+            payload.append(
+                {
+                    "key": key,
+                    "label": label,
+                    "kind": "unverifiable",
+                    "reason": value.reason,
+                }
+            )
+            continue
         if isinstance(value, str):
             try:
                 resolved = _accessible_run_path(Path(value))
@@ -470,10 +618,6 @@ def _tool_output_payload(run: AnalysisRun) -> list[dict[str, Any]]:
                         "name": resolved.name,
                         "size": resolved.stat().st_size,
                         "size_label": _format_size(resolved.stat().st_size),
-                        "download_url": (
-                            f"/api/v1/tool-test-runs/{run.id}/outputs"
-                            f"?key={quote(key, safe='')}"
-                        ),
                     }
                 )
                 continue
@@ -481,7 +625,15 @@ def _tool_output_payload(run: AnalysisRun) -> list[dict[str, Any]]:
     return payload
 
 
-def tool_run_payload(run: AnalysisRun, *, include_events: bool = False) -> dict[str, Any]:
+def tool_run_payload(
+    run: AnalysisRun,
+    *,
+    include_events: bool = False,
+    include_outputs: bool = True,
+    include_task_timing: bool = True,
+    include_request: bool = True,
+    include_error_details: bool = True,
+) -> dict[str, Any]:
     payload = {
         "id": str(run.id),
         "tool": {
@@ -493,12 +645,20 @@ def tool_run_payload(run: AnalysisRun, *, include_events: bool = False) -> dict[
         "label": run.sample_name,
         "actor": run.actor,
         "status": run.status,
+        "output_status": run.output_status,
         "progress": run.progress,
         "current_step": run.current_step,
-        "request": run.request_payload,
-        "error": run.error,
-        "outputs": _tool_output_payload(run),
-        "timing": _run_timing_payload(run),
+        "request": run.request_payload if include_request else {},
+        "error": run.error if include_error_details else "",
+        "error_code": run.error_code,
+        "error_category": run.error_category,
+        "error_retryable": run.error_retryable,
+        "error_details": run.error_details if include_error_details else {},
+        "outputs": _tool_output_payload(run) if include_outputs else [],
+        "timing": _run_timing_payload(
+            run,
+            include_task_timing=include_task_timing,
+        ),
         "created_at": run.created_at,
         "started_at": run.started_at,
         "finished_at": run.finished_at,
@@ -560,7 +720,17 @@ def tool_test_resources(request):
 @api_view(["GET", "POST"])
 def tool_test_runs(request):
     if request.method == "GET":
-        queryset = _visible_tool_runs(request)
+        queryset = _visible_tool_runs(request).defer(
+            "outputs",
+            "output_manifest",
+            "request_payload",
+            "input_values",
+            "source_bundle",
+            "error",
+            "error_details",
+            "work_directory",
+            "tool_version__tool_spec",
+        )
         tool_id = str(request.query_params.get("tool_id") or "").strip()
         version = str(request.query_params.get("version") or "").strip()
         if tool_id:
@@ -568,7 +738,19 @@ def tool_test_runs(request):
         if version:
             queryset = queryset.filter(tool_version__version=version)
         return Response(
-            {"results": [tool_run_payload(run) for run in queryset[:50]]}
+            {
+                "view": "summary",
+                "results": [
+                    tool_run_payload(
+                        run,
+                        include_outputs=False,
+                        include_task_timing=False,
+                        include_request=False,
+                        include_error_details=False,
+                    )
+                    for run in queryset[:50]
+                ]
+            }
         )
 
     tool_id = str(request.data.get("tool_id") or "").strip()
@@ -628,35 +810,95 @@ def tool_test_run_detail(request, run_id):
 def tool_test_run_output(request, run_id):
     run = get_object_or_404(_visible_tool_runs(request), pk=run_id)
     key = str(request.query_params.get("key") or "")
-    output = next(
-        (
-            item
-            for item in _tool_output_payload(run)
-            if item.get("kind") == "file" and item.get("key") == key
-        ),
-        None,
+    manifest = run.output_manifest if isinstance(run.output_manifest, dict) else {}
+    if output_manifest_has_integrity_v2(manifest):
+        items = manifest.get("items")
+        if not isinstance(items, list):
+            return _error(
+                ToolRunInputError(
+                    "ANALYSIS_OUTPUT_UNVERIFIED",
+                    "输出完整性清单无效，无法安全下载。",
+                ),
+                status.HTTP_409_CONFLICT,
+            )
+        item = next(
+            (
+                value
+                for value in items
+                if isinstance(value, dict) and value.get("key") == key
+            ),
+            None,
+        )
+        if item is None:
+            return _error(
+                ToolRunInputError("TOOL_TEST_OUTPUT_NOT_FOUND", "输出文件不存在。"),
+                status.HTTP_404_NOT_FOUND,
+            )
+        if item.get("kind") == "unverifiable":
+            return _error(
+                ToolRunInputError(
+                    "ANALYSIS_OUTPUT_INCOMPLETE",
+                    "输出项未完成或完整性清单无效，无法安全下载。",
+                ),
+                status.HTTP_409_CONFLICT,
+            )
+        if item.get("kind") != "file":
+            return _error(
+                ToolRunInputError("TOOL_TEST_OUTPUT_NOT_FOUND", "输出文件不存在。"),
+                status.HTTP_404_NOT_FOUND,
+            )
+        if not output_manifest_file_item_is_verified(item):
+            return _error(
+                ToolRunInputError(
+                    "ANALYSIS_OUTPUT_UNVERIFIED",
+                    "输出项完整性清单无效，无法安全下载。",
+                ),
+                status.HTTP_409_CONFLICT,
+            )
+        try:
+            path, handle = open_verified_output(
+                item,
+                run_root=run.work_directory,
+            )
+        except (KeyError, OSError, TypeError, ValueError):
+            return _error(
+                ToolRunInputError(
+                    "ANALYSIS_OUTPUT_CHANGED",
+                    "输出文件与成功时的不可变清单不一致。",
+                ),
+                status.HTTP_409_CONFLICT,
+            )
+    else:
+        legacy_output = next(
+            (
+                value
+                for value in _tool_output_payload(run)
+                if value.get("kind") == "file" and value.get("key") == key
+            ),
+            None,
+        )
+        if legacy_output is None:
+            return _error(
+                ToolRunInputError("TOOL_TEST_OUTPUT_NOT_FOUND", "输出文件不存在。"),
+                status.HTTP_404_NOT_FOUND,
+            )
+        return _error(
+            ToolRunInputError(
+                "ANALYSIS_OUTPUT_UNVERIFIED",
+                "历史输出缺少完整性清单，无法安全下载。",
+            ),
+            status.HTTP_409_CONFLICT,
+        )
+    content_type = str(
+        item.get("content_type")
+        or mimetypes.guess_type(str(item.get("filename") or path.name))[0]
+        or "application/octet-stream"
     )
-    if output is None:
-        return _error(
-            ToolRunInputError("TOOL_TEST_OUTPUT_NOT_FOUND", "输出文件不存在。"),
-            status.HTTP_404_NOT_FOUND,
-        )
-    values = dict(_flatten_outputs(run.outputs.get("outputs", run.outputs)))
-    try:
-        root = _accessible_run_path(Path(run.work_directory))
-        path = _accessible_run_path(Path(values[key]))
-        path.relative_to(root)
-        if not path.is_file():
-            raise ValueError
-    except (OSError, TypeError, ValueError):
-        return _error(
-            ToolRunInputError("TOOL_TEST_OUTPUT_NOT_FOUND", "输出文件不存在。"),
-            status.HTTP_404_NOT_FOUND,
-        )
-    content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    return FileResponse(
-        path.open("rb"),
+    response = FileResponse(
+        handle,
         as_attachment=True,
-        filename=path.name,
+        filename=str(item.get("filename") or path.name),
         content_type=content_type,
     )
+    response["ETag"] = f'"{str(item["sha256"]).removeprefix("sha256:")}"'
+    return response

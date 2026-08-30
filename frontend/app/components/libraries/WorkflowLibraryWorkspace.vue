@@ -91,6 +91,9 @@ const props = defineProps<{
   workflowDocuments: WorkflowLibraryEntry[]
   libraryState: 'loading' | 'ready' | 'error'
   libraryError: string
+  libraryTotal: number
+  libraryHasNext: boolean
+  libraryLoadingMore: boolean
   isWorkflowSwitching: boolean
   switchingWorkflowSlug: string
   saveState: 'loading' | 'saved' | 'saving' | 'error'
@@ -194,6 +197,25 @@ const hasWorkflowFilters = computed(() =>
   || workflowKindFilter.value !== 'all'
   || workflowStatusFilter.value !== 'all',
 )
+
+let workflowFilterTimer: ReturnType<typeof setTimeout> | undefined
+watch(
+  [workflowQuery, workflowOwnerFilter, workflowKindFilter, workflowStatusFilter],
+  () => {
+    if (workflowFilterTimer) clearTimeout(workflowFilterTimer)
+    workflowFilterTimer = setTimeout(() => {
+      emit('filtersChange', {
+        q: workflowQuery.value.trim(),
+        owner: workflowOwnerFilter.value,
+        kind: workflowKindFilter.value,
+        status: workflowStatusFilter.value,
+      })
+    }, 200)
+  },
+)
+onBeforeUnmount(() => {
+  if (workflowFilterTimer) clearTimeout(workflowFilterTimer)
+})
 
 function resetWorkflowFilters() {
   workflowQuery.value = ''
@@ -345,6 +367,13 @@ const emit = defineEmits<{
   }]
   createRequestHandled: []
   retryLibrary: []
+  loadMore: []
+  filtersChange: [filters: {
+    q: string
+    owner: 'all' | 'mine' | 'shared'
+    kind: 'all' | 'workflow' | 'subworkflow'
+    status: 'all' | 'draft' | 'published'
+  }]
 }>()
 
 function beginDerivedWdlEdit() {
@@ -518,7 +547,7 @@ watch(() => [props.workflowSlug, props.selectedWdlVersion], () => {
           </label>
         </div>
         <div class="workflow-index-controls__summary">
-          <span>{{ filteredWorkflowDocuments.length }} / {{ workflowDocuments.length }}</span>
+          <span>{{ filteredWorkflowDocuments.length }} / 已加载 {{ workflowDocuments.length }} / 共 {{ libraryTotal }}</span>
           <button v-if="hasWorkflowFilters" type="button" class="text-button" @click="resetWorkflowFilters">清除筛选</button>
         </div>
       </section>
@@ -578,6 +607,13 @@ watch(() => [props.workflowSlug, props.selectedWdlVersion], () => {
             <button type="button" class="button button--ghost" @click="beginCreate('subworkflow')">新建子流程</button>
           </template>
         </div>
+        <button
+          v-if="libraryHasNext"
+          type="button"
+          class="text-button"
+          :disabled="libraryLoadingMore"
+          @click="emit('loadMore')"
+        >{{ libraryLoadingMore ? '正在加载…' : '加载更多流程' }}</button>
         </template>
       </div>
 

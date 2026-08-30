@@ -12,6 +12,9 @@ from workflows.models import ToolDocument, WDLToolPackage, WDLToolPackageAuditEv
 from workflows.wdl_packages import analyze_wdl_library
 
 
+pytestmark = pytest.mark.usefixtures("auth_disabled")
+
+
 QC_WDL = """version 1.0
 
 task QC {

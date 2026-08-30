@@ -9,16 +9,21 @@ interface ToolTestRun {
   label: string
   actor: string
   status: 'queued' | 'preparing' | 'running' | 'cancel_requested' | 'succeeded' | 'failed' | 'canceled'
+  output_status: 'pending' | 'complete' | 'incomplete' | 'unavailable'
   progress: number
   current_step: string
   error?: string
+  error_code: string
+  error_details: Record<string, unknown>
   outputs: Array<{
     key: string
     label?: string
-    kind: 'file' | 'value'
+    kind: 'file' | 'value' | 'directory' | 'unverifiable'
     name?: string
     size_label?: string
+    entry_count?: number
     value?: unknown
+    reason?: string
     download_url?: string
   }>
   timing: { total_seconds?: number; execution_seconds?: number }
@@ -65,6 +70,27 @@ const annotationGroups = computed(() => {
   return [...groups.entries()].map(([name, options]) => ({ name, options }))
 })
 const isRunning = computed(() => activeRun.value && ['queued', 'preparing', 'running', 'cancel_requested'].includes(activeRun.value.status))
+const outputErrorSummary = computed(() => {
+  const details = activeRun.value?.error_details
+  if (!details) return ''
+  const describe = (value: unknown) => {
+    if (typeof value === 'string') return value
+    if (value && typeof value === 'object') {
+      const item = value as Record<string, unknown>
+      const key = String(item.key ?? item.name ?? '<unknown>')
+      return item.reason ? `${key} (${String(item.reason)})` : key
+    }
+    return String(value)
+  }
+  const lines: string[] = []
+  if (Array.isArray(details.missing) && details.missing.length) {
+    lines.push(`缺失：${details.missing.map(describe).join('、')}`)
+  }
+  if (Array.isArray(details.unverifiable) && details.unverifiable.length) {
+    lines.push(`无法验证：${details.unverifiable.map(describe).join('、')}`)
+  }
+  return lines.join('；')
+})
 
 function newResource(kind: string): ManagedResource {
   return { source: kind === 'Directory' ? 'database' : 'rawdata', path: '' }
@@ -155,7 +181,8 @@ function apiError(error: any) {
   return error?.data?.error?.message ?? error?.response?._data?.error?.message ?? '工具测试提交失败。'
 }
 
-function statusLabel(status: ToolTestRun['status']) {
+function statusLabel(run: ToolTestRun) {
+  if (run.status === 'succeeded' && run.output_status === 'incomplete') return '输出不完整'
   return {
     queued: '排队中',
     preparing: '准备中',
@@ -164,7 +191,13 @@ function statusLabel(status: ToolTestRun['status']) {
     succeeded: '已通过',
     failed: '失败',
     canceled: '已取消',
-  }[status]
+  }[run.status]
+}
+
+function statusClass(run: ToolTestRun) {
+  return run.status === 'succeeded' && run.output_status === 'incomplete'
+    ? 'incomplete'
+    : run.status
 }
 
 function formatDuration(value?: number) {
@@ -228,7 +261,7 @@ async function submitRun() {
 function openRun(run: ToolTestRun) {
   activeRun.value = run
   if (pollTimer) clearTimeout(pollTimer)
-  if (['queued', 'preparing', 'running', 'cancel_requested'].includes(run.status)) void refreshRun(run.id)
+  void refreshRun(run.id)
 }
 
 watch(() => [props.toolId, props.version], async () => {
@@ -361,7 +394,7 @@ onBeforeUnmount(() => {
             <strong>{{ activeRun.label }}</strong>
             <span>{{ activeRun.current_step }}</span>
           </div>
-          <span class="tool-run-status" :class="`is-${activeRun.status}`">{{ statusLabel(activeRun.status) }}</span>
+          <span class="tool-run-status" :class="`is-${statusClass(activeRun)}`">{{ statusLabel(activeRun) }}</span>
         </header>
         <div v-if="['queued', 'preparing', 'running', 'cancel_requested'].includes(activeRun.status)" class="tool-run-progress" role="progressbar" :aria-valuenow="activeRun.progress" aria-valuemin="0" aria-valuemax="100">
           <span :style="{ width: `${activeRun.progress}%` }" />
@@ -371,14 +404,18 @@ onBeforeUnmount(() => {
           <div><dt>总耗时</dt><dd>{{ formatDuration(activeRun.timing.total_seconds) }}</dd></div>
           <div><dt>执行耗时</dt><dd>{{ formatDuration(activeRun.timing.execution_seconds) }}</dd></div>
         </dl>
-        <p v-if="activeRun.error" class="tool-test-error">{{ activeRun.error }}</p>
+        <p v-if="activeRun.error" class="tool-test-error">
+          <strong v-if="activeRun.status === 'succeeded' && activeRun.output_status === 'incomplete'">执行完成，但输出不完整：</strong>{{ activeRun.error }}<template v-if="outputErrorSummary"> {{ outputErrorSummary }}</template>
+        </p>
         <section v-if="activeRun.outputs.length" class="tool-test-outputs">
           <strong>输出</strong>
           <ul>
             <li v-for="output in activeRun.outputs" :key="output.key">
               <span><strong>{{ output.label || output.key }}</strong><code v-if="output.label && output.label !== output.key">{{ output.key }}</code><small>{{ output.size_label }}</small></span>
               <a v-if="output.download_url" :href="output.download_url">下载 {{ output.name }}</a>
-              <code v-else>{{ output.value }}</code>
+              <code v-else-if="output.kind === 'value'">{{ output.value }}</code>
+              <code v-else-if="output.kind === 'directory'">{{ output.entry_count ?? 0 }} 项</code>
+              <code v-else>{{ output.reason || '该输出无法验证。' }}</code>
             </li>
           </ul>
         </section>
@@ -392,7 +429,7 @@ onBeforeUnmount(() => {
       <div v-if="runs.length" class="tool-test-run-list">
         <button v-for="run in runs" :key="run.id" type="button" :class="{ 'is-active': activeRun?.id === run.id }" @click="openRun(run)">
           <span><strong>{{ run.label }}</strong><small>{{ new Date(run.created_at).toLocaleString('zh-CN') }}</small></span>
-          <span class="tool-run-status" :class="`is-${run.status}`">{{ statusLabel(run.status) }}</span>
+          <span class="tool-run-status" :class="`is-${statusClass(run)}`">{{ statusLabel(run) }}</span>
         </button>
       </div>
       <p v-else class="empty-state">{{ loadingRuns ? '正在读取测试记录…' : '还没有运行记录。' }}</p>

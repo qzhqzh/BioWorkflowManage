@@ -11,6 +11,9 @@ from workflows import wdl_assets
 from workflows.models import WDLAuditEvent, WDLAsset, WDLSourceRevision, WDLTag
 
 
+pytestmark = pytest.mark.usefixtures("auth_disabled")
+
+
 WDL_SOURCE = """version 1.0
 
 task hello {

@@ -18,6 +18,9 @@ from workflows.models import (
 from workflows.wdl_packages import analyze_wdl_library, digest, package_digest
 
 
+pytestmark = pytest.mark.usefixtures("auth_disabled")
+
+
 TASK_WDL = """version 1.0
 
 task Hello {

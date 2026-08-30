@@ -25,9 +25,10 @@ views._request_id = request_id
 views._with_request_id = with_request_id
 wdl_assets._request_id = request_id
 wdl_assets._with_request_id = with_request_id
-# Keep the container liveness probe public while the rest of the API uses the
-# runtime authentication permission.
+# Keep the container liveness/readiness probes public while the rest of the API
+# uses the runtime authentication permission.
 views.health.view_class.permission_classes = [AllowAny]
+views.ready.view_class.permission_classes = [AllowAny]
 
 for analysis_view in (
     rawdata_catalog.rawdata_catalog,
@@ -42,6 +43,7 @@ for analysis_view in (
 
 urlpatterns = [
     path("health", views.health),
+    path("ready", views.ready),
     path("auth/csrf", auth_views.csrf_token),
     path("auth/login", auth_views.login_view),
     path("auth/me", auth_views.me),

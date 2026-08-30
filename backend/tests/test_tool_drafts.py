@@ -8,6 +8,9 @@ from rest_framework.test import APIClient
 from workflows.models import ToolDocument, ToolVersion
 
 
+pytestmark = pytest.mark.usefixtures("auth_disabled")
+
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
