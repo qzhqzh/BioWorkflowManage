@@ -360,7 +360,7 @@ def test_nextflow_config_pins_images_and_run_label(tmp_path):
     content = config.read_text(encoding="utf-8")
     assert PINNED_IMAGE in content
     assert "bioworkflow.analysis_run_id=run-123" in content
-    assert "resume = false" in content
+    assert "resume =" not in content
     assert "withName: 'Fastp'" in content
     assert "includeConfig" not in content
     assert "executor = 'local'" in content

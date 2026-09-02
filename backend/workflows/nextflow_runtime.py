@@ -168,7 +168,6 @@ def _write_nextflow_config(
 ) -> None:
     images = manifest["container_images"]
     lines = [
-        "resume = false",
         "process.executor = 'local'",
         f"process.container = {_groovy_string(str(images['default']))}",
         "process.containerOptions = ''",
