@@ -1,0 +1,12 @@
+services:
+  backend:
+    networks:
+      default: {}
+      bioworkflow-integration:
+        aliases:
+          - bioworkflow-api
+
+networks:
+  bioworkflow-integration:
+    name: ${BIOWORKFLOW_INTEGRATION_NETWORK:-bioworkflow-integration}
+    external: true

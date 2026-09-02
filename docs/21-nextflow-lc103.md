@@ -105,6 +105,50 @@ docker compose config --quiet
 - QC Excel 与变异 TSV 均进入带 sha256 的输出清单；
 - 重跑创建新任务且原任务证据不变。
 
+## OKB 联合部署
+
+同机部署时先创建专用网络，再用 override 只把 Analysis API 接入该网络：
+
+```bash
+docker network create bioworkflow-integration
+docker compose \
+  -f deploy/analysis-node/compose.yml \
+  -f deploy/analysis-node/compose.okb.yml \
+  --profile headless \
+  --profile nextflow-runtime \
+  up -d
+```
+
+OKB 通过 `http://bioworkflow-api:8000` 访问，不需要对客户局域网发布 Analysis API 端口。
+两端的 `ANALYSIS_RAWDATA_HOST_PATH` 与 `DJANGO_DATA_HOST_DIR` 必须指向同一宿主机目录，
+但数据库、运行目录和结果目录保持隔离。
+
+为 OKB 签发最小权限 token 时直接写入新建的 0600 文件，避免 token 出现在终端日志：
+
+```bash
+docker compose \
+  -f deploy/analysis-node/compose.yml \
+  run --rm \
+  -v /srv/okbox/secrets:/token-output \
+  backend \
+  python backend/manage.py manage_service_account \
+  --client-id okb \
+  --name OKB \
+  --scope workflow:read \
+  --scope analysis:submit \
+  --scope analysis:read \
+  --scope analysis:download \
+  --scope analysis:cancel \
+  --issue-token \
+  --expires-days 90 \
+  --token-name okb-primary \
+  --token-output-file /token-output/bioworkflow-api-token.new
+```
+
+宿主机 `/srv/okbox/secrets` 需提前创建为仅部署账号可读写的目录。输出文件已存在时命令拒绝覆盖
+并立即吊销本次新 token。轮换应写新文件、重启 OKB 并验证，
+再通过旧 `TOKEN_PREFIX` 吊销旧 token。
+
 ## 回滚
 
 1. 停用 `lc103-amp` Analysis Product，阻止新投递。

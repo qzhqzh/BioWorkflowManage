@@ -1086,6 +1086,57 @@ def test_service_account_token_rotation_does_not_reactivate_disabled_account():
 
 
 @pytest.mark.django_db
+def test_service_account_can_write_token_to_new_private_file(tmp_path):
+    token_file = tmp_path / "okb-service-token"
+    output = StringIO()
+
+    call_command(
+        "manage_service_account",
+        client_id="okb",
+        name="OKB",
+        scope=[
+            "workflow:read",
+            "analysis:submit",
+            "analysis:read",
+            "analysis:download",
+            "analysis:cancel",
+        ],
+        issue_token=True,
+        token_output_file=str(token_file),
+        actor="pytest",
+        stdout=output,
+    )
+
+    raw_token = token_file.read_text(encoding="utf-8").strip()
+    assert raw_token
+    assert raw_token not in output.getvalue()
+    assert "TOKEN_FILE_WRITTEN=1" in output.getvalue()
+    assert token_file.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.django_db
+def test_service_account_revokes_new_token_when_output_file_exists(tmp_path):
+    token_file = tmp_path / "existing-token"
+    token_file.write_text("keep-existing\n", encoding="utf-8")
+
+    with pytest.raises(CommandError, match="已吊销"):
+        call_command(
+            "manage_service_account",
+            client_id="okb",
+            name="OKB",
+            scope=["workflow:read"],
+            issue_token=True,
+            token_output_file=str(token_file),
+            actor="pytest",
+            stdout=StringIO(),
+        )
+
+    token = ServiceToken.objects.get(service_account__client_id="okb")
+    assert token.revoked_at is not None
+    assert token_file.read_text(encoding="utf-8") == "keep-existing\n"
+
+
+@pytest.mark.django_db
 def test_integration_not_found_and_validation_errors_use_stable_envelope(settings):
     settings.AUTH_REQUIRED = True
     _, _, _, client = _token_client()

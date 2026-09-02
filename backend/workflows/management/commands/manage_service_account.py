@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 from datetime import timedelta
+from pathlib import Path
 
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
@@ -21,6 +23,7 @@ class Command(BaseCommand):
         parser.add_argument("--token-name", default="default")
         parser.add_argument("--expires-days", type=int)
         parser.add_argument("--issue-token", action="store_true")
+        parser.add_argument("--token-output-file")
         parser.add_argument("--revoke-prefix")
         active = parser.add_mutually_exclusive_group()
         active.add_argument("--activate", action="store_true")
@@ -37,6 +40,9 @@ class Command(BaseCommand):
             raise CommandError(str(error)) from error
         if not scopes and not ServiceAccount.objects.filter(client_id=client_id).exists():
             raise CommandError("新建 Service Account 至少需要一个 --scope。")
+        token_output_file = str(options.get("token_output_file") or "").strip()
+        if token_output_file and not options["issue_token"]:
+            raise CommandError("--token-output-file 只能与 --issue-token 一起使用。")
 
         with transaction.atomic():
             account, created = ServiceAccount.objects.select_for_update().get_or_create(
@@ -94,5 +100,36 @@ class Command(BaseCommand):
                 expires_at=expires_at,
             )
             self.stdout.write(f"TOKEN_PREFIX={token.prefix}")
-            self.stdout.write(f"TOKEN={raw_token}")
-            self.stdout.write("Token 只显示本次，请立即保存到安全的密钥管理系统。")
+            if token_output_file:
+                output_path = Path(token_output_file)
+                descriptor: int | None = None
+                output_created = False
+                try:
+                    descriptor = os.open(
+                        output_path,
+                        os.O_WRONLY
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | getattr(os, "O_NOFOLLOW", 0),
+                        0o600,
+                    )
+                    output_created = True
+                    with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                        descriptor = None
+                        output.write(f"{raw_token}\n")
+                        output.flush()
+                        os.fsync(output.fileno())
+                except OSError as error:
+                    if descriptor is not None:
+                        os.close(descriptor)
+                    if output_created:
+                        output_path.unlink(missing_ok=True)
+                    token.revoked_at = timezone.now()
+                    token.save(update_fields=["revoked_at"])
+                    raise CommandError(
+                        "Token 输出文件创建失败；新签发的 Token 已吊销。"
+                    ) from error
+                self.stdout.write("TOKEN_FILE_WRITTEN=1")
+            else:
+                self.stdout.write(f"TOKEN={raw_token}")
+                self.stdout.write("Token 只显示本次，请立即保存到安全的密钥管理系统。")
