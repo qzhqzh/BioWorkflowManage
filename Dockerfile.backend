@@ -7,7 +7,7 @@ ARG GIT_REVISION=unknown
 FROM ${UV_BASE_IMAGE} AS uv
 FROM ${SPROCKET_BASE_IMAGE} AS sprocket
 
-FROM ${PYTHON_BASE_IMAGE}
+FROM ${PYTHON_BASE_IMAGE} AS app
 
 ARG ANALYSIS_NODE_VERSION
 ARG GIT_REVISION
@@ -43,3 +43,22 @@ RUN chmod -R a+rX /app/backend /app/schemas /app/examples /app/docker \
 
 EXPOSE 8000
 ENTRYPOINT ["backend-entrypoint"]
+
+FROM app AS nextflow-worker
+
+ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 \
+    NXF_OFFLINE=true
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl docker-cli openjdk-21-jre-headless \
+    && curl -fsSL \
+        "https://github.com/nextflow-io/nextflow/releases/download/v25.04.8/nextflow-25.04.8-dist" \
+        -o /usr/local/bin/nextflow \
+    && echo "df18b2c5d89b47f471c71379a8f830a79973c1ba6ff56a55289483764d5e02ac  /usr/local/bin/nextflow" | sha256sum -c - \
+    && chmod 0755 /usr/local/bin/nextflow \
+    && docker --version \
+    && java -version \
+    && nextflow -version \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM app AS backend

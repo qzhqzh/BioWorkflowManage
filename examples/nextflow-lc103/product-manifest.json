@@ -1,0 +1,296 @@
+{
+  "schema_version": 1,
+  "workflow": {
+    "slug": "lc103-amp-nextflow",
+    "workflow_id": "lc103_amp",
+    "name": "LC103 AMP",
+    "description": "LC103 paired-end amplicon sequencing analysis executed by Nextflow.",
+    "compiler_profile": "nextflow-import-v1"
+  },
+  "analysis_product": {
+    "code": "lc103-amp",
+    "name": "LC103 AMP",
+    "description": "LC103 扩增子测序质控与变异分析。",
+    "contract_version": "1.0.0"
+  },
+  "source": {
+    "repository": "ssh://git@gitea.kindstarzhenyuan.cn/qilixing/amp_pipeline.git",
+    "revision": "708b7f08677d8254a9923592b6f2a868d669b5af",
+    "entrypoint": "01_amp_pipeline.nf",
+    "call_count": 18,
+    "files": [
+      "01_amp_pipeline.nf",
+      "panels_config/LC103.targets.bed",
+      "src/conf/coverage_cutoff.yaml",
+      "src/conf/variant_filter_parameter.yaml",
+      "src/modules/01_fastp.nf",
+      "src/modules/01_flash.nf",
+      "src/modules/02_bwa_alignment.nf",
+      "src/modules/02_extract_amp_target.nf",
+      "src/modules/02_sort_bam.nf",
+      "src/modules/03_alignmentQC.nf",
+      "src/modules/03_amp_calculate_coverage.nf",
+      "src/modules/03_qc_collection.nf",
+      "src/modules/04_vardict_variant_calling.nf",
+      "src/modules/05_amp_variant_filter.nf",
+      "src/modules/05_vep_anno.nf",
+      "src/modules/06_combine_variants.nf",
+      "src/modules/06_html_results_show.nf",
+      "src/workflows/workflow_amp_variant_calling.nf",
+      "src/workflows/workflow_vep_anno.nf",
+      "bin/amp_combine_all_samples_qc.py",
+      "bin/amp_qc_collection.py",
+      "bin/cal_region_coverage.py",
+      "bin/cal_region_coverage_with_pair_end_reads.py",
+      "bin/combine_variants.py",
+      "bin/extract_amp_target_reads.py",
+      "bin/variants_filter.py",
+      "bin/convert_vcf_to_tab/canonical_transcript.xlsx",
+      "bin/convert_vcf_to_tab/convert_vcf_2_tab.py",
+      "bin/convert_vcf_to_tab/variant_header_convert.xlsx",
+      "bin/html_show_table/columns_instruction.json",
+      "bin/html_show_table/main.py",
+      "bin/html_show_table/variant_qc_processor.py"
+    ],
+    "executable_files": [
+      "bin/amp_combine_all_samples_qc.py",
+      "bin/amp_qc_collection.py",
+      "bin/cal_region_coverage.py",
+      "bin/cal_region_coverage_with_pair_end_reads.py",
+      "bin/combine_variants.py",
+      "bin/extract_amp_target_reads.py",
+      "bin/variants_filter.py"
+    ]
+  },
+  "runtime_manifest": {
+    "schema_version": 1,
+    "engine_version": "25.04.8",
+    "profile": "lc103-amp-v1",
+    "input_adapter": {
+      "kind": "paired_fastq_csv",
+      "read1": "read1",
+      "read2": "read2"
+    },
+    "fixed_params": {
+      "coverage_gradient": "1,100,200,300,500,1000,1500,2000,3000,4000",
+      "fastp_M": 15,
+      "fastp_l": 30,
+      "fastp_q": 15,
+      "flash_M": 150,
+      "flash_m": 10,
+      "index_name": "hg19bwaidx",
+      "panel": "LC103",
+      "platform": "ILLUMINA",
+      "vardict_I": 30,
+      "vardict_O": 20,
+      "vardict_Q": 30,
+      "vardict_X": 5,
+      "vardict_a": "10:0.95",
+      "vardict_f": 0.001,
+      "vardict_q": 20,
+      "vardict_r": 5,
+      "vep_clinvar": "clinvar/clinvar.vcf.gz",
+      "vep_cosmic": "cosmic/CosmicCodingNoncoding_v92_final.vcf.gz",
+      "vep_dir_cache": "genome/vep/vep_114",
+      "vep_hg19_fasta": "genome/hg19/ucsc.hg19.fasta",
+      "vep_plugins": "genome/vep/vep_114/plugins",
+      "vep_repeat_db": "region/repeatDB.bed.gz"
+    },
+    "path_params": [
+      {
+        "name": "coverage_cutoff",
+        "root": "source",
+        "relative_path": "src/conf/coverage_cutoff.yaml",
+        "kind": "file"
+      },
+      {
+        "name": "variant_filter_config",
+        "root": "source",
+        "relative_path": "src/conf/variant_filter_parameter.yaml",
+        "kind": "file"
+      },
+      {
+        "name": "amp_target",
+        "root": "source",
+        "relative_path": "panels_config/LC103.targets.bed",
+        "kind": "file"
+      },
+      {
+        "name": "bwa_index",
+        "root": "database",
+        "relative_path": "genome/bwa_index",
+        "kind": "directory"
+      },
+      {
+        "name": "hg19_genome",
+        "root": "database",
+        "relative_path": "genome/hg19/ucsc.hg19.fasta",
+        "kind": "file"
+      },
+      {
+        "name": "hg19_genome_fai",
+        "root": "database",
+        "relative_path": "genome/hg19/ucsc.hg19.fasta.fai",
+        "kind": "file"
+      }
+    ],
+    "database_relative_path": ".",
+    "container_images": {
+      "default": "dev.zgbio.net:38083/dr-pipeline-zg@sha256:e9f0c27bf09a5493c85e47adfe88780cada2ae04bcae078da353291793afe2ab",
+      "labels": {
+        "bamdst": "dev.zgbio.net:38083/dr-pipeline-zg@sha256:e9f0c27bf09a5493c85e47adfe88780cada2ae04bcae078da353291793afe2ab",
+        "bwamem": "dev.zgbio.net:38083/dr-pipeline-zg@sha256:e9f0c27bf09a5493c85e47adfe88780cada2ae04bcae078da353291793afe2ab",
+        "fastp": "dev.zgbio.net:38083/dr-pipeline-zg@sha256:e9f0c27bf09a5493c85e47adfe88780cada2ae04bcae078da353291793afe2ab",
+        "flash": "dev.zgbio.net:38083/dr-pipeline-zg@sha256:e9f0c27bf09a5493c85e47adfe88780cada2ae04bcae078da353291793afe2ab",
+        "gatk4": "dev.zgbio.net:38083/dr-pipeline-zg@sha256:e9f0c27bf09a5493c85e47adfe88780cada2ae04bcae078da353291793afe2ab",
+        "samtools": "dev.zgbio.net:38083/dr-pipeline-zg@sha256:e9f0c27bf09a5493c85e47adfe88780cada2ae04bcae078da353291793afe2ab",
+        "sambamba": "dev.zgbio.net:38083/dr-pipeline-zg@sha256:e9f0c27bf09a5493c85e47adfe88780cada2ae04bcae078da353291793afe2ab",
+        "vardict": "dev.zgbio.net:38083/dr-pipeline-zg@sha256:e9f0c27bf09a5493c85e47adfe88780cada2ae04bcae078da353291793afe2ab",
+        "vcf": "dev.zgbio.net:38083/dr-pipeline-zg@sha256:e9f0c27bf09a5493c85e47adfe88780cada2ae04bcae078da353291793afe2ab",
+        "vep": "dev.zgbio.net:38083/dr-pipeline-zg@sha256:e9f0c27bf09a5493c85e47adfe88780cada2ae04bcae078da353291793afe2ab"
+      },
+        "processes": {
+        "AlignmentQCBamdst": "dev.zgbio.net:38083/dr-pipeline-zg@sha256:e9f0c27bf09a5493c85e47adfe88780cada2ae04bcae078da353291793afe2ab",
+        "AmpCalculatePeCoverage": "dev.zgbio.net:38083/dr-pipeline-zg@sha256:e9f0c27bf09a5493c85e47adfe88780cada2ae04bcae078da353291793afe2ab",
+        "AmpCalculateSeCoverage": "dev.zgbio.net:38083/dr-pipeline-zg@sha256:e9f0c27bf09a5493c85e47adfe88780cada2ae04bcae078da353291793afe2ab",
+        "AmpCombineAllSamplesQc": "dev.zgbio.net:38083/dr-pipeline-zg@sha256:e9f0c27bf09a5493c85e47adfe88780cada2ae04bcae078da353291793afe2ab",
+        "AmpQcCollection": "dev.zgbio.net:38083/dr-pipeline-zg@sha256:e9f0c27bf09a5493c85e47adfe88780cada2ae04bcae078da353291793afe2ab",
+        "AmpVariantFilter": "dev.zgbio.net:38083/dr-pipeline-zg@sha256:e9f0c27bf09a5493c85e47adfe88780cada2ae04bcae078da353291793afe2ab",
+        "BwaPairEndReadsAlignment": "dev.zgbio.net:38083/dr-pipeline-zg@sha256:e9f0c27bf09a5493c85e47adfe88780cada2ae04bcae078da353291793afe2ab",
+        "BwaSingleEndReadsAlignment": "dev.zgbio.net:38083/dr-pipeline-zg@sha256:e9f0c27bf09a5493c85e47adfe88780cada2ae04bcae078da353291793afe2ab",
+        "CombineVariants": "dev.zgbio.net:38083/dr-pipeline-zg@sha256:e9f0c27bf09a5493c85e47adfe88780cada2ae04bcae078da353291793afe2ab",
+        "ConvertVcf2Tab": "dev.zgbio.net:38083/dr-pipeline-zg@sha256:e9f0c27bf09a5493c85e47adfe88780cada2ae04bcae078da353291793afe2ab",
+        "ExtractAmpTargetSingleEndReads": "dev.zgbio.net:38083/dr-pipeline-zg@sha256:e9f0c27bf09a5493c85e47adfe88780cada2ae04bcae078da353291793afe2ab",
+        "Fastp": "dev.zgbio.net:38083/dr-pipeline-zg@sha256:e9f0c27bf09a5493c85e47adfe88780cada2ae04bcae078da353291793afe2ab",
+        "Flash": "dev.zgbio.net:38083/dr-pipeline-zg@sha256:e9f0c27bf09a5493c85e47adfe88780cada2ae04bcae078da353291793afe2ab",
+        "HTMLResultsShow": "dev.zgbio.net:38083/dr-pipeline-zg@sha256:e9f0c27bf09a5493c85e47adfe88780cada2ae04bcae078da353291793afe2ab",
+        "SortPeBam": "dev.zgbio.net:38083/dr-pipeline-zg@sha256:e9f0c27bf09a5493c85e47adfe88780cada2ae04bcae078da353291793afe2ab",
+        "SortSeBam": "dev.zgbio.net:38083/dr-pipeline-zg@sha256:e9f0c27bf09a5493c85e47adfe88780cada2ae04bcae078da353291793afe2ab",
+        "VardictForSingleSample": "dev.zgbio.net:38083/dr-pipeline-zg@sha256:e9f0c27bf09a5493c85e47adfe88780cada2ae04bcae078da353291793afe2ab",
+          "VepAnno": "dev.zgbio.net:38083/dr-pipeline-zg@sha256:e9f0c27bf09a5493c85e47adfe88780cada2ae04bcae078da353291793afe2ab"
+        },
+        "container_user_processes": [
+          "VepAnno"
+        ]
+    },
+    "outputs": [
+      {
+        "name": "qc_report",
+        "glob": "reportResults/*QC.xlsx",
+        "required": true
+      },
+      {
+        "name": "variants",
+        "glob": "reportResults/*_all_samples_variants.tsv",
+        "required": true
+      }
+    ]
+  },
+  "interface_contract": {
+    "contract_version": "1.0.0",
+    "inputs": [
+      {
+        "name": "read1",
+        "label": "FASTQ R1",
+        "wdl_type": "File",
+        "semantic_type": "bio.fastq.gz.r1",
+        "required": true
+      },
+      {
+        "name": "read2",
+        "label": "FASTQ R2",
+        "wdl_type": "File",
+        "semantic_type": "bio.fastq.gz.r2",
+        "required": true
+      }
+    ],
+    "outputs": [
+      {
+        "name": "qc_report",
+        "label": "LC103 QC report",
+        "wdl_type": "File",
+        "semantic_type": "report.qc_xlsx",
+        "required": true
+      },
+      {
+        "name": "variants",
+        "label": "LC103 filtered variants",
+        "wdl_type": "File",
+        "semantic_type": "report.variants_tsv",
+        "required": true
+      }
+    ],
+    "resources": [
+      {
+        "name": "bwa_index",
+        "kind": "directory",
+        "root_alias": "database",
+        "relative_path": "genome/bwa_index",
+        "semantic_type": "bio.reference.bwa_index_dir"
+      },
+      {
+        "name": "hg19_fasta",
+        "kind": "file",
+        "root_alias": "database",
+        "relative_path": "genome/hg19/ucsc.hg19.fasta",
+        "semantic_type": "bio.reference.fasta"
+      },
+      {
+        "name": "hg19_fasta_index",
+        "kind": "file",
+        "root_alias": "database",
+        "relative_path": "genome/hg19/ucsc.hg19.fasta.fai",
+        "semantic_type": "bio.reference.fasta_index"
+      },
+      {
+        "name": "vep_cache",
+        "kind": "directory",
+        "root_alias": "database",
+        "relative_path": "genome/vep/vep_114",
+        "semantic_type": "bio.annotation.vep_cache_dir"
+      },
+      {
+        "name": "repeat_database",
+        "kind": "file",
+        "root_alias": "database",
+        "relative_path": "region/repeatDB.bed.gz",
+        "semantic_type": "bio.annotation.bed_gz"
+      },
+      {
+        "name": "repeat_database_index",
+        "kind": "file",
+        "root_alias": "database",
+        "relative_path": "region/repeatDB.bed.gz.tbi",
+        "semantic_type": "bio.annotation.tabix_index"
+      },
+      {
+        "name": "cosmic_database",
+        "kind": "file",
+        "root_alias": "database",
+        "relative_path": "cosmic/CosmicCodingNoncoding_v92_final.vcf.gz",
+        "semantic_type": "bio.annotation.vcf_gz"
+      },
+      {
+        "name": "cosmic_database_index",
+        "kind": "file",
+        "root_alias": "database",
+        "relative_path": "cosmic/CosmicCodingNoncoding_v92_final.vcf.gz.tbi",
+        "semantic_type": "bio.annotation.tabix_index"
+      },
+      {
+        "name": "clinvar_database",
+        "kind": "file",
+        "root_alias": "database",
+        "relative_path": "clinvar/clinvar.vcf.gz",
+        "semantic_type": "bio.annotation.vcf_gz"
+      },
+      {
+        "name": "clinvar_database_index",
+        "kind": "file",
+        "root_alias": "database",
+        "relative_path": "clinvar/clinvar.vcf.gz.tbi",
+        "semantic_type": "bio.annotation.tabix_index"
+      }
+    ]
+  }
+}

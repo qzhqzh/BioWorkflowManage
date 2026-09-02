@@ -27,6 +27,11 @@ from .models import (
     WorkflowDocument,
     WorkflowVersion,
 )
+from .execution_engines import (
+    NEXTFLOW,
+    ExecutionSnapshotError,
+    validate_execution_snapshot,
+)
 from .resource_catalog import (
     ResourceCatalogError,
     catalog_resource_specs,
@@ -1316,14 +1321,28 @@ def _compile_published_workflow(version: WorkflowVersion) -> tuple[dict[str, Any
             "ANALYSIS_WORKFLOW_INVALID",
             "已发布 Workflow 的固定编译产物校验失败。",
         )
-    files = bundle.get("files")
-    if not isinstance(files, dict):
-        files = {}
-    if "workflow.wdl" not in files:
+    outputs = version.interface_contract.get("outputs")
+    output_names = (
+        {
+            str(item.get("name") or "")
+            for item in outputs
+            if isinstance(item, dict) and item.get("name")
+        }
+        if isinstance(outputs, list)
+        else None
+    )
+    try:
+        validate_execution_snapshot(
+            version.execution_engine,
+            bundle,
+            version.runtime_manifest,
+            output_names=output_names,
+        )
+    except ExecutionSnapshotError as error:
         raise AnalysisInputError(
             "ANALYSIS_WORKFLOW_INVALID",
-            "编译结果缺少 workflow.wdl。",
-        )
+            str(error),
+        ) from error
     return bundle, version.compiled_digest
 
 
@@ -1828,6 +1847,7 @@ def analysis_run_payload(
         }
     payload = {
         "id": str(run.id),
+        "execution_engine": run.execution_engine,
         "workflow": workflow_payload,
         "sample_id": run.sample_id,
         "sample_name": run.sample_name,
@@ -2001,6 +2021,11 @@ def analysis_runs(request):
         )
         if workflow_slug.startswith(PUBLISHED_WORKFLOW_PREFIX):
             workflow_version = _parse_published_workflow(workflow_slug)
+            if workflow_version.execution_engine == NEXTFLOW:
+                raise AnalysisInputError(
+                    "ANALYSIS_PRODUCT_REQUIRED",
+                    "首期 Nextflow 流程只允许通过 Integration API 的 Analysis Product 投递。",
+                )
             source_bundle, source_digest = _compile_published_workflow(workflow_version)
             interface_semantics = {
                 item.get("semantic_type")
@@ -2047,6 +2072,8 @@ def analysis_runs(request):
             )
             run = AnalysisRun.objects.create(
                 workflow_version=workflow_version,
+                execution_engine=workflow_version.execution_engine,
+                runtime_manifest=workflow_version.runtime_manifest,
                 workflow_name=str(
                     workflow_version.workflow_graph.get("id")
                     or workflow_version.workflow.slug

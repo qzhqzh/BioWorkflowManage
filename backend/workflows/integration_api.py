@@ -43,6 +43,7 @@ from .artifact_exports import (
     artifact_export_payload,
     create_artifact_export,
 )
+from .execution_engines import NEXTFLOW
 from .analysis_products import (
     AnalysisProductError,
     analysis_product_version_is_current,
@@ -579,6 +580,16 @@ def _fixed_analysis_product(value: Any) -> AnalysisProductVersion:
 def _analysis_source(
     body: dict[str, Any],
 ) -> tuple[WorkflowVersion, AnalysisProductVersion | None]:
+    if "execution_engine" in body or any(
+        isinstance(body.get(key), dict)
+        and "execution_engine" in body[key]
+        for key in ("workflow", "analysis_product")
+    ):
+        raise IntegrationAPIError(
+            "EXECUTION_ENGINE_MANAGED",
+            "执行引擎由固定 Analysis Product / WorkflowVersion 决定，调用方不能指定。",
+            category="workflow",
+        )
     has_workflow = "workflow" in body
     has_product = "analysis_product" in body
     if has_workflow and has_product:
@@ -597,7 +608,14 @@ def _analysis_source(
                 "当前部署只接受已发布的 analysis_product。",
                 category="workflow",
             )
-        return _fixed_workflow(body.get("workflow")), None
+        version = _fixed_workflow(body.get("workflow"))
+        if version.execution_engine == NEXTFLOW:
+            raise IntegrationAPIError(
+                "ANALYSIS_PRODUCT_REQUIRED",
+                "首期 Nextflow 流程只允许通过固定 Analysis Product 投递。",
+                category="workflow",
+            )
+        return version, None
     raise IntegrationAPIError(
         "ANALYSIS_SOURCE_REQUIRED",
         "必须指定固定 workflow 或 analysis_product。",
@@ -2253,6 +2271,8 @@ def integration_analysis_runs(request):
                     run_kind=AnalysisRun.Kind.WORKFLOW,
                     workflow_version=version,
                     analysis_product_version=product_version,
+                    execution_engine=version.execution_engine,
+                    runtime_manifest=version.runtime_manifest,
                     service_account=account,
                     external_run_id=external["external_run_id"],
                     external_analysis_id=external["external_analysis_id"],
@@ -2499,6 +2519,8 @@ def integration_analysis_run_retry(request, run_id):
                     workflow_version=original.workflow_version,
                     analysis_product_version=product_version,
                     tool_version=original.tool_version,
+                    execution_engine=original.execution_engine,
+                    runtime_manifest=original.runtime_manifest,
                     service_account=account,
                     external_run_id=external["external_run_id"],
                     external_analysis_id=external["external_analysis_id"],

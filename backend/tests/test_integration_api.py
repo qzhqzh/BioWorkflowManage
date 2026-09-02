@@ -604,6 +604,8 @@ def test_analysis_product_preflight_and_submission_pin_contract(
     assert run.analysis_product_version == product_version
     assert run.workflow_version == version
     assert run.source_digest == version.compiled_digest
+    assert run.execution_engine == version.execution_engine
+    assert run.runtime_manifest == version.runtime_manifest
     assert run.request_payload["analysis_product"] == {
         "analysis_code": "dna-panel",
         "contract_version": "1.0.0",
@@ -628,6 +630,8 @@ def test_analysis_product_preflight_and_submission_pin_contract(
     assert retried.status_code == 201, retried.data
     retry = AnalysisRun.objects.get(pk=retried.data["id"])
     assert retry.analysis_product_version == product_version
+    assert retry.execution_engine == run.execution_engine
+    assert retry.runtime_manifest == run.runtime_manifest
     assert retried.data["analysis_product"]["contract_digest"] == (
         product_version.contract_digest
     )
@@ -665,6 +669,23 @@ def test_analysis_product_preflight_and_submission_pin_contract(
     )
     assert response.status_code == 400
     assert response.data["error"]["code"] == "ANALYSIS_SOURCE_CONFLICT"
+
+
+@pytest.mark.django_db
+def test_submission_cannot_override_execution_engine(integration_workspace):
+    _, _, _, client = _token_client()
+    version = _workflow_version()
+    body = _submission(version)
+    body["execution_engine"] = "nextflow"
+
+    response = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        body,
+        format="json",
+    )
+
+    assert response.status_code == 400
+    assert response.data["error"]["code"] == "EXECUTION_ENGINE_MANAGED"
 
 
 @pytest.mark.django_db

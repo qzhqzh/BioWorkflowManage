@@ -347,6 +347,10 @@ class LoginRateLimitBucket(models.Model):
 
 
 class WorkflowVersion(ImmutableSnapshot):
+    class ExecutionEngine(models.TextChoices):
+        MINIWDL = "miniwdl", "MiniWDL"
+        NEXTFLOW = "nextflow", "Nextflow"
+
     workflow = models.ForeignKey(
         WorkflowDocument,
         on_delete=models.PROTECT,
@@ -363,6 +367,13 @@ class WorkflowVersion(ImmutableSnapshot):
     compiled_bundle = models.JSONField(default=dict)
     compiled_digest = models.CharField(max_length=80, blank=True)
     compiler_profile = models.CharField(max_length=64, blank=True)
+    execution_engine = models.CharField(
+        max_length=16,
+        choices=ExecutionEngine.choices,
+        default=ExecutionEngine.MINIWDL,
+        db_index=True,
+    )
+    runtime_manifest = models.JSONField(default=dict)
     interface_contract = models.JSONField(default=dict)
     subworkflow_references = models.JSONField(default=list)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -1352,6 +1363,13 @@ class AnalysisRun(models.Model):
     input_values = models.JSONField(default=dict)
     source_bundle = models.JSONField(default=dict)
     source_digest = models.CharField(max_length=80, blank=True)
+    execution_engine = models.CharField(
+        max_length=16,
+        choices=WorkflowVersion.ExecutionEngine.choices,
+        default=WorkflowVersion.ExecutionEngine.MINIWDL,
+        db_index=True,
+    )
+    runtime_manifest = models.JSONField(default=dict)
     outputs = models.JSONField(default=dict)
     output_status = models.CharField(
         max_length=16,

@@ -30,6 +30,14 @@ from .integration_outputs import (
     ResourceSnapshotBudget,
     ResourceSnapshotBudgetError,
 )
+from .execution_engines import (
+    MINIWDL,
+    NEXTFLOW,
+    ExecutionSnapshotError,
+    decode_bundle_file,
+    normalize_source_path,
+    validate_execution_snapshot,
+)
 from .models import AnalysisRun, AnalysisRunEvent
 from .object_inputs import (
     ObjectInputError,
@@ -93,6 +101,14 @@ def _require_trusted_analysis_source(run: AnalysisRun) -> None:
             raise AnalysisProductTrustError(
                 "当前部署只允许执行仍有效且与运行快照一致的 Analysis Product。"
             )
+    if run.workflow_version_id and (
+        run.source_digest != run.workflow_version.compiled_digest
+        or run.execution_engine != run.workflow_version.execution_engine
+        or run.runtime_manifest != run.workflow_version.runtime_manifest
+    ):
+        raise WorkflowPackageTrustError(
+            "运行快照与 WorkflowVersion 固定执行配置不一致。"
+        )
     if not settings.INTEGRATION_REQUIRE_SIGNED_WORKFLOW_PACKAGE:
         return
     if not run.workflow_version_id:
@@ -102,8 +118,7 @@ def _require_trusted_analysis_source(run: AnalysisRun) -> None:
     from .analysis_products import workflow_package_attestation_is_current
 
     if (
-        run.source_digest != run.workflow_version.compiled_digest
-        or not workflow_package_attestation_is_current(run.workflow_version)
+        not workflow_package_attestation_is_current(run.workflow_version)
     ):
         raise WorkflowPackageTrustError(
             "运行快照与 WorkflowVersion 固定编译产物或工作流包签名证明不一致。"
@@ -190,6 +205,18 @@ def _cleanup_swarm_services_for_run(
             except Exception:
                 pass
     return removed, errors
+
+
+def _cleanup_execution_resources(
+    execution_engine: str,
+    run_directory: Path,
+    run_id: str,
+) -> tuple[list[str], list[str]]:
+    if execution_engine == NEXTFLOW:
+        from .nextflow_runtime import cleanup_nextflow_containers_for_run
+
+        return cleanup_nextflow_containers_for_run(run_directory, run_id)
+    return _cleanup_swarm_services_for_run(run_directory)
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -354,7 +381,11 @@ class _LeaseHeartbeat:
         work_directory = str(getattr(self.run, "work_directory", "") or "")
         if not work_directory:
             return
-        _, errors = _cleanup_swarm_services_for_run(Path(work_directory))
+        _, errors = _cleanup_execution_resources(
+            self.run.execution_engine,
+            Path(work_directory),
+            str(self.run.id),
+        )
         self.cleanup_errors.extend(errors)
 
 
@@ -401,19 +432,23 @@ def _finalize_cancelled_run(run_id, lease_token) -> bool:
         return True
 
 
-def _recover_stale_runs(now) -> None:
-    stale_runs = list(
-        AnalysisRun.objects.select_for_update(skip_locked=True)
-        .filter(
-            status__in=[
-                AnalysisRun.Status.PREPARING,
-                AnalysisRun.Status.RUNNING,
-                AnalysisRun.Status.CANCEL_REQUESTED,
-            ],
-            lease_expires_at__lt=now,
-        )
-        .order_by("lease_expires_at")[:20]
+def _recover_stale_runs(
+    now,
+    execution_engines: tuple[str, ...] | None = None,
+) -> None:
+    stale_queryset = AnalysisRun.objects.select_for_update(skip_locked=True).filter(
+        status__in=[
+            AnalysisRun.Status.PREPARING,
+            AnalysisRun.Status.RUNNING,
+            AnalysisRun.Status.CANCEL_REQUESTED,
+        ],
+        lease_expires_at__lt=now,
     )
+    if execution_engines is not None:
+        stale_queryset = stale_queryset.filter(
+            execution_engine__in=execution_engines,
+        )
+    stale_runs = list(stale_queryset.order_by("lease_expires_at")[:20])
     for run in stale_runs:
         stale_work_directory = str(run.work_directory or "")
         if run.status == AnalysisRun.Status.CANCEL_REQUESTED:
@@ -461,8 +496,14 @@ def _recover_stale_runs(now) -> None:
         _event(run, message, kind="lease", level=level)
         if stale_work_directory:
             transaction.on_commit(
-                lambda work_directory=stale_work_directory: (
-                    _cleanup_swarm_services_for_run(Path(work_directory))
+                lambda work_directory=stale_work_directory,
+                execution_engine=run.execution_engine,
+                run_id=str(run.id): (
+                    _cleanup_execution_resources(
+                        execution_engine,
+                        Path(work_directory),
+                        run_id,
+                    )
                 )
             )
 
@@ -495,13 +536,21 @@ def _resource_wait_message(run: AnalysisRun | None = None) -> str | None:
     )
 
 
-def claim_next_run() -> AnalysisRun | None:
+def claim_next_run(
+    execution_engines: tuple[str, ...] = (MINIWDL,),
+) -> AnalysisRun | None:
+    unsupported = set(execution_engines) - {MINIWDL, NEXTFLOW}
+    if not execution_engines or unsupported:
+        raise ValueError("analysis worker execution_engines 配置无效。")
     with transaction.atomic():
         now = timezone.now()
-        _recover_stale_runs(now)
+        _recover_stale_runs(now, execution_engines)
         run = (
             AnalysisRun.objects.select_for_update(skip_locked=True)
-            .filter(status=AnalysisRun.Status.QUEUED)
+            .filter(
+                status=AnalysisRun.Status.QUEUED,
+                execution_engine__in=execution_engines,
+            )
             .order_by("created_at")
             .first()
         )
@@ -519,7 +568,7 @@ def claim_next_run() -> AnalysisRun | None:
         run.status = AnalysisRun.Status.PREPARING
         run.status_version += 1
         run.progress = 5
-        run.current_step = "正在准备 WDL 与输入"
+        run.current_step = "正在准备流程与输入"
         run.started_at = now
         run.attempt_count += 1
         run.lease_token = uuid.uuid4()
@@ -554,7 +603,7 @@ def claim_next_run() -> AnalysisRun | None:
         return run
 
 
-def _revision_bundle(run: AnalysisRun) -> tuple[dict[str, str], str]:
+def _revision_bundle(run: AnalysisRun) -> tuple[dict[str, bytes], str]:
     if run.workflow_version_id or run.tool_version_id:
         if _canonical_bundle_digest(run.source_bundle) != run.source_digest:
             raise RuntimeError("已发布 Workflow 的运行编译产物摘要不匹配。")
@@ -562,10 +611,18 @@ def _revision_bundle(run: AnalysisRun) -> tuple[dict[str, str], str]:
         entrypoint = run.source_bundle.get("entrypoint")
         if not isinstance(files, dict) or not isinstance(entrypoint, str):
             raise RuntimeError("已发布 Workflow 的固定编译产物不完整。")
-        return {
-            str(path): str(content)
-            for path, content in files.items()
-        }, normalize_package_path(entrypoint)
+        try:
+            normalized_files = {
+                normalize_source_path(path): decode_bundle_file(
+                    content,
+                    path=str(path),
+                )
+                for path, content in files.items()
+            }
+            normalized_entrypoint = normalize_source_path(entrypoint)
+        except ExecutionSnapshotError as error:
+            raise RuntimeError(str(error)) from error
+        return normalized_files, normalized_entrypoint
     if run.revision is None or run.asset is None:
         raise RuntimeError("运行没有固定的 WDL 来源。")
     revision = run.revision
@@ -582,7 +639,10 @@ def _revision_bundle(run: AnalysisRun) -> tuple[dict[str, str], str]:
         local_files,
         reference_specs_for_revision(revision),
     )
-    return files, normalize_package_path(entrypoint)
+    return {
+        normalize_source_path(path): content.encode("utf-8")
+        for path, content in files.items()
+    }, normalize_package_path(entrypoint)
 
 
 def _canonical_bundle_digest(value: Any) -> str:
@@ -836,13 +896,16 @@ def _materialize_source(run: AnalysisRun, run_directory: Path) -> Path:
     source_directory = run_directory / "source"
     source_directory.mkdir(parents=True)
     for relative_path, content in files.items():
-        normalized = normalize_package_path(relative_path)
+        normalized = normalize_source_path(relative_path)
         target = source_directory / normalized
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
+        target.write_bytes(content)
+    for relative_path in run.source_bundle.get("executable_files") or []:
+        target = source_directory / normalize_source_path(relative_path)
+        target.chmod(0o755)
     entry = source_directory / entrypoint
     if not entry.is_file():
-        raise RuntimeError(f"WDL 入口文件不存在：{entrypoint}")
+        raise RuntimeError(f"流程入口文件不存在：{entrypoint}")
     return entry
 
 
@@ -1028,11 +1091,10 @@ def _attempt_paths(run_directory: Path, attempt: int) -> dict[str, Path]:
     }
 
 
-def execute_analysis_run(
+def _execute_miniwdl_analysis_run(
     run: AnalysisRun,
     heartbeat: _LeaseHeartbeat | None = None,
 ) -> None:
-    _require_trusted_analysis_source(run)
     executable = shutil.which("miniwdl")
     if executable is None:
         raise RuntimeError("analysis-worker 中没有 miniwdl 可执行文件。")
@@ -1350,6 +1412,50 @@ def execute_analysis_run(
                 else "分析完成，结果文件已就绪。"
             ),
         )
+
+
+def _validate_run_execution_snapshot(run: AnalysisRun) -> None:
+    if not (run.workflow_version_id or run.tool_version_id):
+        if run.execution_engine != MINIWDL:
+            raise RuntimeError("历史 WDL 资产只能由 MiniWDL 执行。")
+        return
+    if _canonical_bundle_digest(run.source_bundle) != run.source_digest:
+        raise RuntimeError("运行固定执行包的摘要不匹配。")
+    output_names = None
+    if run.workflow_version_id:
+        outputs = run.workflow_version.interface_contract.get("outputs")
+        if isinstance(outputs, list):
+            output_names = {
+                str(item.get("name") or "")
+                for item in outputs
+                if isinstance(item, dict) and item.get("name")
+            }
+    try:
+        validate_execution_snapshot(
+            run.execution_engine,
+            run.source_bundle,
+            run.runtime_manifest,
+            output_names=output_names,
+        )
+    except ExecutionSnapshotError as error:
+        raise RuntimeError(str(error)) from error
+
+
+def execute_analysis_run(
+    run: AnalysisRun,
+    heartbeat: _LeaseHeartbeat | None = None,
+) -> None:
+    _require_trusted_analysis_source(run)
+    _validate_run_execution_snapshot(run)
+    if run.execution_engine == MINIWDL:
+        _execute_miniwdl_analysis_run(run, heartbeat)
+        return
+    if run.execution_engine == NEXTFLOW:
+        from .nextflow_runtime import execute_nextflow_analysis_run
+
+        execute_nextflow_analysis_run(run, heartbeat)
+        return
+    raise RuntimeError(f"不支持的执行引擎：{run.execution_engine}。")
 
 
 def process_analysis_run(run: AnalysisRun) -> None:

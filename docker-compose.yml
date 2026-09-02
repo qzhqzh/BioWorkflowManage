@@ -395,7 +395,7 @@ services:
       context: .
       dockerfile: Dockerfile.backend
     restart: unless-stopped
-    command: ["python", "backend/manage.py", "run_analysis_worker"]
+    command: ["python", "backend/manage.py", "run_analysis_worker", "--engine", "miniwdl"]
     user: "${MINIWDL_UID:-1000}:${MINIWDL_GID:-1000}"
     read_only: true
     environment:
@@ -475,7 +475,7 @@ services:
       context: .
       dockerfile: Dockerfile.backend
     restart: unless-stopped
-    command: ["python", "backend/manage.py", "run_analysis_worker"]
+    command: ["python", "backend/manage.py", "run_analysis_worker", "--engine", "miniwdl"]
     user: "${MINIWDL_UID:-1000}:${MINIWDL_GID:-1000}"
     group_add:
       - "${MINIWDL_DOCKER_GID:?Run stat -c '%g' /var/run/docker.sock and set MINIWDL_DOCKER_GID}"
@@ -559,6 +559,130 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  nextflow-docker:
+    profiles: ["nextflow-runtime"]
+    image: m.daocloud.io/docker.io/library/docker:27.5.1-dind@sha256:aa3df78ecf320f5fafdce71c659f1629e96e9de0968305fe1de670e0ca9176ce
+    hostname: nextflow-docker
+    privileged: true
+    environment:
+      DOCKER_TLS_CERTDIR: /certs
+    volumes:
+      - ./data/nextflow-engine:/var/lib/docker
+      - ./data/nextflow-certs:/certs
+      - type: bind
+        source: ${ANALYSIS_RAWDATA_HOST_PATH:-/mnt/nas/workspace/rawdata}
+        target: ${ANALYSIS_RAWDATA_HOST_PATH:-/mnt/nas/workspace/rawdata}
+        read_only: true
+      - type: bind
+        source: ${ANALYSIS_DATABASE_HOST_PATH:-/mnt/nas/workspace/databases}
+        target: ${ANALYSIS_DATABASE_HOST_PATH:-/mnt/nas/workspace/databases}
+        read_only: true
+      - type: bind
+        source: ${ANALYSIS_RUN_HOST_PATH:-/mnt/nas/workspace/analysis-runs}
+        target: ${ANALYSIS_RUN_HOST_PATH:-/mnt/nas/workspace/analysis-runs}
+      - type: bind
+        source: ${ANALYSIS_INPUT_STAGING_HOST_PATH:-/mnt/nas/workspace/input-staging}
+        target: ${ANALYSIS_INPUT_STAGING_HOST_PATH:-/mnt/nas/workspace/input-staging}
+        read_only: true
+    networks:
+      - nextflow-control
+      - nextflow-egress
+    healthcheck:
+      test: ["CMD", "docker", "-H", "unix:///var/run/docker.sock", "info"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  analysis-worker-nextflow:
+    profiles: ["nextflow-runtime"]
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+      target: nextflow-worker
+    restart: unless-stopped
+    command: ["python", "backend/manage.py", "run_analysis_worker", "--engine", "nextflow"]
+    user: "${MINIWDL_UID:-1000}:${MINIWDL_GID:-1000}"
+    read_only: true
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_DB: ${POSTGRES_DB:-bioworkflow}
+      POSTGRES_USER: ${POSTGRES_USER:-bioworkflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?Set DJANGO_SECRET_KEY in .env}
+      DOCKER_HOST: tcp://nextflow-docker:2376
+      DOCKER_CERT_PATH: /certs/client
+      DOCKER_TLS_VERIFY: "1"
+      ANALYSIS_RAWDATA_ROOT: ${ANALYSIS_RAWDATA_HOST_PATH:-/mnt/nas/workspace/rawdata}
+      ANALYSIS_RAWDATA_EXECUTION_ROOT: ${ANALYSIS_RAWDATA_HOST_PATH:-/mnt/nas/workspace/rawdata}
+      ANALYSIS_DATABASE_ROOT: ${ANALYSIS_DATABASE_HOST_PATH:-/mnt/nas/workspace/databases}
+      ANALYSIS_DATABASE_EXECUTION_ROOT: ${ANALYSIS_DATABASE_HOST_PATH:-/mnt/nas/workspace/databases}
+      ANALYSIS_DATABASE_CATALOG: ${ANALYSIS_DATABASE_HOST_PATH:-/mnt/nas/workspace/databases}/catalog.json
+      ANALYSIS_RUN_ROOT: ${ANALYSIS_RUN_HOST_PATH:-/mnt/nas/workspace/analysis-runs}
+      ANALYSIS_RUN_EXECUTION_ROOT: ${ANALYSIS_RUN_HOST_PATH:-/mnt/nas/workspace/analysis-runs}
+      ANALYSIS_INPUT_STAGING_ROOT: ${ANALYSIS_INPUT_STAGING_HOST_PATH:-/mnt/nas/workspace/input-staging}
+      ANALYSIS_INPUT_STAGING_EXECUTION_ROOT: ${ANALYSIS_INPUT_STAGING_HOST_PATH:-/mnt/nas/workspace/input-staging}
+      ANALYSIS_OBJECT_STORAGE_PROFILE_DIR: /run/secrets/bioworkflow/object-storage
+      ANALYSIS_OBJECT_HEAD_TIMEOUT_SECONDS: "${ANALYSIS_OBJECT_HEAD_TIMEOUT_SECONDS:-10}"
+      ANALYSIS_OBJECT_HEAD_MAX_CONCURRENT: "${ANALYSIS_OBJECT_HEAD_MAX_CONCURRENT:-8}"
+      ANALYSIS_OBJECT_STAGE_TIMEOUT_SECONDS: "${ANALYSIS_OBJECT_STAGE_TIMEOUT_SECONDS:-3600}"
+      ANALYSIS_OBJECT_STAGE_RUN_TIMEOUT_SECONDS: "${ANALYSIS_OBJECT_STAGE_RUN_TIMEOUT_SECONDS:-7200}"
+      ANALYSIS_OBJECT_STAGE_SLOT_WAIT_SECONDS: "${ANALYSIS_OBJECT_STAGE_SLOT_WAIT_SECONDS:-600}"
+      ANALYSIS_OBJECT_STAGE_LEASE_SECONDS: "${ANALYSIS_OBJECT_STAGE_LEASE_SECONDS:-7260}"
+      ANALYSIS_OBJECT_STAGE_MAX_CONCURRENT_RUNS: "${ANALYSIS_OBJECT_STAGE_MAX_CONCURRENT_RUNS:-2}"
+      ANALYSIS_OBJECT_STAGE_MAX_ITEMS: "${ANALYSIS_OBJECT_STAGE_MAX_ITEMS:-64}"
+      ANALYSIS_OBJECT_STAGE_MAX_OBJECT_BYTES: "${ANALYSIS_OBJECT_STAGE_MAX_OBJECT_BYTES:-1099511627776}"
+      ANALYSIS_OBJECT_STAGE_MAX_RUN_BYTES: "${ANALYSIS_OBJECT_STAGE_MAX_RUN_BYTES:-2199023255552}"
+      ANALYSIS_OBJECT_STAGE_MAX_RESERVED_BYTES: "${ANALYSIS_OBJECT_STAGE_MAX_RESERVED_BYTES:-4398046511104}"
+      ANALYSIS_OBJECT_STAGE_MIN_FREE_BYTES: "${ANALYSIS_OBJECT_STAGE_MIN_FREE_BYTES:-10737418240}"
+      ANALYSIS_OBJECT_STAGE_CHUNK_BYTES: "${ANALYSIS_OBJECT_STAGE_CHUNK_BYTES:-8388608}"
+      ANALYSIS_RESOURCE_MANIFEST_MAX_ENTRIES: "${ANALYSIS_RESOURCE_MANIFEST_MAX_ENTRIES:-100000}"
+      ANALYSIS_RESOURCE_MANIFEST_MAX_DEPTH: "${ANALYSIS_RESOURCE_MANIFEST_MAX_DEPTH:-128}"
+      ANALYSIS_WORKER_RESOURCE_MANIFEST_TIMEOUT_SECONDS: "${ANALYSIS_WORKER_RESOURCE_MANIFEST_TIMEOUT_SECONDS:-300}"
+      ANALYSIS_MANAGED_RESOURCE_MAX_ITEMS: "${ANALYSIS_MANAGED_RESOURCE_MAX_ITEMS:-256}"
+      ANALYSIS_MANAGED_FILE_CHECKSUM_MAX_BYTES: "${ANALYSIS_MANAGED_FILE_CHECKSUM_MAX_BYTES:-17179869184}"
+      ANALYSIS_OUTPUT_SNAPSHOT_MAX_ITEMS: "${ANALYSIS_OUTPUT_SNAPSHOT_MAX_ITEMS:-256}"
+      ANALYSIS_OUTPUT_SNAPSHOT_MAX_BYTES: "${ANALYSIS_OUTPUT_SNAPSHOT_MAX_BYTES:-1099511627776}"
+      ANALYSIS_OUTPUT_SNAPSHOT_MAX_DIRECTORY_ENTRIES: "${ANALYSIS_OUTPUT_SNAPSHOT_MAX_DIRECTORY_ENTRIES:-200000}"
+      ANALYSIS_OUTPUT_SNAPSHOT_TIMEOUT_SECONDS: "${ANALYSIS_OUTPUT_SNAPSHOT_TIMEOUT_SECONDS:-300}"
+      ANALYSIS_OUTPUT_SNAPSHOT_MIN_FREE_BYTES: "${ANALYSIS_OUTPUT_SNAPSHOT_MIN_FREE_BYTES:-1073741824}"
+      ANALYSIS_OUTPUT_MANIFEST_MAX_DEPTH: "${ANALYSIS_OUTPUT_MANIFEST_MAX_DEPTH:-32}"
+      ANALYSIS_OUTPUT_VALUE_MAX_BYTES: "${ANALYSIS_OUTPUT_VALUE_MAX_BYTES:-65536}"
+      ANALYSIS_WORKER_POLL_SECONDS: "${ANALYSIS_WORKER_POLL_SECONDS:-2}"
+      ANALYSIS_MIN_AVAILABLE_MEMORY_GB: "${NEXTFLOW_MIN_AVAILABLE_MEMORY_GB:-40}"
+    depends_on:
+      db:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+      nextflow-docker:
+        condition: service_healthy
+    volumes:
+      - ./data/nextflow-certs/client:/certs/client:ro
+      - type: bind
+        source: ${ANALYSIS_RAWDATA_HOST_PATH:-/mnt/nas/workspace/rawdata}
+        target: ${ANALYSIS_RAWDATA_HOST_PATH:-/mnt/nas/workspace/rawdata}
+        read_only: true
+      - type: bind
+        source: ${ANALYSIS_DATABASE_HOST_PATH:-/mnt/nas/workspace/databases}
+        target: ${ANALYSIS_DATABASE_HOST_PATH:-/mnt/nas/workspace/databases}
+        read_only: true
+      - type: bind
+        source: ${ANALYSIS_RUN_HOST_PATH:-/mnt/nas/workspace/analysis-runs}
+        target: ${ANALYSIS_RUN_HOST_PATH:-/mnt/nas/workspace/analysis-runs}
+      - type: bind
+        source: ${ANALYSIS_INPUT_STAGING_HOST_PATH:-/mnt/nas/workspace/input-staging}
+        target: ${ANALYSIS_INPUT_STAGING_HOST_PATH:-/mnt/nas/workspace/input-staging}
+      - ${ANALYSIS_OBJECT_STORAGE_SECRETS_HOST_PATH:-./secrets/object-storage}:/run/secrets/bioworkflow/object-storage:ro
+    tmpfs:
+      - /tmp
+    networks:
+      - default
+      - nextflow-control
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
 networks:
   miniwdl-control:
     internal: true
@@ -569,3 +693,12 @@ networks:
     ipam:
       config:
         - subnet: ${MINIWDL_EGRESS_SUBNET:-10.253.1.0/24}
+  nextflow-control:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${NEXTFLOW_CONTROL_SUBNET:-10.254.0.0/24}
+  nextflow-egress:
+    ipam:
+      config:
+        - subnet: ${NEXTFLOW_EGRESS_SUBNET:-10.254.1.0/24}
