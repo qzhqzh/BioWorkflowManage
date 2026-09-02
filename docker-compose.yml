@@ -580,6 +580,7 @@ services:
   nextflow-docker:
     profiles: ["nextflow-runtime"]
     image: m.daocloud.io/docker.io/library/docker:27.5.1-dind@sha256:aa3df78ecf320f5fafdce71c659f1629e96e9de0968305fe1de670e0ca9176ce
+    restart: unless-stopped
     hostname: nextflow-docker
     privileged: true
     command: ["--insecure-registry=dev.zgbio.net:38083"]
