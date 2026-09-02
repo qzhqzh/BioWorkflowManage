@@ -559,11 +559,30 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  nextflow-registry:
+    profiles: ["nextflow-runtime"]
+    image: docker.io/library/registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+    restart: unless-stopped
+    environment:
+      REGISTRY_HTTP_ADDR: 0.0.0.0:38083
+    ports:
+      - "127.0.0.1:${NEXTFLOW_REGISTRY_BOOTSTRAP_PORT:-38084}:38083"
+    volumes:
+      - ./data/nextflow-registry:/var/lib/registry
+    networks:
+      nextflow-control:
+        aliases:
+          - dev.zgbio.net
+      nextflow-bootstrap:
+    security_opt:
+      - no-new-privileges:true
+
   nextflow-docker:
     profiles: ["nextflow-runtime"]
     image: m.daocloud.io/docker.io/library/docker:27.5.1-dind@sha256:aa3df78ecf320f5fafdce71c659f1629e96e9de0968305fe1de670e0ca9176ce
     hostname: nextflow-docker
     privileged: true
+    command: ["--insecure-registry=dev.zgbio.net:38083"]
     environment:
       DOCKER_TLS_CERTDIR: /certs
     volumes:
@@ -587,6 +606,8 @@ services:
     networks:
       - nextflow-control
       - nextflow-egress
+    depends_on:
+      - nextflow-registry
     healthcheck:
       test: ["CMD", "docker", "-H", "unix:///var/run/docker.sock", "info"]
       interval: 3s
@@ -698,6 +719,8 @@ networks:
     ipam:
       config:
         - subnet: ${NEXTFLOW_CONTROL_SUBNET:-10.254.0.0/24}
+  nextflow-bootstrap:
+    driver: bridge
   nextflow-egress:
     ipam:
       config:
