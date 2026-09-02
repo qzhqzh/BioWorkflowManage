@@ -120,8 +120,8 @@ docker compose \
 ```
 
 OKB 通过 `http://bioworkflow-api:8000` 访问，不需要对客户局域网发布 Analysis API 端口。
-两端的 `ANALYSIS_RAWDATA_HOST_PATH` 与 `DJANGO_DATA_HOST_DIR` 必须指向同一宿主机目录，
-但数据库、运行目录和结果目录保持隔离。
+两端的 `ANALYSIS_RAWDATA_HOST_PATH` 与 `BIOWORKFLOW_RAWDATA_HOST_DIR` 必须指向同一宿主机目录；
+OKB 将该目录只读挂载为 `DJANGO_RAWDATA_DIR`，数据库、运行目录和结果目录保持隔离。
 
 为 OKB 签发最小权限 token 时直接写入新建的 0600 文件，避免 token 出现在终端日志：
 
