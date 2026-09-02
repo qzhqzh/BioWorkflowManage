@@ -28,6 +28,19 @@ python backend/manage.py import_nextflow_product \
   --actor deployment
 ```
 
+Docker Compose 部署使用带 Git 的 Nextflow worker 镜像执行同一导入命令：
+
+```bash
+docker compose --profile nextflow-runtime run --rm --no-deps \
+  -v /data/06_project/okb/Workflow/amp_pipeline:/source:ro \
+  analysis-worker-nextflow \
+  python backend/manage.py import_nextflow_product \
+  --manifest examples/nextflow-lc103/product-manifest.json \
+  --source-dir /source \
+  --publish-product \
+  --actor deployment
+```
+
 清单固定以下证据：
 
 - 流程仓库完整 40 位 commit；
@@ -41,7 +54,7 @@ python backend/manage.py import_nextflow_product \
 
 ## 运行节点
 
-Nextflow worker 使用宿主 Docker，并只领取 Nextflow 任务：
+Nextflow worker 使用独立的 TLS Docker-in-Docker daemon，并只领取 Nextflow 任务：
 
 ```bash
 docker compose --profile nextflow-runtime up -d --build \

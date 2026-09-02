@@ -50,7 +50,7 @@ ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 \
     NXF_OFFLINE=true
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl docker-cli openjdk-21-jre-headless \
+    && apt-get install -y --no-install-recommends ca-certificates curl docker-cli git openjdk-21-jre-headless \
     && curl -fsSL \
         "https://github.com/nextflow-io/nextflow/releases/download/v25.04.8/nextflow-25.04.8-dist" \
         -o /usr/local/bin/nextflow \
