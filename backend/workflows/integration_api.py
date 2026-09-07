@@ -76,12 +76,14 @@ from .models import (
     AnalysisRunEvent,
     AnalysisOutputRetention,
     ArtifactExport,
+    RawdataDatasetIndex,
     ServiceAccount,
     SoftwareAsset,
     ToolVersion,
     WorkflowDocument,
     WorkflowVersion,
 )
+from .rawdata_index import rawdata_root_key
 from .object_inputs import (
     lock_input_staging_coordinator_for_manifest,
     ObjectHeadBudget,
@@ -2068,6 +2070,49 @@ def integration_analysis_products(request):
     )
     return Response(
         {"results": [_analysis_product_version_payload(item) for item in versions[:200]]}
+    )
+
+
+@require_service_scopes("analysis:read")
+@api_view(["GET"])
+@permission_classes([IntegrationScopePermission])
+def integration_rawdata_datasets(request):
+    limit = max(1, int(settings.RAWDATA_SCAN_MAX_FILES) // 2)
+    queryset = RawdataDatasetIndex.objects.filter(
+        root_key=rawdata_root_key(),
+        active=True,
+        status="ready",
+    ).order_by("directory", "name", "pair_key")
+    total = queryset.count()
+    datasets = list(queryset[:limit])
+    return Response(
+        {
+            "count": total,
+            "truncated": total > limit,
+            "results": [
+                {
+                    "dataset_id": item.dataset_id,
+                    "name": item.name,
+                    "directory": item.directory,
+                    "pair_key": item.pair_key,
+                    "identity_digest": item.identity_digest,
+                    "files": [
+                        {
+                            key: file_item.get(key)
+                            for key in (
+                                "mate",
+                                "name",
+                                "relative_path",
+                                "size",
+                                "modified_at",
+                            )
+                        }
+                        for file_item in item.files
+                    ],
+                }
+                for item in datasets
+            ],
+        }
     )
 
 

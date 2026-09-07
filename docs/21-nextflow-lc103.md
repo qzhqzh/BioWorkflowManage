@@ -4,7 +4,7 @@
 
 - 流程：`01_amp_pipeline.nf`
 - Panel：`LC103`
-- 输入：一对受管 FASTQ（R1/R2）
+- 输入：一组或多组顺序对应的受管 FASTQ（R1/R2 数组，最多 32 个 lane）
 - 输出：QC Excel、过滤后变异 TSV、OKBOX QC 展示 TSV、OKBOX 变异展示 TSV
 - 外部调用：复用 Integration API / Analysis Product
 - 前端：首期不实现
@@ -86,7 +86,7 @@ docker compose --profile nextflow-runtime run --rm --no-deps \
 mirror 数据保存在已忽略的 `data/nextflow-registry/`，不接受局域网连接；DIND 到 mirror 使用隔离
 网络内的 HTTP，但任务镜像仍必须匹配 `repo@sha256`，不允许用 tag 代替 digest。
 
-Nextflow worker 会生成运行级 `fastq-list.csv` 和只读执行参数，不加载源码仓库的 `nextflow.config`，也不接受调用方传入任意 Nextflow 参数、配置文件、源码路径或容器镜像。Nextflow 子进程只继承 Java、Docker TLS 与基础 locale 所需的环境变量，不继承应用密钥。
+Nextflow worker 会生成运行级 `fastq-list.csv` 和只读执行参数，不加载源码仓库的 `nextflow.config`，也不接受调用方传入任意 Nextflow 参数、配置文件、源码路径或容器镜像。单 lane 直接使用原始 R1/R2；多 lane 按数组顺序将 gzip member 合并为运行目录内的一对临时 FASTQ，再向现有 LC103 流程写入一行输入，因此不改动私有流程源码。R1/R2 数量不一致、空数组、重复路径或超过 32 个 lane 时拒绝执行。Nextflow 子进程只继承 Java、Docker TLS 与基础 locale 所需的环境变量，不继承应用密钥。
 
 ## 验证
 

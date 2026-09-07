@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import json
 import stat
 import subprocess
@@ -31,6 +32,7 @@ from workflows.nextflow_runtime import (
     _collect_outputs,
     _nextflow_environment,
     _nextflow_arguments,
+    _write_fastq_list,
     _write_nextflow_config,
     cleanup_nextflow_containers_for_run,
 )
@@ -368,6 +370,102 @@ def test_nextflow_environment_does_not_inherit_application_secrets(tmp_path, mon
     assert "DJANGO_SECRET_KEY" not in environment
     assert environment["DOCKER_HOST"] == "tcp://nextflow-docker:2376"
     assert environment["NXF_OFFLINE"] == "true"
+
+
+def test_nextflow_fastq_adapter_preserves_scalar_inputs(tmp_path):
+    version = _nextflow_version()
+    run = _nextflow_run(version)
+    read1 = tmp_path / "S001_R1.fastq.gz"
+    read2 = tmp_path / "S001_R2.fastq.gz"
+    read1.write_bytes(b"read1")
+    read2.write_bytes(b"read2")
+    run.input_values = {
+        "lc103_amp.read1": str(read1),
+        "lc103_amp.read2": str(read2),
+    }
+    fastq_list = tmp_path / "fastq-list.csv"
+
+    _write_fastq_list(run, fastq_list, _runtime_manifest()["input_adapter"])
+
+    assert fastq_list.read_text(encoding="utf-8") == (
+        f"S001,{read1},{read2}\n"
+    )
+    assert not (tmp_path / "inputs").exists()
+
+
+def test_nextflow_fastq_adapter_merges_ordered_lane_arrays(tmp_path):
+    version = _nextflow_version()
+    run = _nextflow_run(version)
+    read1_paths = []
+    read2_paths = []
+    for lane in (1, 2):
+        read1 = tmp_path / f"S001_L00{lane}_R1.fastq.gz"
+        read2 = tmp_path / f"S001_L00{lane}_R2.fastq.gz"
+        with gzip.open(read1, "wt", encoding="utf-8") as handle:
+            handle.write(f"lane-{lane}-read-1\n")
+        with gzip.open(read2, "wt", encoding="utf-8") as handle:
+            handle.write(f"lane-{lane}-read-2\n")
+        read1_paths.append(str(read1))
+        read2_paths.append(str(read2))
+    run.input_values = {
+        "lc103_amp.read1": read1_paths,
+        "lc103_amp.read2": read2_paths,
+    }
+    fastq_list = tmp_path / "fastq-list.csv"
+
+    _write_fastq_list(run, fastq_list, _runtime_manifest()["input_adapter"])
+
+    row = fastq_list.read_text(encoding="utf-8").strip().split(",")
+    assert row[0] == "S001"
+    assert row[1:] == [
+        str(tmp_path / "inputs/S001_R1.fastq.gz"),
+        str(tmp_path / "inputs/S001_R2.fastq.gz"),
+    ]
+    with gzip.open(row[1], "rt", encoding="utf-8") as handle:
+        assert handle.read() == "lane-1-read-1\nlane-2-read-1\n"
+    with gzip.open(row[2], "rt", encoding="utf-8") as handle:
+        assert handle.read() == "lane-1-read-2\nlane-2-read-2\n"
+
+
+def test_nextflow_fastq_adapter_rejects_mismatched_lane_counts(tmp_path):
+    version = _nextflow_version()
+    run = _nextflow_run(version)
+    read1 = tmp_path / "S001_L001_R1.fastq.gz"
+    read2 = tmp_path / "S001_L001_R2.fastq.gz"
+    read1.write_bytes(b"read1")
+    read2.write_bytes(b"read2")
+    run.input_values = {
+        "lc103_amp.read1": [str(read1), str(read1)],
+        "lc103_amp.read2": [str(read2)],
+    }
+
+    with pytest.raises(RuntimeError, match="重复文件"):
+        _write_fastq_list(
+            run,
+            tmp_path / "fastq-list.csv",
+            _runtime_manifest()["input_adapter"],
+        )
+
+
+def test_nextflow_fastq_adapter_rejects_unequal_lane_arrays(tmp_path):
+    version = _nextflow_version()
+    run = _nextflow_run(version)
+    read1_a = tmp_path / "S001_L001_R1.fastq.gz"
+    read1_b = tmp_path / "S001_L002_R1.fastq.gz"
+    read2 = tmp_path / "S001_L001_R2.fastq.gz"
+    for item in (read1_a, read1_b, read2):
+        item.write_bytes(b"fastq")
+    run.input_values = {
+        "lc103_amp.read1": [str(read1_a), str(read1_b)],
+        "lc103_amp.read2": [str(read2)],
+    }
+
+    with pytest.raises(RuntimeError, match="lane 数量不一致"):
+        _write_fastq_list(
+            run,
+            tmp_path / "fastq-list.csv",
+            _runtime_manifest()["input_adapter"],
+        )
 
 
 def test_nextflow_config_pins_images_and_run_label(tmp_path):

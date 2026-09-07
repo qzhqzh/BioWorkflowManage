@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "BioWorkflowManage Integration API",
-    "version": "1.5.0",
+    "version": "1.6.0",
     "description": "第三方 MES、运营平台、报告系统与 AI Agent 使用的固定分析产品、Task 测试、异步结果导出及资产查询接口。所有写操作均受 Service Token scope、可移植输入引用、幂等键和审计约束。"
   },
   "servers": [{"url": "/api/v1/integration"}],
@@ -40,6 +40,18 @@
         "responses": {
           "200": {"description": "Analysis Product 固定契约", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AnalysisProductVersion"}}}},
           "404": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/rawdata-datasets": {
+      "get": {
+        "operationId": "listReadyRawdataDatasets",
+        "summary": "列出当前受管 rawdata 索引中的可运行双端数据集",
+        "x-required-scope": "analysis:read",
+        "responses": {
+          "200": {"description": "不包含底层 inode 等身份细节的 ready 数据集", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RawdataDatasetList"}}}},
+          "401": {"$ref": "#/components/responses/Error"},
+          "403": {"$ref": "#/components/responses/Error"}
         }
       }
     },
@@ -401,6 +413,41 @@
         "required": ["results"],
         "properties": {
           "results": {"type": "array", "maxItems": 200, "items": {"$ref": "#/components/schemas/AnalysisProductVersion"}}
+        }
+      },
+      "RawdataDatasetFile": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["mate", "name", "relative_path", "size", "modified_at"],
+        "properties": {
+          "mate": {"type": "integer", "enum": [1, 2]},
+          "name": {"type": "string"},
+          "relative_path": {"type": "string"},
+          "size": {"type": "integer", "minimum": 0},
+          "modified_at": {"type": "string", "format": "date-time"}
+        }
+      },
+      "RawdataDataset": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["dataset_id", "name", "directory", "pair_key", "identity_digest", "files"],
+        "properties": {
+          "dataset_id": {"type": "string"},
+          "name": {"type": "string"},
+          "directory": {"type": "string"},
+          "pair_key": {"type": "string"},
+          "identity_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+          "files": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"$ref": "#/components/schemas/RawdataDatasetFile"}}
+        }
+      },
+      "RawdataDatasetList": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["count", "truncated", "results"],
+        "properties": {
+          "count": {"type": "integer", "minimum": 0},
+          "truncated": {"type": "boolean"},
+          "results": {"type": "array", "items": {"$ref": "#/components/schemas/RawdataDataset"}}
         }
       },
       "AnalysisProductRunRef": {
