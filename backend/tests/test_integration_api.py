@@ -47,6 +47,8 @@ from workflows.models import (
     AnalysisProductVersion,
     AnalysisRun,
     InputStagingCoordinator,
+    RawdataDatasetIndex,
+    RawdataScan,
     ServiceAccount,
     ServiceToken,
     SoftwareAsset,
@@ -56,6 +58,7 @@ from workflows.models import (
     WorkflowVersion,
 )
 from workflows.object_inputs import ObjectInputError, stage_run_object_inputs
+from workflows.rawdata_index import rawdata_root_key
 
 
 pytestmark = pytest.mark.usefixtures("auth_disabled")
@@ -520,6 +523,91 @@ def test_manage_analysis_product_publishes_immutable_catalog_contract():
             actor="pytest",
         )
     assert not AnalysisProduct.objects.filter(code="orphan-product").exists()
+
+
+@pytest.mark.django_db
+def test_integration_rawdata_datasets_returns_ready_public_index(
+    integration_workspace,
+):
+    rawdata, _, _ = integration_workspace
+    scan = RawdataScan.objects.create(
+        root_key=rawdata_root_key(rawdata),
+        status=RawdataScan.Status.SUCCEEDED,
+        trigger="manual",
+        actor="pytest",
+        finished_at=timezone.now(),
+    )
+    now = timezone.now()
+    RawdataDatasetIndex.objects.create(
+        root_key=scan.root_key,
+        dataset_id="dataset-ready",
+        pair_key="batch/S001_L001",
+        name="S001",
+        directory="batch",
+        status="ready",
+        files=[
+            {
+                "mate": 1,
+                "name": "S001_L001_R1.fastq.gz",
+                "relative_path": "batch/S001_L001_R1.fastq.gz",
+                "size": 10,
+                "modified_at": now.isoformat(),
+                "identity": {"inode": 123},
+            },
+            {
+                "mate": 2,
+                "name": "S001_L001_R2.fastq.gz",
+                "relative_path": "batch/S001_L001_R2.fastq.gz",
+                "size": 10,
+                "modified_at": now.isoformat(),
+                "identity": {"inode": 124},
+            },
+        ],
+        total_size=20,
+        identity_digest="sha256:" + "1" * 64,
+        first_seen_at=now,
+        last_seen_at=now,
+        last_changed_at=now,
+        last_scan=scan,
+    )
+    RawdataDatasetIndex.objects.create(
+        root_key=scan.root_key,
+        dataset_id="dataset-issue",
+        pair_key="batch/BROKEN",
+        name="BROKEN",
+        directory="batch",
+        status="issue",
+        files=[],
+        total_size=0,
+        identity_digest="sha256:" + "2" * 64,
+        first_seen_at=now,
+        last_seen_at=now,
+        last_changed_at=now,
+        last_scan=scan,
+    )
+    _, _, _, client = _token_client(scopes=["analysis:read"])
+
+    response = client.get("/api/v1/integration/rawdata-datasets")
+
+    assert response.status_code == 200
+    assert response.data["count"] == 1
+    assert response.data["truncated"] is False
+    assert response.data["results"][0]["dataset_id"] == "dataset-ready"
+    assert [item["mate"] for item in response.data["results"][0]["files"]] == [
+        1,
+        2,
+    ]
+    assert "identity" not in response.data["results"][0]["files"][0]
+
+
+@pytest.mark.django_db
+def test_integration_rawdata_datasets_requires_analysis_read_scope():
+    _, _, _, client = _token_client(scopes=["workflow:read"])
+
+    response = client.get("/api/v1/integration/rawdata-datasets")
+
+    assert response.status_code == 403
+    assert response.data["error"]["code"] == "SERVICE_SCOPE_REQUIRED"
 
 
 @pytest.mark.django_db

@@ -28,6 +28,7 @@ from .object_inputs import stage_run_object_inputs, verify_run_object_inputs
 NEXTFLOW_VERSION_PATTERN = re.compile(r"\bversion\s+([0-9]+\.[0-9]+\.[0-9]+)\b")
 SAFE_TASK_NAME_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
 SAFE_EXECUTION_PATH_PATTERN = re.compile(r"^[A-Za-z0-9_./:@+=-]+$")
+MAX_FASTQ_LANES = 32
 
 
 def _groovy_string(value: str) -> str:
@@ -134,16 +135,43 @@ def _managed_database_path(relative_path: str) -> Path:
     return execution_path
 
 
-def _input_value(run: AnalysisRun, port_name: str) -> str:
+def _input_values(run: AnalysisRun, port_name: str) -> list[str]:
     key = f"{run.workflow_name}.{port_name}"
     value = run.input_values.get(key)
-    if not isinstance(value, str) or not value:
+    values = [value] if isinstance(value, str) else value
+    if not isinstance(values, list) or not values:
         raise RuntimeError(f"Nextflow 运行输入缺少 {port_name}。")
-    if not SAFE_EXECUTION_PATH_PATTERN.fullmatch(value):
-        raise RuntimeError(f"Nextflow 运行输入路径包含不支持的字符：{port_name}。")
-    if not Path(value).is_file():
-        raise RuntimeError(f"Nextflow 运行输入文件不存在：{port_name}。")
-    return value
+    if len(values) > MAX_FASTQ_LANES:
+        raise RuntimeError(
+            f"Nextflow 运行输入 {port_name} 最多支持 {MAX_FASTQ_LANES} 个 lane。"
+        )
+    for item in values:
+        if not isinstance(item, str) or not item:
+            raise RuntimeError(f"Nextflow 运行输入 {port_name} 包含无效路径。")
+        if not SAFE_EXECUTION_PATH_PATTERN.fullmatch(item):
+            raise RuntimeError(
+                f"Nextflow 运行输入路径包含不支持的字符：{port_name}。"
+            )
+        if not Path(item).is_file():
+            raise RuntimeError(f"Nextflow 运行输入文件不存在：{port_name}。")
+    if len(set(values)) != len(values):
+        raise RuntimeError(f"Nextflow 运行输入包含重复文件：{port_name}。")
+    return values
+
+
+def _merge_fastq_lanes(paths: list[str], destination: Path) -> str:
+    destination.parent.mkdir(mode=0o700, exist_ok=True)
+    partial = destination.with_suffix(destination.suffix + ".partial")
+    try:
+        with partial.open("xb") as target:
+            for source_path in paths:
+                with Path(source_path).open("rb") as source:
+                    shutil.copyfileobj(source, target)
+        partial.replace(destination)
+    except Exception:
+        partial.unlink(missing_ok=True)
+        raise
+    return str(destination)
 
 
 def _write_fastq_list(
@@ -154,8 +182,22 @@ def _write_fastq_list(
     sample_id = SAFE_TASK_NAME_PATTERN.sub("_", run.sample_id).strip("._-")
     if not sample_id:
         raise RuntimeError("Nextflow 样本编号无法转换为安全任务名。")
-    read1 = _input_value(run, str(adapter["read1"]))
-    read2 = _input_value(run, str(adapter["read2"]))
+    read1_values = _input_values(run, str(adapter["read1"]))
+    read2_values = _input_values(run, str(adapter["read2"]))
+    if len(read1_values) != len(read2_values):
+        raise RuntimeError("Nextflow 运行输入的 R1/R2 lane 数量不一致。")
+    if len(read1_values) == 1:
+        read1, read2 = read1_values[0], read2_values[0]
+    else:
+        inputs_directory = path.parent / "inputs"
+        read1 = _merge_fastq_lanes(
+            read1_values,
+            inputs_directory / f"{sample_id}_R1.fastq.gz",
+        )
+        read2 = _merge_fastq_lanes(
+            read2_values,
+            inputs_directory / f"{sample_id}_R2.fastq.gz",
+        )
     path.write_text(f"{sample_id},{read1},{read2}\n", encoding="utf-8")
 
 

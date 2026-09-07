@@ -11,7 +11,7 @@
     "code": "lc103-amp",
     "name": "LC103 AMP",
     "description": "LC103 扩增子测序质控与变异分析。",
-    "contract_version": "1.1.0"
+    "contract_version": "1.2.0"
   },
   "source": {
     "repository": "ssh://git@gitea.kindstarzhenyuan.cn/qilixing/amp_pipeline.git",
@@ -197,19 +197,19 @@
     ]
   },
   "interface_contract": {
-    "contract_version": "1.0.0",
+    "contract_version": "1.1.0",
     "inputs": [
       {
         "name": "read1",
         "label": "FASTQ R1",
-        "wdl_type": "File",
+        "wdl_type": "Array[File]",
         "semantic_type": "bio.fastq.gz.r1",
         "required": true
       },
       {
         "name": "read2",
         "label": "FASTQ R2",
-        "wdl_type": "File",
+        "wdl_type": "Array[File]",
         "semantic_type": "bio.fastq.gz.r2",
         "required": true
       }
