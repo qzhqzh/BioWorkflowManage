@@ -5,7 +5,7 @@
 - 流程：`01_amp_pipeline.nf`
 - Panel：`LC103`
 - 输入：一对受管 FASTQ（R1/R2）
-- 输出：QC Excel、过滤后变异 TSV
+- 输出：QC Excel、过滤后变异 TSV、OKBOX QC 展示 TSV、OKBOX 变异展示 TSV
 - 外部调用：复用 Integration API / Analysis Product
 - 前端：首期不实现
 
@@ -48,7 +48,7 @@ docker compose --profile nextflow-runtime run --rm --no-deps \
 - Nextflow 25.04.8；
 - LC103 固定参数；
 - 任务容器 `repo@sha256`；
-- 输入适配器与输出 glob。
+- 输入适配器与四类输出 glob。
 
 生产环境若启用 `INTEGRATION_REQUIRE_SIGNED_WORKFLOW_PACKAGE=1`，必须先对新建的 `WorkflowVersion` 完成现有 Sigstore attestation，再用 `manage_analysis_product` 发布产品版本。不要为绕过校验伪造 bundled attestation。
 
@@ -102,7 +102,7 @@ docker compose config --quiet
 - okbox 预检与提交不包含执行引擎选择；
 - MiniWDL worker 不领取 Nextflow 任务；
 - 取消后没有保留带本次运行 label 的容器；
-- QC Excel 与变异 TSV 均进入带 sha256 的输出清单；
+- QC Excel、汇总变异 TSV、QC 展示 TSV 与变异展示 TSV 均进入带 sha256 的输出清单；
 - 重跑创建新任务且原任务证据不变。
 
 ## OKB 联合部署

@@ -20,7 +20,7 @@ Nextflow 与 MiniWDL 不是可互换的流程语言或运行器。二者可以�
 4. MiniWDL worker 默认只领取 `miniwdl` 任务；Nextflow worker 必须通过 `--engine nextflow` 显式领取，避免运行时依赖混装和错误抢占。
 5. Nextflow 使用独立镜像层，固定 Java 17+ 运行环境（当前镜像为 Java 21）、Nextflow 25.04.8 与任务容器的 `repo@sha256`。API 容器不安装 Java/Nextflow。
 6. Nextflow worker 只连接独立的 TLS Docker-in-Docker daemon，不挂载宿主 Docker socket；运行目录、数据库目录在 worker 与隔离 daemon 中使用相同绝对路径。任务容器带运行 ID label，取消或租约失效时只清理由该 label 且挂载当前运行目录的容器。
-7. 首期只启用 `paired_fastq_csv` 输入适配器和 LC103 的两个受管输出：QC Excel、过滤后变异 TSV。自动 `-resume` 不启用；失败重跑仍创建新的 `AnalysisRun`。
+7. 首期只启用 `paired_fastq_csv` 输入适配器和 LC103 的四个受管输出：QC Excel、过滤后变异 TSV，以及供 OKBOX 结构化导入的 QC/变异展示 TSV。自动 `-resume` 不启用；失败重跑仍创建新的 `AnalysisRun`。
 8. Nextflow 子进程使用环境变量白名单，不继承数据库口令、Django 密钥或对象存储配置；固定包中的 `nextflow.config` 不参与运行，参数与执行策略全部由平台生成。
 
 ## 被否决方案

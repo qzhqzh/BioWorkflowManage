@@ -69,6 +69,16 @@ def _runtime_manifest() -> dict:
                 "glob": "reportResults/*variants.tsv",
                 "required": True,
             },
+            {
+                "name": "qc_display",
+                "glob": "html_results/*/*_show_qc.tsv",
+                "required": True,
+            },
+            {
+                "name": "variant_display",
+                "glob": "html_results/*/*_show_variant.tsv",
+                "required": True,
+            },
         ],
     }
 
@@ -82,6 +92,8 @@ def _nextflow_version(*, slug: str = "lc103-nextflow") -> WorkflowVersion:
             {"id": "read2", "type": "workflow_input"},
             {"id": "qc_report", "type": "workflow_output"},
             {"id": "variants", "type": "workflow_output"},
+            {"id": "qc_display", "type": "workflow_output"},
+            {"id": "variant_display", "type": "workflow_output"},
         ],
         "edges": [],
     }
@@ -111,6 +123,18 @@ def _nextflow_version(*, slug: str = "lc103-nextflow") -> WorkflowVersion:
                 "name": "variants",
                 "wdl_type": "File",
                 "semantic_type": "report.variants_tsv",
+                "required": True,
+            },
+            {
+                "name": "qc_display",
+                "wdl_type": "File",
+                "semantic_type": "report.qc_tsv",
+                "required": True,
+            },
+            {
+                "name": "variant_display",
+                "wdl_type": "File",
+                "semantic_type": "report.snv_tsv",
                 "required": True,
             },
         ],
@@ -154,6 +178,8 @@ def _nextflow_run(version: WorkflowVersion, *, sample_id: str = "S001") -> Analy
             "integration_output_contract": [
                 {"name": "qc_report", "wdl_type": "File"},
                 {"name": "variants", "wdl_type": "File"},
+                {"name": "qc_display", "wdl_type": "File"},
+                {"name": "variant_display", "wdl_type": "File"},
             ]
         },
     )
@@ -174,7 +200,7 @@ def test_nextflow_snapshot_requires_digest_pinned_container():
             NEXTFLOW,
             bundle,
             runtime_manifest,
-            output_names={"qc_report", "variants"},
+            output_names={"qc_report", "variants", "qc_display", "variant_display"},
         )
 
 
@@ -193,7 +219,7 @@ def test_nextflow_snapshot_requires_phase_one_engine_version():
             NEXTFLOW,
             bundle,
             runtime_manifest,
-            output_names={"qc_report", "variants"},
+            output_names={"qc_report", "variants", "qc_display", "variant_display"},
         )
 
 
@@ -379,12 +405,21 @@ def test_nextflow_output_collection_uses_contract_keys(tmp_path, settings):
         "CHROM\tPOS\n",
         encoding="utf-8",
     )
+    display = results.parent / "html_results/S001"
+    display.mkdir(parents=True)
+    (display / "S001_show_qc.tsv").write_text("Total Reads\t1\n", encoding="utf-8")
+    (display / "S001_show_variant.tsv").write_text(
+        "CHROM\tPOS\n",
+        encoding="utf-8",
+    )
 
     result = _collect_outputs(run, results.parent, version.runtime_manifest)
 
     assert set(result["outputs"]) == {
         "lc103_amp.qc_report",
         "lc103_amp.variants",
+        "lc103_amp.qc_display",
+        "lc103_amp.variant_display",
     }
     assert result["outputs"]["lc103_amp.qc_report"].endswith("S001.QC.xlsx")
 
@@ -460,6 +495,16 @@ def test_import_nextflow_product_is_idempotent(tmp_path, settings):
                     "name": "variants",
                     "wdl_type": "File",
                     "semantic_type": "report.variants_tsv",
+                },
+                {
+                    "name": "qc_display",
+                    "wdl_type": "File",
+                    "semantic_type": "report.qc_tsv",
+                },
+                {
+                    "name": "variant_display",
+                    "wdl_type": "File",
+                    "semantic_type": "report.snv_tsv",
                 },
             ],
         },
