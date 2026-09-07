@@ -1416,6 +1416,7 @@ def _workflow_version_payload(
         "description": workflow_version.description,
         "kind": workflow_version.kind,
         "semantic_digest": workflow_version.semantic_digest,
+        "execution_engine": workflow_version.execution_engine,
         "interface_contract": workflow_version.interface_contract,
         "subworkflow_references": workflow_version.subworkflow_references,
         "created_at": workflow_version.created_at.isoformat(),
@@ -1429,6 +1430,7 @@ def _workflow_version_payload(
                 "compiled_bundle": workflow_version.compiled_bundle,
                 "compiled_digest": workflow_version.compiled_digest,
                 "compiler_profile": workflow_version.compiler_profile,
+                "runtime_manifest": workflow_version.runtime_manifest,
             }
         )
     return payload

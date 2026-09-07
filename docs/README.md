@@ -24,6 +24,7 @@
 18. [稳定版本发布与升级](18-stable-release.md)
 19. [Analysis Node 独立交付与第三方部署](19-analysis-node-deployment.md)
 20. [Reference Connector 与 MES 兼容性套件](20-reference-connector.md)
+21. [Nextflow LC103 Analysis Product](21-nextflow-lc103.md)
 
 ## Architecture Decision Records
 
@@ -31,6 +32,7 @@
 - [ADR 0002：双层类型系统](adr/0002-dual-type-system.md)
 - [ADR 0003：Workflow Graph 语义规范化](adr/0003-semantic-canonicalization.md)
 - [ADR 0004：Stateless Compiler First](adr/0004-stateless-compiler-first.md)
+- [ADR 0005：共享任务控制面与显式执行引擎适配器](adr/0005-multi-engine-analysis-runtime.md)
 
 ## 机器可读契约
 

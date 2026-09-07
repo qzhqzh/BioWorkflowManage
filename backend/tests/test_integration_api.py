@@ -604,6 +604,8 @@ def test_analysis_product_preflight_and_submission_pin_contract(
     assert run.analysis_product_version == product_version
     assert run.workflow_version == version
     assert run.source_digest == version.compiled_digest
+    assert run.execution_engine == version.execution_engine
+    assert run.runtime_manifest == version.runtime_manifest
     assert run.request_payload["analysis_product"] == {
         "analysis_code": "dna-panel",
         "contract_version": "1.0.0",
@@ -628,6 +630,8 @@ def test_analysis_product_preflight_and_submission_pin_contract(
     assert retried.status_code == 201, retried.data
     retry = AnalysisRun.objects.get(pk=retried.data["id"])
     assert retry.analysis_product_version == product_version
+    assert retry.execution_engine == run.execution_engine
+    assert retry.runtime_manifest == run.runtime_manifest
     assert retried.data["analysis_product"]["contract_digest"] == (
         product_version.contract_digest
     )
@@ -665,6 +669,23 @@ def test_analysis_product_preflight_and_submission_pin_contract(
     )
     assert response.status_code == 400
     assert response.data["error"]["code"] == "ANALYSIS_SOURCE_CONFLICT"
+
+
+@pytest.mark.django_db
+def test_submission_cannot_override_execution_engine(integration_workspace):
+    _, _, _, client = _token_client()
+    version = _workflow_version()
+    body = _submission(version)
+    body["execution_engine"] = "nextflow"
+
+    response = client.post(
+        "/api/v1/integration/analysis-runs/preflight",
+        body,
+        format="json",
+    )
+
+    assert response.status_code == 400
+    assert response.data["error"]["code"] == "EXECUTION_ENGINE_MANAGED"
 
 
 @pytest.mark.django_db
@@ -1062,6 +1083,57 @@ def test_service_account_token_rotation_does_not_reactivate_disabled_account():
     )
     account.refresh_from_db()
     assert account.is_active is True
+
+
+@pytest.mark.django_db
+def test_service_account_can_write_token_to_new_private_file(tmp_path):
+    token_file = tmp_path / "okb-service-token"
+    output = StringIO()
+
+    call_command(
+        "manage_service_account",
+        client_id="okb",
+        name="OKB",
+        scope=[
+            "workflow:read",
+            "analysis:submit",
+            "analysis:read",
+            "analysis:download",
+            "analysis:cancel",
+        ],
+        issue_token=True,
+        token_output_file=str(token_file),
+        actor="pytest",
+        stdout=output,
+    )
+
+    raw_token = token_file.read_text(encoding="utf-8").strip()
+    assert raw_token
+    assert raw_token not in output.getvalue()
+    assert "TOKEN_FILE_WRITTEN=1" in output.getvalue()
+    assert token_file.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.django_db
+def test_service_account_revokes_new_token_when_output_file_exists(tmp_path):
+    token_file = tmp_path / "existing-token"
+    token_file.write_text("keep-existing\n", encoding="utf-8")
+
+    with pytest.raises(CommandError, match="已吊销"):
+        call_command(
+            "manage_service_account",
+            client_id="okb",
+            name="OKB",
+            scope=["workflow:read"],
+            issue_token=True,
+            token_output_file=str(token_file),
+            actor="pytest",
+            stdout=StringIO(),
+        )
+
+    token = ServiceToken.objects.get(service_account__client_id="okb")
+    assert token.revoked_at is not None
+    assert token_file.read_text(encoding="utf-8") == "keep-existing\n"
 
 
 @pytest.mark.django_db

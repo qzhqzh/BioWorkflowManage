@@ -636,6 +636,7 @@ def tool_run_payload(
 ) -> dict[str, Any]:
     payload = {
         "id": str(run.id),
+        "execution_engine": run.execution_engine,
         "tool": {
             "id": run.tool_version.tool_id,
             "version": run.tool_version.version,
