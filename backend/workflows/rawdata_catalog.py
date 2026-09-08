@@ -62,6 +62,7 @@ def _file_payload(path: Path, root: Path, mate: int | None = None) -> dict[str, 
         "identity": {
             "size": size,
             "mtime_ns": stat.st_mtime_ns,
+            "ctime_ns": stat.st_ctime_ns,
             "device": stat.st_dev,
             "inode": stat.st_ino,
         },

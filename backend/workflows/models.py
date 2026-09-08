@@ -1170,6 +1170,24 @@ class RawdataScan(models.Model):
         ]
 
 
+class RawdataBatchReadiness(models.Model):
+    """批次完成标记的持久基线；同一代次发生变化后不得自行恢复。"""
+
+    root_key = models.CharField(max_length=80)
+    directory = models.CharField(max_length=1024)
+    generation = models.CharField(max_length=80)
+    inventory_digest = models.CharField(max_length=80)
+    changed = models.BooleanField(default=False)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["root_key", "directory"], name="unique_rawdata_batch_readiness"
+            )
+        ]
+
+
 class RawdataDatasetIndex(models.Model):
     root_key = models.CharField(max_length=80, db_index=True)
     dataset_id = models.CharField(max_length=64)
