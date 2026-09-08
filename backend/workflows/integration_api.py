@@ -83,7 +83,8 @@ from .models import (
     WorkflowDocument,
     WorkflowVersion,
 )
-from .rawdata_index import rawdata_root_key
+from .rawdata_index import indexed_rawdata_catalog, rawdata_root_key
+from .rawdata_readiness import rawdata_readiness, readiness_context, verify_readiness_snapshot
 from .object_inputs import (
     lock_input_staging_coordinator_for_manifest,
     ObjectHeadBudget,
@@ -1747,6 +1748,15 @@ def _preflight_workflow(
         snapshot_budget=snapshot_budget,
         client_id=client_id,
     )
+    if "rawdata_readiness" in body:
+        try:
+            manifests["rawdata_readiness"] = verify_readiness_snapshot(
+                body["rawdata_readiness"], manifests.get("input_resource_manifest")
+            )
+        except ValueError as error:
+            raise IntegrationAPIError(
+                "RAWDATA_NOT_READY", str(error), category="input"
+            ) from error
     declared = _declared_resources(version, snapshot_budget=snapshot_budget)
     catalog = _catalog_resources(
         version,
@@ -2078,15 +2088,19 @@ def integration_analysis_products(request):
 @permission_classes([IntegrationScopePermission])
 def integration_rawdata_datasets(request):
     limit = max(1, int(settings.RAWDATA_SCAN_MAX_FILES) // 2)
+    include_unready = request.query_params.get("include_unready") == "true"
     queryset = RawdataDatasetIndex.objects.filter(
         root_key=rawdata_root_key(),
         active=True,
-        status="ready",
     ).order_by("directory", "name", "pair_key")
+    if not include_unready:
+        queryset = queryset.filter(status="ready")
     total = queryset.count()
     datasets = list(queryset[:limit])
+    context = readiness_context() if include_unready else None
     return Response(
         {
+            **({"index": indexed_rawdata_catalog()["index"]} if include_unready else {}),
             "count": total,
             "truncated": total > limit,
             "results": [
@@ -2096,6 +2110,13 @@ def integration_rawdata_datasets(request):
                     "directory": item.directory,
                     "pair_key": item.pair_key,
                     "identity_digest": item.identity_digest,
+                    **({
+                        "status": item.status,
+                        "issues": item.issues,
+                        "readiness": rawdata_readiness([
+                            file_item["relative_path"] for file_item in item.files
+                        ], context=context),
+                    } if include_unready else {}),
                     "files": [
                         {
                             key: file_item.get(key)
@@ -2114,6 +2135,26 @@ def integration_rawdata_datasets(request):
             ],
         }
     )
+
+
+@require_service_scopes("analysis:read")
+@api_view(["POST"])
+@permission_classes([IntegrationScopePermission])
+def integration_rawdata_readiness(request):
+    if isinstance(request.data, dict) and "datasets" in request.data:
+        datasets = request.data["datasets"]
+        if not isinstance(datasets, list) or len(datasets) > 100 or any(
+            not isinstance(item, dict) or not isinstance(item.get("key"), str)
+            or not item["key"] or len(item["key"]) > 128 for item in datasets
+        ) or len({item["key"] for item in datasets}) != len(datasets):
+            return Response({"error": {"code": "RAWDATA_REQUEST_INVALID", "message": "datasets 必须为至多 100 项、key 不重复的请求列表。"}}, status=400)
+        context = readiness_context()
+        return Response({"results": [
+            {"key": item["key"], **rawdata_readiness(item.get("files"), context=context)}
+            for item in datasets
+        ]})
+    files = request.data.get("files") if isinstance(request.data, dict) else None
+    return Response(rawdata_readiness(files))
 
 
 @require_service_scopes("workflow:read")

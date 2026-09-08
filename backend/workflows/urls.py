@@ -62,6 +62,10 @@ urlpatterns = [
         integration_api.integration_rawdata_datasets,
     ),
     path(
+        "integration/rawdata-datasets/readiness",
+        integration_api.integration_rawdata_readiness,
+    ),
+    path(
         "integration/workflow-versions",
         integration_api.integration_workflow_versions,
     ),

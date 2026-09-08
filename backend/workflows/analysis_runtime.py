@@ -870,6 +870,15 @@ def _verify_run_resource_manifests(
     snapshot_budget: ResourceSnapshotBudget | None = None,
 ) -> None:
     payload = run.request_payload
+    if "rawdata_readiness" in payload:
+        from .rawdata_readiness import verify_readiness_snapshot
+
+        # 排队可长于索引 TTL；执行仍实时复验文件/标记，不因 TTL 取消合法任务。
+        verify_readiness_snapshot(
+            payload["rawdata_readiness"],
+            payload.get("input_resource_manifest"),
+            require_fresh_index=False,
+        )
     object_manifest_items(payload.get("input_resource_manifest"))
     _verify_manifest_files(
         payload.get("input_resource_manifest"),

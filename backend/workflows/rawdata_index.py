@@ -135,6 +135,9 @@ def _apply_catalog(scan: RawdataScan, catalog: dict[str, Any]) -> None:
 
     if catalog.get("root_status") != "ready" or catalog.get("scan_limited"):
         return
+    from .rawdata_readiness import observe_indexed_batches
+
+    observe_indexed_batches(scan.root_key, catalog.get("datasets", []))
     missing = list(
         RawdataDatasetIndex.objects.select_for_update()
         .filter(root_key=scan.root_key, active=True)
