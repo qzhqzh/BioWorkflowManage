@@ -2,19 +2,40 @@
 
 ## 本地运行
 
-复制环境变量并启动整套服务：
+首次部署时，在项目根目录复制环境变量模板；已有 `.env` 时不要覆盖：
 
 ```bash
 cp .env.example .env
+```
+
+编辑同目录的 `.env`（隐藏文件，可用 `ls -la .env` 查看）。
+[`.env.example`](.env.example) 已分为 **A：部署时常用、需要确认** 和
+**B：高级配置、通常保持默认** 两部分：先填写数据库密码、应用密钥，确认访问地址、
+HTTP/HTTPS、数据目录及 miniwdl 运行条件；未使用的回调、对象存储和 Nextflow 配置可保持默认。
+修改模板不会自动更新已有 `.env`。
+
+直接使用可信内网 HTTP 时，将 `.env` 中 `DJANGO_SESSION_COOKIE_SECURE` 和
+`DJANGO_CSRF_COOKIE_SECURE` 都设为 `0`，否则登录 Cookie 不可用；HTTP 不加密凭据，
+正式环境建议使用 HTTPS 并保留两项为 `1`。不要关闭认证来解决登录问题。
+使用新的 IP / 域名时，同时按模板注释配置 `DJANGO_ALLOWED_HOSTS` 与
+`DJANGO_CSRF_TRUSTED_ORIGINS`。
+
+配置完成后启动网页、API 和后台辅助服务：
+
+```bash
 docker compose up -d --build
 ```
+
+实际运行 miniwdl 流程还需选择并启动执行 profile，见
+[miniwdl 执行说明](docs/12-miniwdl-execution.md)。宿主 Docker 模式另有
+[`.env.host.example`](.env.host.example) 路径模板；不要用它覆盖已有配置。
 
 浏览器访问 `http://localhost:8082`。局域网设备使用
 `http://<运行服务的电脑局域网 IP>:8082`。API 健康检查位于
 `/api/v1/health`。
 
 PostgreSQL 数据通过 bind mount 保存在 `./data/postgres`；停止或重建容器不会删除数据。
-生产环境必须修改 `.env` 中的数据库密码和 `DJANGO_SECRET_KEY`。
+首次部署必须自行设置 `.env` 中的数据库密码和 `DJANGO_SECRET_KEY`；已有部署升级时保留这些值。
 
 BioWorkflowManage 是面向生物信息学流程工程化的可视化 Workflow 编译平台。
 
