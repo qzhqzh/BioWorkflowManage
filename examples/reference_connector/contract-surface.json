@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "openapi_version": "1.6.0",
+  "openapi_version": "1.7.0",
   "parameters": [
     "IdempotencyKey",
     "RequestId",
@@ -84,5 +84,5 @@
     "analysisRunTerminal",
     "artifactExportCompleted"
   ],
-  "projection_digest": "sha256:e069f895e671aa2c4abbd7ea893aa887d9c6f3777cc80f75ab9f9d3f430398bd"
+  "projection_digest": "sha256:b936a562beb6c58edfe629b74050342c473bc0d3007a8bd0d479a6277f172608"
 }

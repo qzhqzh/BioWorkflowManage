@@ -1,6 +1,9 @@
 # BioWorkflowManage 文档索引
 
-本目录是项目开发的规范来源。第一阶段开发应以这里的需求、Schema、ADR 和验收标准为准，而不是以前端临时对象、数据库字段或生成后的 WDL 反推模型。
+本目录是项目开发的规范来源。编译器基础以需求、Schema、ADR 和验收标准为准，而不是以前端临时对象、数据库字段或生成后的 WDL 反推模型。分析底座的日常公共接口变更以第 22 章兼容约定及第 14 章/OpenAPI 为准，不以历史 Phase 1 或稳定发布范围限制当前开发。
+
+业务系统或 AI 接入优先阅读 [分析服务接入指南与契约](23-analysis-service-integration-guide.md)：
+它同时规定调用方式和双方责任；字段查 OpenAPI，平台维护者的变更流程查第 22 章。
 
 ## 第一阶段核心文档
 
@@ -25,6 +28,8 @@
 19. [Analysis Node 独立交付与第三方部署](19-analysis-node-deployment.md)
 20. [Reference Connector 与 MES 兼容性套件](20-reference-connector.md)
 21. [Nextflow LC103 Analysis Product](21-nextflow-lc103.md)
+22. [平台契约与兼容开发约定](22-integration-contract-governance.md)
+23. [分析服务接入指南与契约](23-analysis-service-integration-guide.md)
 
 ## Architecture Decision Records
 
@@ -42,6 +47,7 @@
 - [`schemas/validation-report.schema.json`](../schemas/validation-report.schema.json)
 - [`schemas/error-catalog.json`](../schemas/error-catalog.json)
 - [`schemas/integration-openapi-v1.json`](../schemas/integration-openapi-v1.json)
+- [只增不改的 Integration API 历史基线](../schemas/compatibility/README.md)
 
 这些文件是前端表单、后端 Pydantic 模型、编译器校验和 CI 的共同契约。
 
@@ -100,3 +106,5 @@ GitHub Actions 配置：`.github/workflows/validate-contracts.yml`。
 在 Phase 1 编译规范之外，项目已补充认证、执行调度、历史 WDL、第三方 Integration API
 与受限 AI Agent MCP、WDL 多人协作、原始数据后台索引和稳定发布治理；对应运行边界以
 第 12 至 20 章为准。
+
+跨项目持续开发与向后兼容以第 22 章为准；软件 Release 与部署是独立动作，不是形成契约的前置条件。

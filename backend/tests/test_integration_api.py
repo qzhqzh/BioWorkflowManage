@@ -4,6 +4,7 @@ import gzip
 import hashlib
 import json
 import os
+import re
 import time
 import uuid
 from datetime import timedelta
@@ -3010,36 +3011,21 @@ def test_mcp_analysis_product_discovery_and_submission():
 
 @pytest.mark.django_db
 def test_openapi_contract_covers_every_integration_route():
+    from workflows.urls import urlpatterns
+
     payload = json.loads(
         (Path(__file__).parents[2] / "schemas" / "integration-openapi-v1.json").read_text(
             encoding="utf-8"
         )
     )
     paths = payload["paths"]
-    assert {
-        "/openapi",
-        "/analysis-products",
-        "/analysis-products/{analysis_code}/versions/{contract_version}",
-        "/workflow-versions",
-        "/workflow-versions/{version_id}",
-        "/analysis-runs/preflight",
-        "/analysis-runs",
-        "/analysis-runs/by-external-ref",
-        "/analysis-runs/batch-status",
-        "/analysis-runs/{run_id}",
-        "/analysis-runs/{run_id}/events",
-        "/analysis-runs/{run_id}/cancel",
-        "/analysis-runs/{run_id}/retry",
-        "/analysis-runs/{run_id}/outputs",
-        "/analysis-runs/{run_id}/outputs/download",
-        "/analysis-runs/{run_id}/artifact-exports",
-        "/artifact-exports/{export_id}",
-        "/artifact-exports/{export_id}/acknowledge",
-        "/tool-test-runs/preflight",
-        "/tool-test-runs",
-        "/tools",
-        "/software",
-    } <= set(paths)
+    routes = {
+        "/" + re.sub(r"<(?:[^:>]+:)?([^>]+)>", r"{\1}", str(item.pattern)[len("integration/"):])
+        for item in urlpatterns
+        if str(item.pattern).startswith("integration/")
+    }
+    # Discover actual routes; a hand-maintained subset previously missed readiness.
+    assert routes == set(paths)
     workflow_ref = payload["components"]["schemas"]["WorkflowVersionRef"]
     assert workflow_ref.get("additionalProperties", True) is not False
     input_reference = payload["components"]["schemas"]["InputReference"]

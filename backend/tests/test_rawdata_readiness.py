@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import json
 import os
 import time
 from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 from django.utils import timezone
+from jsonschema import Draft202012Validator
 
 from workflows.analysis_runtime import _verify_run_resource_manifests
 from workflows.models import RawdataBatchReadiness, RawdataScan
@@ -18,6 +21,23 @@ from test_integration_api import integration_workspace as integration_workspace
 from test_rawdata_catalog import _finish_index
 
 pytestmark = [pytest.mark.django_db, pytest.mark.usefixtures("auth_disabled")]
+
+
+@pytest.fixture
+def validate_response():
+    contract = json.loads(
+        (Path(__file__).resolve().parents[2] / "schemas/integration-openapi-v1.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    def validate(response, path, method="get"):
+        schema = contract["paths"][path][method]["responses"][str(response.status_code)][
+            "content"
+        ]["application/json"]["schema"]
+        Draft202012Validator({**schema, "components": contract["components"]}).validate(response.data)
+
+    return validate
 
 
 @pytest.fixture
@@ -174,15 +194,19 @@ def test_worker_uses_frozen_index_key_with_different_mount(batch, settings, monk
         verify_readiness_snapshot(snapshot, manifest, require_fresh_index=False)
 
 
-def test_readiness_api_batch_and_legacy_catalog(batch, settings):
+def test_readiness_api_batch_and_legacy_catalog(batch, settings, validate_response):
     root, directory, files = batch
     _finish_index(settings, root)
     _, _, _, client = _token_client(scopes=["analysis:read"])
     old = client.get("/api/v1/integration/rawdata-datasets")
     assert old.status_code == 200 and old.data["count"] == 1
     assert "readiness" not in old.data["results"][0]
+    assert "index" not in old.data
+    validate_response(old, "/rawdata-datasets")
+    assert client.get("/api/v1/integration/rawdata-datasets?include_unready=false").data == old.data
     extended = client.get("/api/v1/integration/rawdata-datasets?include_unready=true")
     assert extended.data["results"][0]["readiness"]["status"] == "waiting"
+    validate_response(extended, "/rawdata-datasets")
     response = client.post(
         "/api/v1/integration/rawdata-datasets/readiness",
         {"datasets": [{"key": "one", "files": files}, {"key": "two", "files": []}]},
@@ -193,14 +217,37 @@ def test_readiness_api_batch_and_legacy_catalog(batch, settings):
         "waiting",
         "unbound",
     ]
-    assert (
-        client.post(
-            "/api/v1/integration/rawdata-datasets/readiness",
-            {"datasets": [{"key": "one", "files": files}] * 2},
-            format="json",
-        ).status_code
-        == 400
+    validate_response(response, "/rawdata-datasets/readiness", "post")
+    invalid = client.post(
+        "/api/v1/integration/rawdata-datasets/readiness",
+        {"datasets": [{"key": "one", "files": files}] * 2},
+        format="json",
     )
+    assert invalid.status_code == 400
+    validate_response(invalid, "/rawdata-datasets/readiness", "post")
+
+
+def test_ready_snapshot_and_unready_datasets_match_openapi(batch, settings, validate_response):
+    root, directory, files = batch
+    (directory / "_READY.done").touch()
+    _finish_index(settings, root)
+    _, _, _, client = _token_client(scopes=["analysis:read"])
+    ready = client.post(
+        "/api/v1/integration/rawdata-datasets/readiness", {"files": files}, format="json"
+    )
+    assert ready.status_code == 200 and ready.data["submission_allowed"] is True
+    assert ready.data["snapshot"]["root_key"].startswith("sha256:")
+    validate_response(ready, "/rawdata-datasets/readiness", "post")
+    # A partially copied pair remains discoverable only in the opt-in representation.
+    (directory / "OTHER_R1.fastq.gz").write_bytes(b"reads")
+    _finish_index(settings, root)
+    old = client.get("/api/v1/integration/rawdata-datasets")
+    assert old.data["count"] == 1
+    validate_response(old, "/rawdata-datasets")
+    extended = client.get("/api/v1/integration/rawdata-datasets?include_unready=true")
+    assert extended.data["count"] == 2
+    assert any(item["status"] == "issue" for item in extended.data["results"])
+    validate_response(extended, "/rawdata-datasets")
 
 
 def test_batch_request_reuses_directory_observation_only_within_request(
