@@ -287,6 +287,10 @@ Reference Connector 在首个订单提交前还会读取 `/openapi`，确认运�
 operations、parameters、schemas、webhooks 和规范投影摘要。`scripts/validate_contracts.py` 会在 CI
 中重新计算投影；接口变更未同步 Connector 时直接失败。
 
+这个投影是参考客户端的依赖检查，不是整个分析平台兼容性的定义。平台对所有接入方的共同承诺见
+[分析服务接入指南与契约](23-analysis-service-integration-guide.md)，历史基线和变更流程见
+[兼容开发约定](22-integration-contract-governance.md)。同步客户端投影不能代替保护旧平台契约。
+
 兼容性套件覆盖：
 
 - 相同订单重复提交只创建一个 AnalysisRun；

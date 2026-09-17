@@ -1,0 +1,10 @@
+{
+  "analysis_product": {
+    "analysis_code": "lc103-amp",
+    "contract_version": "1.2.0"
+  },
+  "inputs": {
+    "read1": [{"root_alias": "rawdata", "relative_path": "run-001/S001_R1.fastq.gz"}],
+    "read2": [{"root_alias": "rawdata", "relative_path": "run-001/S001_R2.fastq.gz"}]
+  }
+}

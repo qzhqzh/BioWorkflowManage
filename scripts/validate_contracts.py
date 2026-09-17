@@ -14,6 +14,7 @@ from typing import Any, Iterable
 
 from jsonschema import Draft202012Validator
 
+from validate_integration_compatibility import validate_baselines
 from validate_reference_connector_contract import (
     validate_reference_connector_contract,
 )
@@ -289,6 +290,7 @@ def main() -> None:
         raise AssertionError("Compile manifest is missing required artifacts")
 
     validate_report(report, catalog)
+    baseline_count = validate_baselines()
     connector_digest = validate_reference_connector_contract(
         load_json(SCHEMAS / "integration-openapi-v1.json"),
         load_json(REFERENCE_CONNECTOR / "contract-surface.json"),
@@ -369,6 +371,7 @@ def main() -> None:
     print(f"Compiler IR digest: {ir_digest}")
     print(f"Diagnostic catalog entries: {len(catalog)}")
     print(f"Reference Connector contract projection: {connector_digest}")
+    print(f"Integration API historical baselines: {baseline_count}")
 
 
 if __name__ == "__main__":

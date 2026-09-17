@@ -1,9 +1,16 @@
 # 第三方分析投递 API 与 MCP
 
+首次接入请先读[分析服务接入指南与契约](23-analysis-service-integration-guide.md)，其中包含
+随业务系统部署、最小调用闭环及双方稳定性约定。本页提供完整扩展能力与运维细节。
+
+本文件与 OpenAPI 由分析平台统一维护，所有上游按同一契约接入。日常扩展、问题修复、
+历史基线保护和接入验收遵守[平台契约与兼容开发约定](22-integration-contract-governance.md)，
+不要求先发布软件 Release。数据复制完成能力是[显式可选协议](rawdata-ready-marker.md)，不全局改变旧投递。
+
 ## 1. 责任边界
 
 BioWorkflowManage 作为通用分析执行控制面，负责固定 Workflow/Tool 版本、受管资源预检、
-排队、miniwdl 执行、状态、事件、取消、重跑和语义化输出。OKB 等报告系统继续负责患者、
+排队、按固定产品选择 MiniWDL / Nextflow 执行、状态、事件、取消、重跑和语义化输出。OKB 等报告系统继续负责患者、
 样本业务、QC/SNV/CNV 入库和报告，不共享数据库，也不直接写 `AnalysisRun`。
 
 平台也可以作为独立组件部署：上游用 Integration API 提交任务，下游通过轮询或签名 Webhook
@@ -347,7 +354,8 @@ miniwdl Swarm service；运行目录、日志和已经形成的证据不会被�
 | `REQUIRED_OUTPUT_MISSING` | application | 否，执行成功但输出契约不完整 |
 | `ANALYSIS_CANCELED` | cancellation | 否 |
 
-所有 Integration API 错误均使用：
+一般业务错误使用以下封装；`rawdata-datasets/readiness` 的批量格式错误目前仅保证
+`error.code/message`，认证和代理层也可能有不同形状，调用方须按 HTTP 状态兜底：
 
 ```json
 {

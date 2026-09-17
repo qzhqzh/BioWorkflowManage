@@ -23,6 +23,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up uv and Python
         uses: astral-sh/setup-uv@v6
@@ -36,6 +38,12 @@ jobs:
 
       - name: Validate JSON contracts and fixture digests
         run: uv run python scripts/validate_contracts.py
+
+      - name: Protect historical Integration API baselines
+        if: github.event_name == 'pull_request'
+        env:
+          CONTRACT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: uv run python scripts/validate_integration_compatibility.py --base-ref "$CONTRACT_BASE_SHA"
 
       - name: Validate generated WDL syntax
         run: uv run python scripts/miniwdl_runtime.py check
