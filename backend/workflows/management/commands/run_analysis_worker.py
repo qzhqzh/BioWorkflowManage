@@ -11,6 +11,8 @@ from workflows.execution_engines import MINIWDL, SUPPORTED_EXECUTION_ENGINES
 
 
 class Command(BaseCommand):
+    # Role images do not load unrelated HTTP views or compiler dependencies.
+    requires_system_checks = []
     help = "Poll queued analysis runs for one or more explicit execution engines."
 
     def add_arguments(self, parser):

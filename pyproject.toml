@@ -14,6 +14,20 @@ dependencies = [
 ]
 
 [dependency-groups]
+runtime-webhook = [
+  "Django>=5.2,<5.3",
+  "djangorestframework>=3.16,<3.17",
+  "psycopg[binary]>=3.2,<4",
+]
+runtime-exporter = [
+  {include-group = "runtime-webhook"},
+  "boto3>=1.40,<2",
+  "jsonschema>=4.23,<5",
+]
+runtime-execution = [
+  {include-group = "runtime-exporter"},
+  "miniwdl==1.14.2",
+]
 dev = [
   "pytest>=8.3,<9",
   "pytest-django>=4.11,<5",

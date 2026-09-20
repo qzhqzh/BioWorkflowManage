@@ -48,6 +48,26 @@ dev = [
     { name = "pytest" },
     { name = "pytest-django" },
 ]
+runtime-execution = [
+    { name = "boto3" },
+    { name = "django" },
+    { name = "djangorestframework" },
+    { name = "jsonschema" },
+    { name = "miniwdl" },
+    { name = "psycopg", extra = ["binary"] },
+]
+runtime-exporter = [
+    { name = "boto3" },
+    { name = "django" },
+    { name = "djangorestframework" },
+    { name = "jsonschema" },
+    { name = "psycopg", extra = ["binary"] },
+]
+runtime-webhook = [
+    { name = "django" },
+    { name = "djangorestframework" },
+    { name = "psycopg", extra = ["binary"] },
+]
 
 [package.metadata]
 requires-dist = [
@@ -64,6 +84,26 @@ requires-dist = [
 dev = [
     { name = "pytest", specifier = ">=8.3,<9" },
     { name = "pytest-django", specifier = ">=4.11,<5" },
+]
+runtime-execution = [
+    { name = "boto3", specifier = ">=1.40,<2" },
+    { name = "django", specifier = ">=5.2,<5.3" },
+    { name = "djangorestframework", specifier = ">=3.16,<3.17" },
+    { name = "jsonschema", specifier = ">=4.23,<5" },
+    { name = "miniwdl", specifier = "==1.14.2" },
+    { name = "psycopg", extras = ["binary"], specifier = ">=3.2,<4" },
+]
+runtime-exporter = [
+    { name = "boto3", specifier = ">=1.40,<2" },
+    { name = "django", specifier = ">=5.2,<5.3" },
+    { name = "djangorestframework", specifier = ">=3.16,<3.17" },
+    { name = "jsonschema", specifier = ">=4.23,<5" },
+    { name = "psycopg", extras = ["binary"], specifier = ">=3.2,<4" },
+]
+runtime-webhook = [
+    { name = "django", specifier = ">=5.2,<5.3" },
+    { name = "djangorestframework", specifier = ">=3.16,<3.17" },
+    { name = "psycopg", extras = ["binary"], specifier = ">=3.2,<4" },
 ]
 
 [[package]]

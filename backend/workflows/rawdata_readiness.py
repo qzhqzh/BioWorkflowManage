@@ -329,6 +329,9 @@ def readiness_context():
 
 
 def verify_readiness_snapshot(snapshot, manifest, *, require_fresh_index=True):
+    from . import data_service
+    if data_service.enabled():
+        return data_service.verify_snapshot(snapshot, manifest, require_fresh_index=require_fresh_index)
     from .rawdata_index import rawdata_root_key
 
     if not isinstance(snapshot, dict) or snapshot.get("schema_version") != 1:

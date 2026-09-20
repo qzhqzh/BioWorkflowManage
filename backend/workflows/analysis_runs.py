@@ -1039,6 +1039,13 @@ def _managed_wdl_workflows(
     reference_entries: list[dict[str, Any]] | None = None,
     panel_entries: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
+    profiles = WORKFLOW_PROFILES
+    if not settings.ANALYSIS_CATALOG_INCLUDE_UNIMPORTED:
+        installed = set(
+            WDLAsset.objects.filter(slug__in=profiles).values_list("slug", flat=True)
+        )
+        # Keep imported but unready assets visible with their diagnostics.
+        profiles = {slug: profile for slug, profile in profiles.items() if slug in installed}
     results = [
         _workflow_payload(
             slug,
@@ -1047,9 +1054,9 @@ def _managed_wdl_workflows(
             reference_entries=reference_entries,
             panel_entries=panel_entries,
         )
-        for slug, profile in WORKFLOW_PROFILES.items()
+        for slug, profile in profiles.items()
     ]
-    profile = WORKFLOW_PROFILES.get(requested_slug)
+    profile = profiles.get(requested_slug)
     if profile is not None and requested_revision is not None:
         requested = _workflow_payload(
             requested_slug,

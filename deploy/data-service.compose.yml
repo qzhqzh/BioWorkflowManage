@@ -1,0 +1,34 @@
+# Opt in with: docker compose -f docker-compose.yml -f deploy/data-service.compose.yml ...
+x-data-env: &data-env
+  DATA_SERVICE_URL: ${DATA_SERVICE_URL:-http://data-api:8000}
+  DATA_SERVICE_TOKEN_FILE: /run/secrets/data-service-token
+x-data-volumes: &data-volumes
+  - type: bind
+    source: ${DATA_SERVICE_TOKEN_HOST_FILE:?Set the BWM data-service token file}
+    target: /run/secrets/data-service-token
+    read_only: true
+    bind: {create_host_path: false}
+services:
+  backend:
+    environment: *data-env
+    volumes: *data-volumes
+    networks: [default, data-services]
+  rawdata-indexer:
+    profiles: [legacy-rawdata]
+    environment: *data-env
+  analysis-worker:
+    environment: *data-env
+    volumes: *data-volumes
+    networks: [default, data-services]
+  analysis-worker-host:
+    environment: *data-env
+    volumes: *data-volumes
+    networks: [default, data-services]
+  analysis-worker-nextflow:
+    environment: *data-env
+    volumes: *data-volumes
+    networks: [default, data-services]
+networks:
+  data-services:
+    name: ${DATA_SERVICE_NETWORK:-bioworkflow-integration}
+    external: true

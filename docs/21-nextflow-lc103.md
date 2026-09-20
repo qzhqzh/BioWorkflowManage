@@ -157,3 +157,9 @@ docker compose \
 4. 保留不可变 WorkflowVersion、AnalysisRun、日志与输出证据，不删除迁移或运行目录。
 
 MiniWDL worker 与已有 WDL 产品无需切换或回滚。
+
+## 专用实例的流程列表
+
+可在 API 服务配置 `ANALYSIS_CATALOG_INCLUDE_UNIMPORTED=0`，让分析页面只列出已导入的历史 WDL 资产和已发布 Workflow。只初始化 LC103 的实例因此只显示 LC103；以后导入其他受支持 WDL 或发布其他 Workflow 后会正常列出。已导入但资源未就绪的流程仍显示诊断，不按 ready 状态隐藏。
+
+兼容分类为 additive：默认值 `1` 保留其他部署的预置占位条目；开关只影响 `/api/v1/analysis/catalog` 的管理页面目录，不改 Integration API、发布版本、历史任务、执行引擎或业务镜像。服务初始化不自动下载流程工具镜像，工具镜像仍按流程固定声明单独准备。
