@@ -26,6 +26,7 @@ from workflows.execution_engines import (
     NEXTFLOW,
     normalize_source_path,
     validate_execution_snapshot,
+    validate_nextflow_panel_interface,
 )
 from workflows.models import AnalysisProduct, WorkflowDocument, WorkflowVersion
 
@@ -280,6 +281,7 @@ class Command(BaseCommand):
                 runtime_manifest,
                 output_names=output_names,
             )
+            validate_nextflow_panel_interface(runtime_manifest, interface_contract)
         except ValueError as error:
             raise CommandError(str(error)) from error
         graph = _workflow_graph(workflow, interface_contract, runtime_manifest)

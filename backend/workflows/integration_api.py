@@ -43,7 +43,7 @@ from .artifact_exports import (
     artifact_export_payload,
     create_artifact_export,
 )
-from .execution_engines import NEXTFLOW
+from .execution_engines import NEXTFLOW, ExecutionSnapshotError, selected_nextflow_panel, selected_uploaded_panel
 from .analysis_products import (
     AnalysisProductError,
     analysis_product_version_is_current,
@@ -1748,6 +1748,12 @@ def _preflight_workflow(
         snapshot_budget=snapshot_budget,
         client_id=client_id,
     )
+    if version.execution_engine == NEXTFLOW:
+        try:
+            selected_nextflow_panel(version.runtime_manifest, input_values, workflow_name)
+            selected_uploaded_panel(version.runtime_manifest, input_values, workflow_name, database_path=settings.ANALYSIS_DATABASE_ROOT)
+        except ExecutionSnapshotError as error:
+            raise IntegrationAPIError("INPUT_CONSTRAINT_INVALID", str(error), category="input") from error
     if "rawdata_readiness" in body:
         try:
             manifests["rawdata_readiness"] = verify_readiness_snapshot(

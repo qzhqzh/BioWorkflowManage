@@ -22,6 +22,8 @@ from .analysis_runtime import (
 )
 from .integration_outputs import ResourceSnapshotBudget, build_output_manifest
 from .models import AnalysisRun
+from .execution_engines import selected_nextflow_panel, selected_uploaded_panel
+from .panel_inputs import materialize_panel
 from .object_inputs import stage_run_object_inputs, verify_run_object_inputs
 
 
@@ -300,6 +302,8 @@ def _nextflow_arguments(
     attempt_directory: Path,
     manifest: dict[str, Any],
     task_name: str,
+    input_values: dict[str, Any] | None = None,
+    workflow_name: str = "",
 ) -> list[str]:
     results = attempt_directory / "results"
     work = attempt_directory / "work"
@@ -342,6 +346,23 @@ def _nextflow_arguments(
             database_path=database_path,
         )
     )
+    uploaded = selected_uploaded_panel(manifest, input_values or {}, workflow_name, database_path=database_path)
+    if uploaded is not None:
+        binding = manifest["panel_input_binding"]
+        bed = materialize_panel(uploaded, attempt_directory)
+        if not SAFE_EXECUTION_PATH_PATTERN.fullmatch(str(bed)):
+            raise RuntimeError("Panel 暂存路径包含不支持的字符。")
+        arguments.extend([f"--{binding['parameter']}", uploaded["code"], f"--{binding['bed_parameter']}", str(bed)])
+    selection = selected_nextflow_panel(manifest, input_values or {}, workflow_name)
+    if selection is not None:
+        panel, bed_path = selection
+        binding = manifest["panel_binding"]
+        arguments.extend([f"--{binding['parameter']}", panel])
+        arguments.extend(_path_parameter_arguments(
+            {"path_params": [{"name": binding["bed_parameter"], "root": "source", "relative_path": bed_path, "kind": "file"}]},
+            source_directory=source_directory,
+            database_path=database_path,
+        ))
     return arguments
 
 
@@ -546,6 +567,8 @@ def execute_nextflow_analysis_run(
         attempt_directory=attempt_directory,
         manifest=manifest,
         task_name=task_name,
+        input_values=run.input_values,
+        workflow_name=run.workflow_name,
     )
     _update_run(
         run,

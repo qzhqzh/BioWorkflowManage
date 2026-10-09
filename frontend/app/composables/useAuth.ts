@@ -10,6 +10,7 @@ export type AuthUser = {
 }
 
 export function defaultRouteForUser(user: AuthUser): string {
+  if (user.is_admin && user.allowed_sections.includes('runs')) return '/operations'
   if (user.allowed_sections.includes('overview')) return '/overview'
   if (user.allowed_sections.includes('runs')) return '/runs'
   if (user.allowed_sections.includes('rawdata')) return '/rawdata'
@@ -17,6 +18,7 @@ export function defaultRouteForUser(user: AuthUser): string {
 }
 
 export function routeSection(path: string, section?: unknown): AppSection {
+  if (path.startsWith('/operations')) return 'runs'
   if (path.startsWith('/overview')) return 'overview'
   if (path.startsWith('/rawdata')) return 'rawdata'
   if (path.startsWith('/runs')) return 'runs'

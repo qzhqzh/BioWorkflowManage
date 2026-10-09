@@ -58,6 +58,28 @@ BioWorkflowManage 是面向生物信息学流程工程化的可视化 Workflow �
 
 > 用户定义生信工具的使用方式，平台负责规范化、流程编排和确定性 WDL 生成。
 
+## 研发与运维控制台
+
+管理员登录后进入 `/operations` 运维控制台，读取已发布分析产品、真实 Integration 任务、
+运行事件和已校验输出。研发控制台保留在 `/overview`，画布入口为 `/`；运维菜单不提供研发跳转，研发页面顶部可返回运维。
+复用现有管理员会话、CSRF 和 Integration 权限，不向浏览器发放服务 Token，不扩大普通操作员的数据权限。
+
+运行列表当前读取 API 返回的最近 200 条记录，页面标明统计范围；读取失败显示错误并标记旧数据，
+不补充演示任务。资源页展示契约声明，不能将契约有效误认为镜像、参考文件或执行器实时健康。
+取消调用既有取消接口，并等待实际状态确认。业务来源任务的重跑回到业务系统发起，避免新任务与
+样本、执行记录和报告脱离关联。
+
+可为前端进程设置 `NUXT_PUBLIC_OPERATIONS_BUSINESS_LINKS`（JSON 数组）：
+
+```json
+[{"clientId":"your-client","name":"业务系统","analysisUrlTemplate":"https://business.example.test/analysis/{analysis_id}"}]
+```
+
+`clientId` 对应 Service Account；模板支持 URL 编码后的 `{analysis_id}` 和 `{run_id}`。
+这只配置跳转地址，不代表数据权限或产品授权。未配置时展示执行编号，由用户在业务系统定位。
+开发服务的 API 目标可使用 `NUXT_DEV_API_PROXY=http://127.0.0.1:8082/api`；保留请求 Host 和 Origin，
+继续执行原有登录与 CSRF 检查。生产环境沿用网关的同源 `/api` 路由。
+
 ## 当前阶段
 
 项目已完成多流程 Beta 的核心闭环，当前作为多个上游的分析底座持续开发。

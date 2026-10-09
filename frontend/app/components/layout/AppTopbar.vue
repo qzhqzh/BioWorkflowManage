@@ -37,6 +37,7 @@ async function logout() {
     <slot name="status" />
     <div class="topbar__actions">
       <ClientOnly>
+        <NuxtLink v-if="auth.user.value?.is_admin" class="topbar__operations" to="/operations">运维控制台</NuxtLink>
         <slot name="actions" />
       </ClientOnly>
       <ClientOnly>
@@ -48,6 +49,16 @@ async function logout() {
 </template>
 
 <style scoped>
+.topbar__operations {
+  color: var(--color-primary);
+  border: 1px solid var(--color-border);
+  border-radius: 5px;
+  padding: 5px 9px;
+  font-size: var(--text-caption);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
 .topbar__user {
   color: var(--color-muted);
   font-size: var(--text-secondary);

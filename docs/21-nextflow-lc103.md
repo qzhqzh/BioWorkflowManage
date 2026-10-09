@@ -163,3 +163,7 @@ MiniWDL worker 与已有 WDL 产品无需切换或回滚。
 可在 API 服务配置 `ANALYSIS_CATALOG_INCLUDE_UNIMPORTED=0`，让分析页面只列出已导入的历史 WDL 资产和已发布 Workflow。只初始化 LC103 的实例因此只显示 LC103；以后导入其他受支持 WDL 或发布其他 Workflow 后会正常列出。已导入但资源未就绪的流程仍显示诊断，不按 ready 状态隐藏。
 
 兼容分类为 additive：默认值 `1` 保留其他部署的预置占位条目；开关只影响 `/api/v1/analysis/catalog` 的管理页面目录，不改 Integration API、发布版本、历史任务、执行引擎或业务镜像。服务初始化不自动下载流程工具镜像，工具镜像仍按流程固定声明单独准备。
+
+## 可选 Panel 的系统配置
+
+原 LC103 固定产品保留。可选 Panel 的新产品、提交参数及 OKBOX 接入方式见 [扩增子 Panel 选择](24-panel-selection.md)。
