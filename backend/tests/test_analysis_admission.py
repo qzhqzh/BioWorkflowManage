@@ -29,7 +29,8 @@ def make_run(engine='miniwdl', **kwargs):
 
 
 def test_concurrent_engines_share_one_slot():
-    make_run('nextflow'); make_run('miniwdl')
+    make_run('nextflow')
+    make_run('miniwdl')
     barrier = Barrier(2)
     def claim(engine):
         close_old_connections()
@@ -50,14 +51,17 @@ def test_cancellation_still_occupies_slot():
     make_run('nextflow', status='cancel_requested', lease_expires_at=timezone.now()+timedelta(minutes=1))
     queued = make_run()
     assert claim_next_run() is None
-    queued.refresh_from_db(); assert queued.status == 'queued'
+    queued.refresh_from_db()
+    assert queued.status == 'queued'
 
 
 def test_stale_other_engine_is_not_recovered():
     stale = make_run('nextflow', status='running', lease_token=uuid.uuid4(), lease_expires_at=timezone.now()-timedelta(minutes=1))
     make_run()
     assert claim_next_run() is None
-    stale.refresh_from_db(); assert stale.status == 'running'; assert stale.lease_token is not None
+    stale.refresh_from_db()
+    assert stale.status == 'running'
+    assert stale.lease_token is not None
 
 
 def test_cleanup_failure_preserves_capacity(monkeypatch):
@@ -65,8 +69,11 @@ def test_cleanup_failure_preserves_capacity(monkeypatch):
     queued = make_run()
     monkeypatch.setattr('workflows.analysis_runtime._cleanup_execution_resources', lambda *args: ([], ['daemon unavailable']))
     assert claim_next_run() is None
-    stale.refresh_from_db(); queued.refresh_from_db()
-    assert stale.status == 'running'; assert stale.lease_token is not None; assert queued.status == 'queued'
+    stale.refresh_from_db()
+    queued.refresh_from_db()
+    assert stale.status == 'running'
+    assert stale.lease_token is not None
+    assert queued.status == 'queued'
     assert stale.events.filter(kind='lease').count() == 1
     assert claim_next_run() is None
     assert stale.events.filter(kind='lease').count() == 1
@@ -77,4 +84,6 @@ def test_cleanup_success_releases_slot(monkeypatch):
     queued = make_run()
     monkeypatch.setattr('workflows.analysis_runtime._cleanup_execution_resources', lambda *args: (['old-task'], []))
     assert claim_next_run().pk == queued.pk
-    stale.refresh_from_db(); assert stale.status == 'failed'; assert stale.lease_token is None
+    stale.refresh_from_db()
+    assert stale.status == 'failed'
+    assert stale.lease_token is None

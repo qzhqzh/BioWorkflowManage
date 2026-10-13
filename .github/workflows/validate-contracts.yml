@@ -233,6 +233,7 @@ jobs:
           backend/tests/test_artifact_exports.py::test_postgresql_artifact_export_claim_and_lease_fencing
           backend/tests/test_artifact_exports.py::test_cleanup_claim_skips_more_than_fifty_blocked_retention_rows
           backend/tests/test_integration_api.py::test_analysis_product_preflight_and_submission_pin_contract
+          backend/tests/test_analysis_admission.py
 
   frontend:
     name: Frontend quality gates

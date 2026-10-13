@@ -1,6 +1,6 @@
 [project]
 name = "bioworkflow-manage"
-version = "1.0.0"
+version = "1.1.0"
 description = "Contract-driven visual bioinformatics workflow compiler"
 requires-python = ">=3.11"
 dependencies = [
