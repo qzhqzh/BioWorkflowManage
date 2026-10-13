@@ -43,7 +43,7 @@ from .artifact_exports import (
     artifact_export_payload,
     create_artifact_export,
 )
-from .execution_engines import NEXTFLOW
+from .execution_engines import NEXTFLOW, ExecutionSnapshotError, selected_nextflow_panel, selected_uploaded_panel
 from .analysis_products import (
     AnalysisProductError,
     analysis_product_version_is_current,
@@ -1748,6 +1748,12 @@ def _preflight_workflow(
         snapshot_budget=snapshot_budget,
         client_id=client_id,
     )
+    if version.execution_engine == NEXTFLOW:
+        try:
+            selected_nextflow_panel(version.runtime_manifest, input_values, workflow_name)
+            selected_uploaded_panel(version.runtime_manifest, input_values, workflow_name, database_path=settings.ANALYSIS_DATABASE_ROOT)
+        except ExecutionSnapshotError as error:
+            raise IntegrationAPIError("INPUT_CONSTRAINT_INVALID", str(error), category="input") from error
     if "rawdata_readiness" in body:
         try:
             manifests["rawdata_readiness"] = verify_readiness_snapshot(
@@ -2087,6 +2093,9 @@ def integration_analysis_products(request):
 @api_view(["GET"])
 @permission_classes([IntegrationScopePermission])
 def integration_rawdata_datasets(request):
+    from . import data_service
+    if data_service.enabled():
+        return Response(data_service.datasets(include_unready=request.query_params.get("include_unready") == "true"))
     limit = max(1, int(settings.RAWDATA_SCAN_MAX_FILES) // 2)
     include_unready = request.query_params.get("include_unready") == "true"
     queryset = RawdataDatasetIndex.objects.filter(
@@ -2141,6 +2150,12 @@ def integration_rawdata_datasets(request):
 @api_view(["POST"])
 @permission_classes([IntegrationScopePermission])
 def integration_rawdata_readiness(request):
+    from . import data_service
+    if data_service.enabled():
+        try:
+            return Response(data_service.request("POST", "/api/v1/readiness", request.data))
+        except ValueError:
+            return Response({"error": {"code": "RAWDATA_REQUEST_INVALID", "message": "数据就绪请求无效。"}}, status=400)
     if isinstance(request.data, dict) and "datasets" in request.data:
         datasets = request.data["datasets"]
         if not isinstance(datasets, list) or len(datasets) > 100 or any(

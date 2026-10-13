@@ -14,6 +14,8 @@ from workflows.webhooks import (
 
 
 class Command(BaseCommand):
+    # Role images do not load unrelated HTTP views or compiler dependencies.
+    requires_system_checks = []
     help = "Deliver durable Integration Outbox events without blocking analysis workers."
 
     def add_arguments(self, parser):

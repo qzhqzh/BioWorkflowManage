@@ -115,6 +115,8 @@ def _validate_nextflow_manifest(
         "input_adapter",
         "fixed_params",
         "path_params",
+        "panel_binding",
+        "panel_input_binding",
         "database_relative_path",
         "container_images",
         "outputs",
@@ -182,6 +184,35 @@ def _validate_nextflow_manifest(
                 f"Nextflow path_params[{index}] 定义无效。"
             )
         path_param_names.add(name)
+
+    binding = manifest.get("panel_binding")
+    if binding is not None:
+        if not isinstance(binding, dict) or set(binding) != {"input", "parameter", "bed_parameter", "options"}:
+            raise ExecutionSnapshotError("Nextflow panel_binding 字段无效。")
+        names = [binding["parameter"], binding["bed_parameter"]]
+        if (not isinstance(binding["input"], str)
+                or not IDENTIFIER_PATTERN.fullmatch(binding["input"])
+                or any(not isinstance(name, str) or not IDENTIFIER_PATTERN.fullmatch(name) for name in names)
+                or len(set(names)) != 2
+                or any(name in MANAGED_NEXTFLOW_PARAMS or name in fixed_params or name in path_param_names for name in names)):
+            raise ExecutionSnapshotError("Nextflow Panel 参数重复或覆盖了已有参数。")
+        options = binding["options"]
+        if not isinstance(options, dict) or not 1 <= len(options) <= 64:
+            raise ExecutionSnapshotError("Nextflow Panel 必须声明 1–64 个固定选项。")
+        for panel, bed_path in options.items():
+            if (not isinstance(panel, str) or len(panel) > 64 or not PROFILE_PATTERN.fullmatch(panel)
+                    or not isinstance(bed_path, str) or normalize_source_path(bed_path) != bed_path):
+                raise ExecutionSnapshotError("Nextflow Panel 名称或 BED 路径无效。")
+
+    dynamic = manifest.get("panel_input_binding")
+    if dynamic is not None:
+        from .panel_inputs import validate_binding
+        if binding is not None:
+            raise ExecutionSnapshotError("两种 Panel 绑定方式不能同时启用。")
+        try:
+            validate_binding(dynamic, reserved=MANAGED_NEXTFLOW_PARAMS | set(fixed_params) | path_param_names)
+        except ValueError as error:
+            raise ExecutionSnapshotError(str(error)) from error
 
     database_relative_path = normalize_relative_directory(
         manifest.get("database_relative_path")
@@ -266,6 +297,9 @@ def validate_execution_snapshot(
     if not entrypoint.endswith(".nf"):
         raise ExecutionSnapshotError("Nextflow 执行入口必须是 .nf 文件。")
     _validate_nextflow_manifest(runtime_manifest, output_names=output_names)
+    for bed_path in (runtime_manifest.get("panel_binding") or {}).get("options", {}).values():
+        if bed_path not in files or not decode_bundle_file(files[bed_path], path=bed_path).strip():
+            raise ExecutionSnapshotError(f"Panel BED 未包含在固定执行包中或内容为空：{bed_path}。")
     process_count = len(runtime_manifest["container_images"]["processes"])
     if (
         isinstance(bundle.get("call_count"), bool)
@@ -281,3 +315,48 @@ def validate_execution_snapshot(
     if bundle.get("execution") != expected_execution:
         raise ExecutionSnapshotError("Nextflow runtime_manifest 未绑定到固定包摘要。")
     return files, entrypoint
+
+
+def validate_nextflow_panel_interface(manifest: dict[str, Any], interface: dict[str, Any]) -> None:
+    if manifest.get("panel_input_binding") is not None:
+        from .panel_inputs import validate_interface
+        try:
+            validate_interface(manifest["panel_input_binding"], interface)
+        except ValueError as error:
+            raise ExecutionSnapshotError(str(error)) from error
+    binding = manifest.get("panel_binding")
+    if not binding:
+        return
+    ports = [item for item in interface.get("inputs", []) if item.get("name") == binding["input"]]
+    if len(ports) != 1:
+        raise ExecutionSnapshotError("Panel 选择必须声明为流程输入。")
+    port = ports[0]
+    choices = (port.get("constraints") or {}).get("enum")
+    if (port.get("wdl_type") != "String" or port.get("semantic_type") != "bio.panel.id"
+            or not isinstance(choices, list) or any(not isinstance(item, str) for item in choices)
+            or set(choices) != set(binding["options"])
+            or len(choices) != len(binding["options"])
+            or ("default" in port and port["default"] not in choices)
+            or (not port.get("required", True) and "default" not in port)):
+        raise ExecutionSnapshotError("Panel 输入必须为 String，且默认值和枚举与固定 BED 选项一致。")
+
+
+def selected_nextflow_panel(manifest: dict[str, Any], inputs: dict[str, Any], workflow_name: str) -> tuple[str, str] | None:
+    binding = manifest.get("panel_binding")
+    if not binding:
+        return None
+    value = inputs.get(f"{workflow_name}.{binding['input']}")
+    if not isinstance(value, str) or value not in binding["options"]:
+        raise ExecutionSnapshotError("请选择流程已声明并包含 BED 文件的 Panel。")
+    return value, binding["options"][value]
+
+
+def selected_uploaded_panel(manifest, inputs, workflow_name, *, database_path=None):
+    binding = manifest.get("panel_input_binding")
+    if binding is None:
+        return None
+    from .panel_inputs import select_panel
+    try:
+        return select_panel(binding, inputs, workflow_name, database_path=database_path)
+    except (ValueError, OSError) as error:
+        raise ExecutionSnapshotError(str(error)) from error

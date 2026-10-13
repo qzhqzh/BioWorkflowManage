@@ -21,6 +21,11 @@ export default defineNuxtRouteMiddleware(async (to) => {
   }
   if (!auth.user.value) return navigateTo('/login', { external: nuxtApp.isHydrating })
   if (to.path === '/no-access') return
+  // Integration reads and operations currently require an administrator session.
+  // Keep existing operator permissions unchanged; do not expose service tokens.
+  if (to.path.startsWith('/operations') && !auth.user.value.is_admin) {
+    return navigateTo(defaultRouteForUser(auth.user.value))
+  }
   const section = routeSection(to.path, to.query.section)
   if (!auth.user.value.allowed_sections.includes(section)) {
     return navigateTo(defaultRouteForUser(auth.user.value), { external: nuxtApp.isHydrating })

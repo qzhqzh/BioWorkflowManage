@@ -1,5 +1,9 @@
 # BioWorkflowManage
 
+当前基础版：**v1.1.0**（2026-10-13）。本次固定底座源码、依赖锁和接入兼容范围；
+版本说明及部署边界见 [v1.1.0 发布说明](docs/releases/v1.1.0.md)。
+底座软件、Integration API 文档和分析产品分别管理版本，业务流程更新不自动升级底座。
+
 把平台作为自己项目的分析服务（或连接已有在线平台），从
 [分析服务接入指南与契约](docs/23-analysis-service-integration-guide.md)开始：部署配置、数据投递、
 异步状态、结果展示，以及平台和接入方必须共同遵守的兼容边界。
@@ -58,10 +62,31 @@ BioWorkflowManage 是面向生物信息学流程工程化的可视化 Workflow �
 
 > 用户定义生信工具的使用方式，平台负责规范化、流程编排和确定性 WDL 生成。
 
+## 研发与运维控制台
+
+管理员登录后进入 `/operations` 运维控制台，读取已发布分析产品、真实 Integration 任务、
+运行事件和已校验输出。研发控制台保留在 `/overview`，画布入口为 `/`；运维菜单不提供研发跳转，研发页面顶部可返回运维。
+复用现有管理员会话、CSRF 和 Integration 权限，不向浏览器发放服务 Token，不扩大普通操作员的数据权限。
+
+运行列表当前读取 API 返回的最近 200 条记录，页面标明统计范围；读取失败显示错误并标记旧数据，
+不补充演示任务。资源页展示契约声明，不能将契约有效误认为镜像、参考文件或执行器实时健康。
+取消调用既有取消接口，并等待实际状态确认。业务来源任务的重跑回到业务系统发起，避免新任务与
+样本、执行记录和报告脱离关联。
+
+可为前端进程设置 `NUXT_PUBLIC_OPERATIONS_BUSINESS_LINKS`（JSON 数组）：
+
+```json
+[{"clientId":"your-client","name":"业务系统","analysisUrlTemplate":"https://business.example.test/analysis/{analysis_id}"}]
+```
+
+`clientId` 对应 Service Account；模板支持 URL 编码后的 `{analysis_id}` 和 `{run_id}`。
+这只配置跳转地址，不代表数据权限或产品授权。未配置时展示执行编号，由用户在业务系统定位。
+开发服务的 API 目标可使用 `NUXT_DEV_API_PROXY=http://127.0.0.1:8082/api`；保留请求 Host 和 Origin，
+继续执行原有登录与 CSRF 检查。生产环境沿用网关的同源 `/api` 路由。
+
 ## 当前阶段
 
-项目已完成多流程 Beta 的核心闭环，当前作为多个上游的分析底座持续开发。
-先维护统一契约和向后兼容，正式软件 Release 待平台与接入验证充分后另行决定：
+项目已完成多流程核心闭环，以 v1.1.0 固定当前分析底座基础版，并继续维护统一契约和向后兼容：
 
 - Docker Compose、PostgreSQL 持久化和局域网访问；
 - ToolSpec、Workflow Graph、DAG 与类型校验；
@@ -87,7 +112,7 @@ BioWorkflowManage 是面向生物信息学流程工程化的可视化 Workflow �
 新增能力、优化和问题修复均遵守
 [平台契约与兼容开发约定](docs/22-integration-contract-governance.md)：内部可演进，旧调用不能被
 静默破坏；新能力显式启用，分析产品版本不可原地改绑。历史稳定版本升级手册仍用于相应版本，
-不限制当前开发范围，也不代表现在必须发布 Release。
+当前基础版范围以 [v1.1.0 发布说明](docs/releases/v1.1.0.md) 为准。业务应用和流程包独立迭代。
 
 认证登录、WDL 工具包管理和运行分析页面已经落地；运行分析由独立
 `analysis-worker` 领取队列任务并记录进度、事件、取消、重跑和输出证据；独立

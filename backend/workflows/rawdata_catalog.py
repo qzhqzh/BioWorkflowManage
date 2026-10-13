@@ -669,6 +669,10 @@ def rawdata_catalog(request):
 
 @api_view(["POST"])
 def rawdata_scans(request):
+    from . import data_service
+    if data_service.enabled():
+        payload = data_service.request("POST", "/api/v1/scans", {})
+        return Response(payload, status=202 if payload.get("created") else 200)
     from .rawdata_index import queue_rawdata_scan
 
     user = getattr(request, "user", None)

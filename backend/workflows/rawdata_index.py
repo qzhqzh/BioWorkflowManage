@@ -375,6 +375,9 @@ def _augment_dataset_history(catalog: dict[str, Any], root_key: str) -> None:
 def indexed_rawdata_catalog(
     root_value: str | Path | None = None,
 ) -> dict[str, Any]:
+    from . import data_service
+    if data_service.enabled():
+        return data_service.catalog()
     root_key = rawdata_root_key(root_value)
     latest = RawdataScan.objects.filter(
         root_key=root_key,
@@ -452,6 +455,10 @@ def link_run_to_indexed_dataset(
     dataset_id: str,
     identity: dict[str, Any],
 ) -> RawdataRunReference | None:
+    from . import data_service
+    if data_service.enabled():
+        # run.request_payload and its input manifest own the frozen data reference.
+        return None
     dataset = RawdataDatasetIndex.objects.filter(
         root_key=rawdata_root_key(),
         dataset_id=dataset_id,

@@ -1166,6 +1166,33 @@ def test_catalog_discovers_fastq_pair_and_reports_managed_workflow(
     assert response.data["database"]["references"][0]["ready"] is True
 
 
+@pytest.mark.parametrize("include_unimported", [True, False])
+def test_catalog_installed_only_keeps_published_workflows(
+    client, analysis_workspace, settings, include_unimported
+):
+    settings.ANALYSIS_CATALOG_INCLUDE_UNIMPORTED = include_unimported
+    version = _published_fastq_workflow()
+    response = client.get("/api/v1/analysis/catalog")
+    assert response.status_code == 200
+    workflows = response.data["workflows"]
+    assert any(item["slug"] == f"published:{version.workflow.slug}:{version.version}" for item in workflows)
+    legacy = {item["slug"] for item in workflows if item["source_type"] != "workflow_version"}
+    assert legacy == (set(analysis_runs_module.WORKFLOW_PROFILES) if include_unimported else set())
+
+
+def test_catalog_installed_only_keeps_unready_imported_assets(
+    client, analysis_workspace, settings
+):
+    settings.ANALYSIS_CATALOG_INCLUDE_UNIMPORTED = False
+    _asset("tumor-blood-single-production", "TumorBloodSingle")
+    response = client.get("/api/v1/analysis/catalog")
+    assert response.status_code == 200
+    workflows = response.data["workflows"]
+    assert [item["slug"] for item in workflows] == ["tumor-blood-single-production"]
+    assert workflows[0]["ready"] is False
+    assert workflows[0]["blockers"]
+
+
 def test_catalog_exposes_limited_rawdata_scan_without_partial_datasets(
     client, analysis_workspace, monkeypatch
 ):

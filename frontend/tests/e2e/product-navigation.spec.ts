@@ -9,7 +9,8 @@ test.beforeEach(async ({ page }) => {
   await page.getByLabel('用户名').fill('zhuqin')
   await page.getByLabel('密码').fill('zhuqin')
   await page.getByRole('button', { name: '登录', exact: true }).click()
-  await page.waitForURL('**/overview')
+  await page.waitForURL('**/operations')
+  await page.goto('/overview')
 })
 
 test('管理员从总览进入子流程创建并返回总览', async ({ page }) => {

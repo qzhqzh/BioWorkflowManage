@@ -15,7 +15,24 @@ def _csv_environment(name: str, default: str) -> list[str]:
     ]
 
 
-SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "development-only-change-me")
+def _secret_environment(name: str, default: str = "") -> str:
+    path = os.environ.get(f"{name}_FILE")
+    if not path:
+        return os.environ.get(name, default)
+    if os.environ.get(name):
+        raise ValueError(f"{name} and {name}_FILE are mutually exclusive")
+    try:
+        with Path(path).open("rb") as handle:
+            raw = handle.read(8193)
+        value = raw.decode("utf-8").strip()
+    except (OSError, UnicodeError):
+        raise ValueError(f"{name}_FILE cannot be read") from None
+    if not value or len(raw) > 8192 or "\x00" in value:
+        raise ValueError(f"{name}_FILE must contain a nonempty bounded secret")
+    return value
+
+
+SECRET_KEY = _secret_environment("DJANGO_SECRET_KEY", "development-only-change-me")
 DEBUG = os.environ.get("DJANGO_DEBUG", "0") == "1"
 ALLOWED_HOSTS = _csv_environment(
     "DJANGO_ALLOWED_HOSTS",
@@ -66,6 +83,10 @@ WSGI_APPLICATION = "config.wsgi.application"
 # Authentication is enabled by default. Contract-focused API test modules opt out
 # explicitly; authentication tests exercise the deployed setting.
 AUTH_REQUIRED = os.environ.get("DJANGO_AUTH_REQUIRED", "1") == "1"
+# Opt-in installed-only catalog; preserve legacy placeholders elsewhere.
+ANALYSIS_CATALOG_INCLUDE_UNIMPORTED = (
+    os.environ.get("ANALYSIS_CATALOG_INCLUDE_UNIMPORTED", "1") == "1"
+)
 INTEGRATION_REQUIRE_ANALYSIS_PRODUCT = (
     os.environ.get("INTEGRATION_REQUIRE_ANALYSIS_PRODUCT", "0") == "1"
 )
@@ -84,7 +105,7 @@ if os.environ.get("POSTGRES_HOST"):
             "ENGINE": "django.db.backends.postgresql",
             "NAME": os.environ.get("POSTGRES_DB", "bioworkflow"),
             "USER": os.environ.get("POSTGRES_USER", "bioworkflow"),
-            "PASSWORD": os.environ.get("POSTGRES_PASSWORD", ""),
+            "PASSWORD": _secret_environment("POSTGRES_PASSWORD"),
             "HOST": os.environ["POSTGRES_HOST"],
             "PORT": os.environ.get("POSTGRES_PORT", "5432"),
             "CONN_MAX_AGE": 60,
@@ -453,6 +474,11 @@ ANALYSIS_WORKER_POLL_SECONDS = float(
 ANALYSIS_MIN_AVAILABLE_MEMORY_GB = float(
     os.environ.get("ANALYSIS_MIN_AVAILABLE_MEMORY_GB", "40")
 )
+# Zero preserves existing deployments; the new suite explicitly selects one.
+ANALYSIS_MAX_ACTIVE_RUNS = int(os.environ.get("ANALYSIS_MAX_ACTIVE_RUNS", "0"))
+if ANALYSIS_MAX_ACTIVE_RUNS < 0:
+    raise ValueError("ANALYSIS_MAX_ACTIVE_RUNS must be nonnegative")
+
 ANALYSIS_INFRASTRUCTURE_RETRIES = int(
     os.environ.get("ANALYSIS_INFRASTRUCTURE_RETRIES", "0")
 )
@@ -467,7 +493,7 @@ ANALYSIS_RUN_HEARTBEAT_SECONDS = min(
     max(5, ANALYSIS_RUN_LEASE_SECONDS // 3),
 )
 
-WEBHOOK_SIGNING_KEY = os.environ.get("WEBHOOK_SIGNING_KEY") or (
+WEBHOOK_SIGNING_KEY = _secret_environment("WEBHOOK_SIGNING_KEY") or (
     f"bioworkflow-webhook-v1:{SECRET_KEY}"
 )
 WEBHOOK_DELIVERY_TIMEOUT_SECONDS = max(
@@ -503,3 +529,8 @@ WEBHOOK_PRIVATE_HOST_ALLOWLIST = _csv_environment(
     "WEBHOOK_PRIVATE_HOST_ALLOWLIST",
     "",
 )
+
+# Opt-in independent data management service (origin URL, no /api suffix).
+DATA_SERVICE_URL = os.environ.get("DATA_SERVICE_URL", "")
+DATA_SERVICE_TOKEN_FILE = os.environ.get("DATA_SERVICE_TOKEN_FILE", "")
+DATA_SERVICE_TIMEOUT_SECONDS = max(0.1, float(os.environ.get("DATA_SERVICE_TIMEOUT_SECONDS", "10")))

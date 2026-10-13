@@ -17,10 +17,11 @@ from pathlib import Path
 from typing import Any
 
 from django.conf import settings
-from django.db import close_old_connections, transaction
+from django.db import close_old_connections, connection, transaction
 from django.db.models import F
 from django.utils import timezone
 
+from .data_service import DataServiceUnavailable
 from .integration_outputs import (
     _directory_manifest,
     _file_identity,
@@ -451,6 +452,21 @@ def _recover_stale_runs(
     stale_runs = list(stale_queryset.order_by("lease_expires_at")[:20])
     for run in stale_runs:
         stale_work_directory = str(run.work_directory or "")
+        cleaned = False
+        if settings.ANALYSIS_MAX_ACTIVE_RUNS and stale_work_directory:
+            # With a global admission limit, capacity is released only after this
+            # engine confirms cleanup. Never borrow the other engine's daemon.
+            _, cleanup_errors = _cleanup_execution_resources(
+                run.execution_engine, Path(stale_work_directory), str(run.id)
+            )
+            if cleanup_errors:
+                message = "worker 租约过期，执行资源清理未完成；保留并发槽位，请检查对应引擎。"
+                if run.current_step != message:
+                    run.current_step = message
+                    run.save(update_fields=["current_step", "updated_at"])
+                    _event(run, message, kind="lease", level="error")
+                continue
+            cleaned = True
         if run.status == AnalysisRun.Status.CANCEL_REQUESTED:
             run.status = AnalysisRun.Status.CANCELED
             run.current_step = "运行已取消"
@@ -494,7 +510,7 @@ def _recover_stale_runs(
         run.save()
         enqueue_terminal_event(run)
         _event(run, message, kind="lease", level=level)
-        if stale_work_directory:
+        if stale_work_directory and not cleaned:
             transaction.on_commit(
                 lambda work_directory=stale_work_directory,
                 execution_engine=run.execution_engine,
@@ -543,8 +559,26 @@ def claim_next_run(
     if not execution_engines or unsupported:
         raise ValueError("analysis worker execution_engines 配置无效。")
     with transaction.atomic():
+        limit = settings.ANALYSIS_MAX_ACTIVE_RUNS
+        if limit:
+            if connection.vendor != "postgresql":
+                raise RuntimeError("ANALYSIS_MAX_ACTIVE_RUNS requires PostgreSQL")
+            # Transaction-scoped, database-local admission lock across both engines.
+            # Losing contenders return to polling without holding row locks.
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_try_advisory_xact_lock(%s, %s)", [182910, 1])
+                if not cursor.fetchone()[0]:
+                    return None
         now = timezone.now()
         _recover_stale_runs(now, execution_engines)
+        if limit and AnalysisRun.objects.filter(
+            status__in=(
+                AnalysisRun.Status.PREPARING,
+                AnalysisRun.Status.RUNNING,
+                AnalysisRun.Status.CANCEL_REQUESTED,
+            )
+        ).count() >= limit:
+            return None
         run = (
             AnalysisRun.objects.select_for_update(skip_locked=True)
             .filter(
@@ -1486,7 +1520,7 @@ def process_analysis_run(run: AnalysisRun) -> None:
                 }
                 if isinstance(
                     error,
-                    (AnalysisProductTrustError, WorkflowPackageTrustError),
+                    (AnalysisProductTrustError, WorkflowPackageTrustError, DataServiceUnavailable),
                 )
                 else
                 {

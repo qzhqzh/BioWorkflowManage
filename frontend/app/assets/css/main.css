@@ -8314,7 +8314,7 @@ kbd {
   }
 
   .topbar {
-    grid-template-columns: 15rem minmax(10rem, 1fr) auto auto;
+    grid-template-columns: minmax(0, 15rem) minmax(10rem, 1fr) auto auto;
   }
 
   .brand {
@@ -8395,7 +8395,7 @@ kbd {
   }
 
   .topbar {
-    grid-template-columns: 15rem minmax(6rem, 1fr) auto;
+    grid-template-columns: minmax(0, 15rem) minmax(6rem, 1fr) auto;
   }
 
   .save-state {

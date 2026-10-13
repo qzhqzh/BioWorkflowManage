@@ -14,6 +14,8 @@ from workflows.artifact_exports import (
 
 
 class Command(BaseCommand):
+    # Role images do not load unrelated HTTP views or compiler dependencies.
+    requires_system_checks = []
     help = "Deliver immutable analysis artifacts without blocking API or analysis workers."
 
     def add_arguments(self, parser):

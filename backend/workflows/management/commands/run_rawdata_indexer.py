@@ -31,6 +31,8 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
+        if settings.DATA_SERVICE_URL:
+            raise CommandError("Independent data service is configured; use its indexer, not BWM's legacy indexer.")
         if options["once"]:
             scan, _ = queue_rawdata_scan(
                 actor="command",

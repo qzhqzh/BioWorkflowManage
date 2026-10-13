@@ -10,6 +10,7 @@ from django.db import transaction
 from compiler_core import canonical_digest
 
 from .analysis_runs import _compile_published_workflow
+from .execution_engines import NEXTFLOW, ExecutionSnapshotError, validate_nextflow_panel_interface
 from .models import (
     AnalysisProduct,
     AnalysisProductVersion,
@@ -142,6 +143,11 @@ def snapshot_workflow_contract(
         )
 
     snapshot = copy.deepcopy(interface_contract)
+    if workflow_version.execution_engine == NEXTFLOW:
+        try:
+            validate_nextflow_panel_interface(workflow_version.runtime_manifest, snapshot)
+        except ExecutionSnapshotError as error:
+            raise AnalysisProductError("ANALYSIS_PRODUCT_CONTRACT_INVALID", str(error)) from error
     return source_digest, snapshot, canonical_digest(snapshot)
 
 
