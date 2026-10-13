@@ -41,7 +41,7 @@ test.beforeEach(async ({ page }) => {
   await page.getByLabel('用户名').fill('zhuqin')
   await page.getByLabel('密码').fill('zhuqin')
   await page.getByRole('button', { name: '登录', exact: true }).click()
-  await page.waitForURL('**/overview')
+  await page.waitForURL('**/operations')
   await page.goto('/')
   await expect(page.getByText('BioWorkflowManage', { exact: true })).toBeVisible()
   await expect(page.getByRole('button', { name: '保存草稿' })).toContainText('草稿已保存')
