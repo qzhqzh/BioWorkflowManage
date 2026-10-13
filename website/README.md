@@ -32,19 +32,20 @@ python3 -m http.server 38120 --bind 127.0.0.1 --directory website/dist
 
 ## 独立站点部署
 
-在长期保留的 checkout 中构建，并以站点提交作为镜像标签。该 Compose 仅包含静态站点，不连接底座数据库和执行 Worker。
+在长期保留的 checkout 中构建。该 Compose 使用固定摘要的 Nginx 镜像，只读挂载构建产物与站点配置，不依赖额外镜像构建，也不连接底座数据库和执行 Worker。
 
 ```bash
 python3 website/build.py
 python3 website/check.py
-BWM_SITE_TAG="$(git rev-parse --short=12 HEAD)" \
-  docker compose -f website/deploy/compose.yml up -d --build --wait
+docker compose -f website/deploy/compose.yml up -d --force-recreate --wait
 curl --fail http://127.0.0.1:18820/version.json
 ```
 
 服务复用 Docker 默认网桥，仅绑定 `127.0.0.1:18820`，以非 root 用户、只读文件系统运行，不创建额外应用子网。`deploy/gateway.conf` 是指定域名的反向代理配置，TLS 配置继承现有网关；在其他主机上部署须自行配置域名证书和网关。网关先验证配置，再平滑加载。不要修改其他域名或重启业务容器。
 
-发布后核对 HTTPS 首页、`/docs/quickstart/`、`/llms.txt`、`/openapi.json`、`/version.json` 以及不存在页面的 404。静态内容要求重新验证缓存，若接入 CDN，不应把 HTML 与版本清单配置为永久缓存。回滚只需将 `BWM_SITE_TAG` 指向保留的上一站点镜像并执行 `up -d --no-build --wait`；底座数据不参与站点回滚。
+构建会替换 `dist/` 目录，因此每次更新后须用 `--force-recreate` 重新挂载新产物；不要仅重启旧容器。发布后核对 HTTPS 首页、`/docs/quickstart/`、`/llms.txt`、`/openapi.json`、`/version.json` 以及不存在页面的 404。静态内容要求重新验证缓存，若接入 CDN，不应把 HTML 与版本清单配置为永久缓存。
+
+部署前记录旧的站点提交。回滚时检出该提交，重新构建、检查，再执行上面的容器重建命令；底座数据不参与站点回滚。需要打包静态镜像时，也保留了可选的 `deploy/Dockerfile`；当前默认部署不需要它。
 
 ## 验收范围
 

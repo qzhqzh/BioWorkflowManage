@@ -24,4 +24,4 @@ jobs:
           python -m unittest discover -s website/tests -v
           node --check website/assets/site.js
       - name: Validate isolated site deployment
-        run: BWM_SITE_TAG=ci docker compose -f website/deploy/compose.yml config --quiet
+        run: docker compose -f website/deploy/compose.yml config --quiet
