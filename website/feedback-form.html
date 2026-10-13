@@ -1,0 +1,14 @@
+<h2 id="compose-feedback">生成反馈记录</h2>
+<p>在本机生成 Markdown 文件，检查后交给维护者。内容不会自动发送。</p>
+<form id="feedback-form" class="feedback-form">
+<label class="wide">问题标题<input name="title" required maxlength="160" placeholder="例如：输入预检通过，但任务持续排队"></label>
+<label>底座版本<input name="version" required value="v1.1.0" maxlength="80"></label>
+<label>流程产品 / 契约版本<input name="product" maxlength="160" placeholder="analysis_code / contract_version"></label>
+<label>业务应用版本<input name="application" maxlength="120" placeholder="填写版本号即可"></label>
+<label>影响范围<select name="impact"><option>试用问题，存在绕过方式</option><option>阻断安装或核心流程</option><option>数据或结果正确性问题</option><option>文档或易用性建议</option></select></label>
+<label class="wide">运行环境<input name="environment" required maxlength="300" placeholder="Linux 版本、Docker / Compose 版本、CPU / 内存、执行引擎"></label>
+<label class="wide">复现步骤<textarea name="steps" required placeholder="从哪一步开始、输入了什么、执行了哪些操作。请使用脱敏信息。"></textarea></label>
+<label class="wide">预期结果<textarea name="expected" required></textarea></label>
+<label class="wide">实际结果与证据<textarea name="actual" required placeholder="错误码、脱敏日志、时间点、运行 ID 或证据文件名。"></textarea></label>
+<div class="wide form-actions"><button class="button" type="submit">下载反馈文件</button><span id="feedback-status" class="status-message" role="status" aria-live="polite"></span></div>
+</form>

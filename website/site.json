@@ -1,0 +1,12 @@
+{
+  "name": "BioWorkflowManage",
+  "slogan": "轻松集成，即刻开跑。",
+  "description": "可复用的生信分析底座。固定流程版本，统一执行与结果交付。",
+  "origin": "https://bwm.qzhqzh.com",
+  "version": "1.1.0",
+  "release_commit": "2087547268444c6327fa74f48968c74edd578f78",
+  "api_document_version": "1.7.0",
+  "repository": "https://github.com/qzhqzh/BioWorkflowManage",
+  "site_branch": "codex/product-site",
+  "updated": "2026-10-13"
+}

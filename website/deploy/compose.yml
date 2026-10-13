@@ -1,0 +1,32 @@
+name: bwm-product-site
+services:
+  site:
+    image: bwm-product-site:${BWM_SITE_TAG:?Set BWM_SITE_TAG to the website commit}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    network_mode: bridge
+    ports:
+      - "127.0.0.1:18820:8080"
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    cpus: 1.0
+    mem_limit: 128m
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/version.json"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "3"

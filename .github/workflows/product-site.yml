@@ -1,0 +1,27 @@
+name: Validate product site
+on:
+  push:
+    branches: [codex/product-site]
+    paths: [website/**, .github/workflows/product-site.yml]
+  pull_request:
+    paths: [website/**, .github/workflows/product-site.yml]
+permissions:
+  contents: read
+jobs:
+  public-site:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build and verify public artifacts
+        run: |
+          python -W error website/build.py
+          python website/check.py
+          python -m unittest discover -s website/tests -v
+          node --check website/assets/site.js
+      - name: Validate isolated site deployment
+        run: BWM_SITE_TAG=ci docker compose -f website/deploy/compose.yml config --quiet

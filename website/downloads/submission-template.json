@@ -1,0 +1,9 @@
+{
+  "external_ref": {"external_run_id": "demo-execution-001"},
+  "analysis_product": {
+    "analysis_code": "your-analysis",
+    "contract_version": "1.0.0"
+  },
+  "subject": {"sample_id": "sample-demo-001"},
+  "inputs": {}
+}
