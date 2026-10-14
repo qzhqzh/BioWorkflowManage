@@ -1,5 +1,18 @@
 # BioWorkflowManage
 
+## 稳定版本与后续开发
+
+**v1.1.0 是当前对外发布的稳定版本，源码已在 GitHub 公开。** GitHub 仓库保留该版本的源码、
+发布标签、安装文档和兼容说明，供部署使用与参考。
+
+后续功能迭代转入内部开发，不再持续同步到 GitHub。如需后续版本、部署支持或合作，
+可通过 [GitHub Issues](https://github.com/qzhqzh/BioWorkflowManage/issues)
+联系作者 [@qzhqzh](https://github.com/qzhqzh)。
+
+产品介绍与安装指南：[bwm.qzhqzh.com](https://bwm.qzhqzh.com)。
+
+## 当前基础版
+
 当前基础版：**v1.1.0**（2026-10-13）。本次固定底座源码、依赖锁和接入兼容范围；
 版本说明及部署边界见 [v1.1.0 发布说明](docs/releases/v1.1.0.md)。
 底座软件、Integration API 文档和分析产品分别管理版本，业务流程更新不自动升级底座。
