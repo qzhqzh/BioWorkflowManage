@@ -73,6 +73,12 @@ def main():
     for path in OUT.rglob('*'):
         if not path.is_file():
             continue
+        if path.suffix in ('.png', '.woff2', '.ttf'):
+            data = path.read_bytes()
+            signatures = {'.png': b'\x89PNG\r\n\x1a\n', '.woff2': b'wOF2', '.ttf': b'\x00\x01\x00\x00'}
+            assert path.is_relative_to(OUT / 'assets'), f'Unexpected binary download: {path}'
+            assert data.startswith(signatures[path.suffix]), f'Invalid asset: {path}'
+            continue
         content = path.read_text()
         assert not any(term in content.casefold() for term in denied), f'Private label found: {path}'
         assert not re.search(r'/home/[^\s/]+/', content), f'Internal host path: {path}'

@@ -25,13 +25,18 @@ ICONS = {
     'arrow': '<path d="M5 12h14m-6-6 6 6-6 6"/>',
     'external': '<path d="M8 5h11v11M19 5 5 19"/>',
     'copy': '<rect x="8" y="8" width="12" height="13" rx="1.5"/><path d="M16 8V3H4v13h4"/>',
-    'file': '<path d="M6 2h8l5 5v15H6V2zm8 0v6h5M9 12h7M9 16h7"/>',
+    'file': '<path d="M3 2h11l7 7v13H3V2zm11 0v7h7M7 13h10M7 17h10"/>',
     'monitor': '<rect x="2" y="3" width="20" height="14" rx="1.5"/><path d="M12 17v4m-5 0h10"/>',
     'database': '<ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v13c0 4 16 4 16 0V5M4 11c0 4 16 4 16 0"/>',
     'gear': '<path d="m10 2-1 3-3 1-3-1-2 4 2 2v3l-2 2 2 4 3-1 3 1 1 3h4l1-3 3-1 3 1 2-4-2-2v-3l2-2-2-4-3 1-3-1-1-3z" transform="translate(1 -1) scale(.91)"/><circle cx="12" cy="11.5" r="3"/>',
     'tool': '<path d="M14 3a6 6 0 0 0-7 8L2 18a2.7 2.7 0 0 0 4 4l7-7a6 6 0 0 0 8-7l-4 4-4-4z"/>',
     'book': '<path d="M12 5v16M12 5C8 2 4 2 2 4v16c3-2 6-2 10 1 4-3 7-3 10-1V4c-3-2-6-2-10 1"/>',
     'flask': '<path d="M9 2h6M10 2v7L4 19c-1 2 0 3 2 3h12c2 0 3-1 2-3L14 9V2M7 15h10"/>',
+    'layers': '<path d="m2 7 10-5 10 5-10 5L2 7zm0 5 10 5 10-5M2 17l10 5 10-5"/>',
+    'tag': '<path d="M21 3h-8L2 14l8 8L21 11V3z"/><circle cx="17" cy="7" r="1"/>',
+    'download': '<path d="M12 2v14m-6-6 6 6 6-6M3 17v5h18v-5"/>',
+    'plug': '<path d="M7 2v7m10-7v7M4 9h16v4a8 8 0 0 1-16 0V9zm8 12v2"/>',
+    'github': '<path fill="currentColor" stroke="none" d="M12 .75a11.25 11.25 0 0 0-3.56 21.92c.56.1.77-.24.77-.54v-2.1c-3.13.68-3.79-1.33-3.79-1.33-.51-1.3-1.25-1.65-1.25-1.65-1.02-.7.08-.68.08-.68 1.13.08 1.72 1.16 1.72 1.16 1.01 1.73 2.65 1.23 3.3.94.1-.73.39-1.23.72-1.51-2.5-.28-5.13-1.25-5.13-5.56 0-1.23.44-2.23 1.16-3.02-.11-.29-.5-1.43.11-2.98 0 0 .95-.31 3.09 1.15a10.7 10.7 0 0 1 5.62 0c2.15-1.46 3.09-1.15 3.09-1.15.61 1.55.23 2.69.12 2.98.72.79 1.15 1.79 1.15 3.02 0 4.32-2.63 5.27-5.14 5.55.4.35.76 1.04.76 2.1v3.08c0 .3.2.65.78.54A11.25 11.25 0 0 0 12 .75z"/>',
 }
 
 def icon(name: str, extra: str = '') -> str:
@@ -47,13 +52,13 @@ def header(active: str = '') -> str:
 <button class="menu-toggle" aria-expanded="false" aria-controls="site-nav">菜单</button>
 <nav class="site-nav" id="site-nav" aria-label="主导航">
 <a href="/"{current('product')}>产品</a><a href="/docs/overview/"{current('docs')}>文档</a>
-<a href="/docs/ai/"{current('ai')}>给 AI 的文档</a><a href="{REPO}">GitHub</a></nav>
+<a href="/docs/ai/"{current('ai')}>给 AI 的文档</a><a href="{REPO}">GitHub {icon('external')}</a></nav>
 <div class="header-action"><a class="button small" href="/docs/quickstart/">开始安装 {icon('arrow')}</a></div>
 </div></header>'''
 
 
 def footer() -> str:
-    return f'''<footer class="site-footer"><div class="wrap footer-inner"><a class="footer-name" href="/">BioWorkflowManage<span>v1.1.0</span></a><nav class="footer-links" aria-label="页脚"><a href="{REPO}">GitHub</a><a href="/docs/feedback/">问题反馈</a><a href="/docs/releases/">版本说明</a></nav></div></footer>'''
+    return f'''<footer class="site-footer"><div class="wrap footer-inner"><a class="footer-name" href="/">BioWorkflowManage<span>v1.1.0</span></a><nav class="footer-links" aria-label="页脚"><a href="{REPO}">GitHub {icon('external')}</a><a href="/docs/feedback/">问题反馈</a><a href="/docs/releases/">版本说明</a></nav></div></footer>'''
 
 
 def shell(title: str, description: str, path: str, content: str, active: str = '') -> str:
@@ -61,8 +66,8 @@ def shell(title: str, description: str, path: str, content: str, active: str = '
     return f'''<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{html.escape(title)} · BioWorkflowManage</title><meta name="description" content="{html.escape(description, quote=True)}">
-<link rel="canonical" href="{ORIGIN}{path}"><meta property="og:type" content="website"><meta property="og:locale" content="zh_CN"><meta property="og:title" content="{html.escape(title, quote=True)}"><meta property="og:description" content="{html.escape(description, quote=True)}"><meta property="og:url" content="{ORIGIN}{path}"><meta name="theme-color" content="#154ad6">
-<link rel="icon" href="/assets/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/assets/site.css?v={fingerprint}"><link rel="alternate" type="text/plain" href="/llms.txt" title="给 AI 的文档索引"><script src="/assets/site.js?v={fingerprint}" defer></script>
+<link rel="canonical" href="{ORIGIN}{path}"><meta property="og:type" content="website"><meta property="og:locale" content="zh_CN"><meta property="og:title" content="{html.escape(title, quote=True)}"><meta property="og:description" content="{html.escape(description, quote=True)}"><meta property="og:url" content="{ORIGIN}{path}"><meta name="theme-color" content="#35577b">
+<link rel="icon" href="/assets/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/assets/fonts/fonts.css?v={fingerprint}"><link rel="stylesheet" href="/assets/site.css?v={fingerprint}"><link rel="alternate" type="text/plain" href="/llms.txt" title="给 AI 的文档索引"><script src="/assets/site.js?v={fingerprint}" defer></script>
 </head><body>{header(active)}{content}{footer()}</body></html>'''
 
 
@@ -71,22 +76,31 @@ def code_block(code: str, ident: str, dark: bool = False, label: str = '复制�
 
 
 def homepage() -> str:
-    command = 'git clone --branch v1.1.0 --depth 1 ' + chr(92) + '\n  https://github.com/qzhqzh/BioWorkflowManage.git'
-    def docs_stack(labels):
-        return '<div class="document-stack">' + ''.join('<div>' + icon('file') + '<span>' + label + '</span></div>' for label in labels) + '</div>'
-    content = f'''<main id="main" class="wrap">
-<section class="hero" aria-labelledby="hero-title"><div><h1 id="hero-title">轻松集成，<br>即刻开跑。</h1><p class="hero-description">可复用的生信分析底座。</p></div>
-<div class="hero-start"><h2>独立部署，统一执行。</h2><p class="engine-line">MiniWDL / Nextflow</p><div class="hero-actions"><a class="button" href="/docs/quickstart/">开始安装 {icon('arrow')}</a><a class="button text" href="{REPO}/tree/v1.1.0">查看源码 {icon('external')}</a></div></div>
-<div class="hero-scenarios"><h2>接入场景</h2><ul class="scenario-list"><li>{icon('monitor')}Web 应用</li><li>{icon('database')}业务后台</li><li>{icon('gear')}自动化任务</li></ul></div></section>
-<section class="pipeline" aria-label="执行链路：分析产品、输入预检、执行管理、结果交付">
-<div class="pipeline-label"><strong>执行链路</strong><span class="pipeline-caption">BIO<br>ANALYSIS<br>PIPELINE</span></div>
-<article class="stage"><span class="stage-number">01</span><h2><a href="/docs/integration/#contract">分析产品</a></h2><p>标准化分析工具与流程</p><div class="stage-art">{docs_stack(['ToolSpec','Workflow','Contract'])}</div><span class="port" aria-hidden="true"></span></article>
-<article class="stage"><span class="stage-number">02</span><h2><a href="/docs/integration/#inputs">输入预检</a></h2><p>检查输入数据与参数</p><div class="stage-art"><div class="precheck"><div class="input-list"><span>样本数据</span><span>参数配置</span></div><svg class="input-wires" viewBox="0 0 40 108" preserveAspectRatio="none" aria-hidden="true"><path d="M0 25h10c12 0 10 26 23 26h7M0 83h10c12 0 10-28 23-28h7"/><path d="m33 47 7 4-7 4m0-4 7 4-7 4"/></svg><div class="validation-node">输入<br>预检</div></div></div><span class="port" aria-hidden="true"></span></article>
-<article class="stage"><span class="stage-number">03</span><h2><a href="/docs/deployment/#engines">执行管理</a></h2><p>统一调度与流程执行</p><div class="stage-art"><div class="runtime"><div class="runtime-core"><strong>BioWorkflowManage</strong><small>v1.1.0</small></div><svg class="runtime-wires" viewBox="0 0 240 35" preserveAspectRatio="none" aria-hidden="true"><path d="M120 0v15H50v18M120 15h70v18m-144-5 4 5 4-5m132 0 4 5 4-5"/></svg><div class="runtime-engines"><span>MiniWDL</span><span>Nextflow</span></div></div></div><span class="port" aria-hidden="true"></span></article>
-<article class="stage"><span class="stage-number">04</span><h2><a href="/docs/integration/#outputs">结果交付</a></h2><p>输出可验证的结果文件</p><div class="stage-art">{docs_stack(['运行记录','输出清单','SHA-256'])}</div><span class="port" aria-hidden="true"></span></article>
-</section>
-<section class="entry-panels" aria-label="获取源码与接入文档"><div class="source-entry"><h2>获取 v1.1.0</h2>{code_block(command,'source-command',True,'复制获取源码命令')}<p>Docker Compose · 源码部署</p></div><div class="ai-entry"><h2>给 AI 的文档</h2><p>接入契约与示例。</p><a class="artifact-link" href="/docs/integration.md">{icon('file')}<span>integration.md</span><span class="artifact-type">Markdown</span>{icon('external','arrow')}</a><a class="artifact-link" href="/openapi.json">{icon('file')}<span>openapi.json</span><span class="artifact-type">OpenAPI</span>{icon('external','arrow')}</a><button class="button secondary" type="button" data-copy-url="/docs/ai-context.md" data-copy-label="复制接入说明">{icon('copy')}复制接入说明</button></div></section>
-<nav class="doc-strip" aria-label="开始使用"><div class="doc-strip-heading"><strong>文档</strong><small>DOCUMENTATION</small></div><a href="/docs/quickstart/">{icon('file')}快速安装 {icon('arrow','arrow')}</a><a href="/docs/deployment/">{icon('tool')}部署与运维 {icon('arrow','arrow')}</a><a href="/docs/integration/">{icon('book')}接入指南 {icon('arrow','arrow')}</a><a href="/docs/evaluation/">{icon('flask')}试部署与测评 {icon('arrow','arrow')}</a></nav>
+    commands = [
+        ('install', '安装', 'quickstart', 'git clone --branch v1.1.0 --depth 1 ' + chr(92) + '\n  https://github.com/qzhqzh/BioWorkflowManage.git', '<a href="/docs/quickstart/">Docker Compose · 源码部署</a>'),
+        ('deploy', '部署', 'deployment', 'docker compose config --quiet && ' + chr(92) + '\n  docker compose up -d --build --wait', '<a href="/docs/quickstart/#configure">在 v1.1.0 源码目录配置 .env 后执行 ' + icon('external') + '</a>'),
+        ('evaluate', '测评', 'evaluation', 'curl --fail http://127.0.0.1:8082/api/v1/health\ncurl --fail http://127.0.0.1:8082/api/v1/ready', '服务检查 · <a href="/docs/evaluation/">完整测评清单 ' + icon('external') + '</a>'),
+    ]
+    tabs, panels = [], []
+    for index, (key, label, filename, command, caption) in enumerate(commands):
+        tabs.append(f'<button type="button" role="tab" id="tab-{key}" aria-controls="panel-{key}" aria-selected="{str(index == 0).lower()}" tabindex="{0 if index == 0 else -1}">{label}</button>')
+        highlighted = html.escape(command)
+        if index == 0:
+            highlighted = highlighted.replace('git clone', '<span class="syntax-command">git clone</span>', 1)
+        else:
+            highlighted = re.sub(r'^(docker compose|curl)', r'<span class="syntax-command">\1</span>', highlighted, flags=re.M)
+        panels.append(f'''<div class="setup-panel" id="panel-{key}" role="tabpanel" aria-labelledby="tab-{key}"{'' if index == 0 else ' hidden'}>
+<div class="code-console"><div class="console-toolbar"><span class="console-dots" aria-hidden="true"><i></i><i></i><i></i></span><span class="console-filename">{filename} / v1.1.0</span><span class="code-status" role="status" aria-live="polite"></span><button class="console-copy" type="button" data-copy-target="#command-{key}" data-copy-label="复制{label}命令" aria-label="复制{label}命令">{icon('copy')}<span>复制</span></button></div><pre><code id="command-{key}">{highlighted}</code></pre></div>
+<p class="console-caption">{caption}</p></div>''')
+    content = f'''<main id="main" class="home-page">
+<section class="hero" aria-labelledby="hero-title"><div class="wrap hero-inner"><div class="hero-copy">
+<h1 id="hero-title">轻松集成，<br>即刻开跑。</h1><p class="hero-description">可复用的生信分析底座。</p>
+<div class="hero-actions"><a class="button" href="/docs/quickstart/">快速安装 {icon('arrow')}</a><a class="button secondary" href="{REPO}/tree/v1.1.0">查看源码 {icon('github')}</a></div>
+<ul class="hero-features"><li>{icon('layers')}<span>业务独立</span><span class="feature-line" aria-hidden="true"></span></li><li>{icon('tag')}<span>流程版本</span><span class="feature-line" aria-hidden="true"></span></li><li>{icon('file')}<span>执行记录</span><span class="feature-line" aria-hidden="true"></span></li></ul>
+</div><figure class="hero-visual"><img src="/assets/foundation-hero-v2.png" width="1448" height="1086" fetchpriority="high" decoding="async" alt="业务应用和自动化任务经 Integration API 接入 BioWorkflowManage；底座负责分析产品、输入预检、执行管理和结果交付，由 MiniWDL 或 Nextflow 执行并生成输出清单。"></figure></div></section>
+<div class="wrap"><section class="entry-panels" aria-label="安装与接入"><div class="source-entry"><div class="setup-tabs" role="tablist" aria-label="开始使用">{''.join(tabs)}</div>{''.join(panels)}</div>
+<div class="ai-entry"><div class="ai-heading">{icon('file')}<div><h2>给 AI 的文档</h2><p>接入契约与示例。</p></div></div><div class="ai-actions"><a href="/docs/integration.md">Markdown {icon('external')}</a><a href="/openapi.json">OpenAPI {icon('external')}</a><button class="button" type="button" data-copy-url="/docs/ai-context.md" data-copy-label="复制接入说明">{icon('copy')}复制接入说明</button></div></div></section>
+<nav class="doc-strip" aria-label="使用文档"><a href="/docs/quickstart/">{icon('download')}<span>快速安装</span>{icon('arrow','arrow')}</a><a href="/docs/deployment/">{icon('gear')}<span>部署与运维</span>{icon('arrow','arrow')}</a><a href="/docs/integration/">{icon('plug')}<span>接入指南</span>{icon('arrow','arrow')}</a><a href="/docs/evaluation/">{icon('file')}<span>试部署与测评</span>{icon('arrow','arrow')}</a></nav></div>
 </main>'''
     return shell(CONFIG['slogan'], CONFIG['description'], '/', content, 'product')
 
@@ -241,7 +255,7 @@ def build():
     (OUT / '404.html').write_text(shell('页面未找到', '返回产品首页或快速安装指南。', '/404.html', '<main id="main" class="wrap not-found"><p>404</p><h1>这个页面没有找到。</h1><p>可以从产品首页或快速安装指南继续。</p><a class="button" href="/">返回首页</a> <a class="button text" href="/docs/quickstart/">快速安装</a></main>'))
     (OUT / 'robots.txt').write_text('User-agent: *\nAllow: /\nSitemap: ' + ORIGIN + '/sitemap.xml\n')
     urls = ['/'] + ['/docs/' + slug + '/' for slug, _ in PAGES]
-    (OUT / 'sitemap.xml').write_text('<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' + ''.join('<url><loc>' + ORIGIN + path + '</loc><lastmod>' + CONFIG['updated'] + '</lastmod></url>' for path in urls) + '</urlset>\n')
+    (OUT / 'sitemap.xml').write_text('<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' + ''.join('<url><loc>' + ORIGIN + path + '</loc><lastmod>' + (CONFIG.get('site_updated', CONFIG['updated']) if path == '/' else CONFIG['updated']) + '</lastmod></url>' for path in urls) + '</urlset>\n')
     downloads = sorted(path for path in (OUT / 'downloads').iterdir() if path.is_file())
     (OUT / 'downloads/SHA256SUMS').write_text(''.join(hashlib.sha256(path.read_bytes()).hexdigest() + '  ' + path.name + '\n' for path in downloads))
     commit = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=ROOT.parent, check=True, capture_output=True, text=True).stdout.strip()

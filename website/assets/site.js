@@ -7,6 +7,27 @@
     document.addEventListener('keydown', event => { if (event.key === 'Escape' && nav.dataset.open === 'true') { closeMenu(); menu.focus(); } });
     nav.addEventListener('click', event => { if (event.target.closest('a')) closeMenu(); });
   }
+  const setupTabs = [...document.querySelectorAll('.setup-tabs [role="tab"]')];
+  function selectTab(selected, focus = false) {
+    setupTabs.forEach(tab => {
+      const active = tab === selected;
+      tab.setAttribute('aria-selected', String(active));
+      tab.tabIndex = active ? 0 : -1;
+      document.getElementById(tab.getAttribute('aria-controls')).hidden = !active;
+    });
+    if (focus) selected.focus();
+  }
+  setupTabs.forEach((tab, index) => {
+    tab.addEventListener('click', () => selectTab(tab));
+    tab.addEventListener('keydown', event => {
+      let next;
+      if (event.key === 'ArrowRight') next = (index + 1) % setupTabs.length;
+      if (event.key === 'ArrowLeft') next = (index + setupTabs.length - 1) % setupTabs.length;
+      if (event.key === 'Home') next = 0;
+      if (event.key === 'End') next = setupTabs.length - 1;
+      if (next !== undefined) { event.preventDefault(); selectTab(setupTabs[next], true); }
+    });
+  });
   async function copyText(text) {
     if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(text);
     const input = document.createElement('textarea');
